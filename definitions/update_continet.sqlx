@@ -1,0 +1,8 @@
+config {
+  type: "incremental"
+}
+
+SELECT  
+   'Sudarshan' AS `string_field_0`
+FROM `cities.continents`
+
