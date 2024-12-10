@@ -4,5 +4,5 @@ config {
 
 SELECT  
    'Sudarshan' AS `string_field_0`
-FROM `cities.continents`
+FROM ${ref("continent")}
 
