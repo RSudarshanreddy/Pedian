@@ -1,8 +1,0 @@
-config {
-  
-  type: "table", // Creates a view in BigQuery. Try changing to "table" instead.
-  
-}
-
--- The rest of a SQLX file contains your SELECT statement used to create the table.
-select * from `cities.continents`
