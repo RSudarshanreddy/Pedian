@@ -19,16 +19,16 @@ operate("update_finances_from_gsheets")
         SELECT 
           Stock,
           cmp,
-          previous_change,
-          _1_day_change 
+          previous_changes,
+          _1_day_changes 
         FROM \`sudarshan-442212.fin.finances\`
       ) AS Source
       ON Source.Stock = Target.Stock
       WHEN MATCHED THEN
         UPDATE SET 
           Target.cmp = Source.cmp,
-          Target.previous_change = Source.previous_change,
-          Target._1_day_change = Source._1_day_change
+          Target.previous_change = Source.previous_changes,
+          Target._1_day_change = Source._1_day_changes
       WHEN NOT MATCHED THEN
         INSERT (
           Stock,
@@ -39,7 +39,7 @@ operate("update_finances_from_gsheets")
         VALUES (
           Source.Stock,
           Source.cmp,
-          Source.previous_change,
-          Source._1_day_change              
+          Source.previous_changes,
+          Source._1_day_changes              
               )
         `);
