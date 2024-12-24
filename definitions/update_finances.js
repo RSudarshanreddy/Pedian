@@ -1,17 +1,3 @@
-// publish("tbl_daily_fin_updates", {
-//     type: "incremental",
-//     schema: "dataform",
-//     tags: ["Forecast"]
-// }).query(`
-//   SELECT 
-//     Stock, 
-//     cmp, 
-//     previous_change, 
-//     _1_day_change
-//   FROM 
-//     \`sudarshan-442212.fin.finances\`
-// `);
-
 operate("update_finances_from_gsheets")
     .tags("Forecast")
     .queries(` MERGE INTO \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS Target
