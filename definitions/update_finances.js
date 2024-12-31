@@ -32,27 +32,29 @@ operate("update_finances_from_gsheets")
           Target.Lowest_Cday = source.Lowest_Cday,
           Target._52_high = source._52_high,
           Target._52_low = source._52_low,
-          # Target.Buy_Qty = source.Buy_Qty,
-          # Target.Buy_Price = source.Buy_Price,          
-          # target.Current_Market_Value = source.Current_Market_Value ,
-          # target.Sell_Target_value = source.Sell_Target_value,       
+           #Target.Buy_Qty = source.Buy_Qty,
+           Target.Buy_Value = source.Buy_Value,
+           #Target.Buy_Price = source.Buy_Price,          
+           target.Current_Market_Value = source.Current_Market_Value ,
+           target.Sell_Target_value = source.Sell_Target_value,       
           target.calday = CURRENT_DATE()
       WHEN NOT MATCHED THEN
         INSERT (
            Stock,
            # Buy_Qty,
            #Buy_Price,
-            cmp, 
+           cmp, 
            # Target,
-           # Buy_Value, 
-           #Current_Market_Value,
-            # Sell_Target_value,
-            previous_changes, 
-            _1_day_change,
-            Highest_Cday, 
-            Lowest_Cday,
-            _52_high,
-            _52_low
+           Buy_Value, 
+           Current_Market_Value,
+           Sell_Target_value,
+           previous_changes, 
+           _1_day_change,
+           Highest_Cday, 
+           Lowest_Cday,
+           _52_high,
+           _52_low, 
+           calday
         )
         VALUES  (
             source.Stock,
@@ -60,16 +62,16 @@ operate("update_finances_from_gsheets")
             #source.Buy_Price,
             source.cmp, 
             #source.Target,
-            #source.Buy_Value, 
-            #source.Current_Market_Value,
-            #source.Sell_Target_value,
+            source.Buy_Value, 
+            source.Current_Market_Value,
+            source.Sell_Target_value,
             source.previous_changes, 
             source._1_day_changes,
             source.Highest_Cday, 
             source.Lowest_Cday,
             source._52_high,
-            source._52_low       
-          
+            source._52_low, 
+            CURRENT_DATE()         
           
           )            
               `);
