@@ -41,10 +41,10 @@ operate("update_finances_from_gsheets")
       WHEN NOT MATCHED THEN
         INSERT (
            Stock,
-           # Buy_Qty,
+           Buy_Qty,
            #Buy_Price,
            cmp, 
-           # Target,
+           #Target,
            Buy_Value, 
            Current_Market_Value,
            Sell_Target_value,
@@ -58,7 +58,7 @@ operate("update_finances_from_gsheets")
         )
         VALUES  (
             source.Stock,
-            #source.Buy_Qty,
+            source.Buy_Qty,
             #source.Buy_Price,
             source.cmp, 
             #source.Target,
