@@ -32,7 +32,7 @@ operate("update_finances_from_gsheets")
           Target.Lowest_Cday = source.Lowest_Cday,
           Target._52_high = source._52_high,
           Target._52_low = source._52_low,
-           #Target.Buy_Qty = source.Buy_Qty,
+          Target.Buy_Qty = source.Buy_Qty,
            Target.Buy_Value = source.Buy_Value,
            #Target.Buy_Price = source.Buy_Price,          
            target.Current_Market_Value = source.Current_Market_Value ,
@@ -77,9 +77,9 @@ operate("update_finances_from_gsheets")
               `)
     .queries(
         `UPDATE \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS C
-              SET C.Buy_Value = B.Latest_Buy_Value -- , C.Buy_Qty = B.Latest_Buy_Qty
+              SET C.Buy_Value = B.Latest_Buy_Value,C.Buy_Qty = B.Latest_Buy_Qty
               FROM (
-                    SELECT A.Stock, B.Latest_Buy_Value, B.Entity
+                    SELECT A.Stock, B.Latest_Buy_Value, B.Entity, B.Latest_Buy_Qty
                     FROM \`sudarshan-442212.fin.Finances\` AS A
                     LEFT JOIN \`sudarshan-442212.fin.fin_squares\` AS B
                     ON A.Stock = B.Entity
