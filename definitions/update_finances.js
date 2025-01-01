@@ -1,6 +1,6 @@
 operate("update_finances_from_gsheets")
-  .tags("Forecast")
-  .queries(`MERGE INTO \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS Target
+    .tags("Forecast")
+    .queries(`MERGE INTO \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS Target
       USING (
         SELECT            
             Stock,
@@ -71,7 +71,19 @@ operate("update_finances_from_gsheets")
             source.Lowest_Cday,
             source._52_high,
             source._52_low, 
-            CURRENT_DATE()         
+            CURRENT_DATE()        
           
           )            
+              `)
+    .queries(
+        `UPDATE \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS C
+              SET C.Buy_Value = B.Latest_Buy_Value -- , C.Buy_Qty = B.Latest_Buy_Qty
+              FROM (
+                    SELECT A.Stock, B.Latest_Buy_Value, B.Entity
+                    FROM \`sudarshan-442212.fin.Finances\` AS A
+                    LEFT JOIN \`sudarshan-442212.fin.fin_squares\` AS B
+                    ON A.Stock = B.Entity
+                    WHERE B.Entity IS NOT NULL
+              ) AS B
+              WHERE C.Stock = B.Stock;
               `);
