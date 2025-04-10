@@ -81,10 +81,6 @@ operate("update_finances_from_gsheets")
       ON A.Stock = B.Entity
       WHERE B.Entity IS NOT NULL
     ) AS B
-    WHERE C.Stock = B.Stock;
-
-
-
-  
+    WHERE C.Stock = B.Stock; 
 
   `);
