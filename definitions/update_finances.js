@@ -1,7 +1,7 @@
 operate("update_finances_from_gsheets")
   .tags("Forecast")
-  .queries(`
-    MERGE INTO \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS Target
+
+  .queries(`MERGE INTO \`sudarshan-442212.dataform.tbl_daily_fin_updates\` AS Target
     USING (
       SELECT            
           Stock,
