@@ -4,8 +4,8 @@
 - `git init` → Initialize a new repository  
 - `git clone <url>` → Clone an existing repository  
 
-### Configuration  
-- `git config --global user.name "Name"`  
+### Configuration  =(- `git config --global use gw3
+m.0r.name "Name"`  
 - `git config --global user.email "Email"`  
 
 ### Basic Snapshotting  
@@ -37,4 +37,4 @@
 ### Undoing  
 - `git reset <commit>` → Reset current HEAD to a specific state  
 - `git revert <commit>` → Create a new commit that undoes changes  
-- `git restore <file>` → Restore working tree files
+- `git restore <file>` → Restore working tree files (Done with my cloning)
