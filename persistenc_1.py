@@ -19,6 +19,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Optional
 
 import numpy as np
@@ -31,7 +32,7 @@ LOGGER = logging.getLogger(__name__)
 
 NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 REQUIRED_COLUMNS = {"Open", "High", "Low", "Close", "Volume"}
-
+DEFAULT_BQ_TABLE_ID = "daily_stocks_v2"
 
 # =========================================================
 # CONFIG
@@ -98,6 +99,18 @@ class ScannerConfig:
 # HELPERS
 # =========================================================
 def load_yfinance() -> Any:
+    # yfinance's cookie/cache layer uses SQLite. Some minimal Cloud Run
+    # Functions images omit the SQLite shared library, which otherwise makes
+    # every ticker in every batch look like a failed Yahoo download.
+    try:
+        import sqlite3
+        sqlite3.connect(":memory:").close()
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "This Cloud Function runtime has no usable SQLite driver, required by yfinance. "
+            "Redeploy with the full Python base image (for example, python313 on google-22-full)."
+        ) from exc
+
     try:
         import yfinance as yf
     except ModuleNotFoundError as exc:
@@ -625,6 +638,30 @@ BQ_SCHEMA = [
 ]
 
 
+def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
+    """Preserve legacy field names/types while adding fields from BQ_SCHEMA.
+
+    The original ``daily_stocks`` table has fields such as ``tikker`` and
+    ``run_date`` and lacks ``Bar_Date``.  Field names cannot be guessed by
+    BigQuery, and an existing INTEGER ``score`` cannot be loaded as FLOAT64.
+    """
+    existing = {field.name.lower(): field for field in table.schema}
+    field_map: dict[str, str] = {}
+    schema: list[bigquery.SchemaField] = []
+    for expected in BQ_SCHEMA:
+        # `tikker` is the one known spelling error in the legacy table.
+        actual = existing.get(expected.name.lower())
+        if expected.name == "Ticker" and actual is None:
+            actual = existing.get("tikker")
+        if actual is not None:
+            field_map[expected.name] = actual.name
+            schema.append(actual)
+        else:
+            field_map[expected.name] = expected.name
+            schema.append(expected)
+    return schema, field_map
+
+
 def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_id: str) -> int:
     """Idempotent write: deletes any existing rows sharing (Ticker, Bar_Date)
     with the incoming data before appending, so re-running the scanner for
@@ -636,21 +673,43 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
 
     try:
-        client.get_table(table_ref)
+        table = client.get_table(table_ref)
         table_exists = True
     except NotFound:
-        client.create_table(bigquery.Table(table_ref, schema=BQ_SCHEMA))
+        table = client.create_table(bigquery.Table(table_ref, schema=BQ_SCHEMA))
         LOGGER.info("Created %s", table_ref)
         table_exists = False
+
+    load_schema, field_map = _schema_for_existing_table(table)
+    ticker_field = field_map["Ticker"]
+    # Legacy tables did not record a market bar date.  On the first upgraded
+    # run use run_date for de-duplication; Bar_Date is then added by the load.
+    dedupe_date_field = field_map["Bar_Date"]
+    if dedupe_date_field == "Bar_Date" and not any(f.name == "Bar_Date" for f in table.schema):
+        dedupe_date_field = field_map["Run_Date"]
+        LOGGER.warning("%s lacks Bar_Date; using %s for this run's de-duplication", table_ref, dedupe_date_field)
 
     output = df.copy()
     output["Bar_Date"] = pd.to_datetime(output["Bar_Date"]).dt.date
     output["Run_Date"] = pd.to_datetime(output["Run_Date"]).dt.date
+    output = output.rename(columns={source: target for source, target in field_map.items() if source != target})
+
+    # The legacy table stores score as INTEGER.  Retain that established type
+    # instead of failing the load; new tables keep the FLOAT64 schema above.
+    score_field = next(field for field in load_schema if field.name == field_map["Score"])
+    if score_field.field_type == "INTEGER":
+        output[field_map["Score"]] = output[field_map["Score"]].round().astype("Int64")
+    for field in load_schema:
+        if field.field_type == "NUMERIC" and field.name in output:
+            output[field.name] = output[field.name].map(
+                lambda value: Decimal(str(value)) if pd.notna(value) else None
+            )
 
     if table_exists:
-        pairs = output[["Ticker", "Bar_Date"]].drop_duplicates()
+        pairs = output[[ticker_field, dedupe_date_field]].drop_duplicates()
         conditions = " OR ".join(
-            f"(Ticker = '{row.Ticker}' AND Bar_Date = DATE('{row.Bar_Date.isoformat()}'))"
+            f"(`{ticker_field}` = '{getattr(row, ticker_field).replace(chr(39), chr(39) * 2)}' "
+            f"AND `{dedupe_date_field}` = DATE('{getattr(row, dedupe_date_field).isoformat()}'))"
             for row in pairs.itertuples(index=False)
         )
         client.query(f"DELETE FROM `{table_ref}` WHERE {conditions}").result()
@@ -659,7 +718,7 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
         output,
         table_ref,
         job_config=bigquery.LoadJobConfig(
-            schema=BQ_SCHEMA,
+            schema=load_schema,
             write_disposition="WRITE_APPEND",
             schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
         ),
@@ -669,11 +728,18 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
 
 
 def _resolve_project_id(project_id: Optional[str]) -> str:
-    resolved = project_id or os.getenv("GCP_PROJECT")
+    # `GCP_PROJECT` is convenient locally, while Cloud Functions/Run exposes
+    # the deployed project as `GOOGLE_CLOUD_PROJECT`.
+    resolved = project_id or os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not resolved:
+        try:
+            resolved = bigquery.Client().project
+        except Exception:
+            resolved = None
     if not resolved:
         raise ValueError(
-            "No GCP project_id provided and GCP_PROJECT env var is not set. "
-            "Pass --project-id or run: set GCP_PROJECT=<sudarshan-442212>"
+            "No GCP project_id provided and neither GCP_PROJECT nor GOOGLE_CLOUD_PROJECT is set. "
+            "Pass --project-id or configure a Cloud Function project."
         )
     return resolved
 
@@ -715,7 +781,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
     p.add_argument("--project-id", default=None, help="GCP project (else uses GCP_PROJECT env var)")
     p.add_argument("--dataset-id", default="data_options")
-    p.add_argument("--table-id", default="daily_stocks")
+    p.add_argument(
+        "--table-id",
+        default=DEFAULT_BQ_TABLE_ID,
+        help=f"BigQuery table (default: {DEFAULT_BQ_TABLE_ID}; created with the full scanner schema if absent)",
+    )
     p.add_argument("--verbose", action="store_true")
 
     args, _ = p.parse_known_args()
@@ -725,7 +795,13 @@ def parse_args() -> argparse.Namespace:
 # =========================================================
 # MAIN
 # =========================================================
-def main() -> None:
+def main(request: Any = None) -> Optional[tuple[str, int]]:
+    """Run as either a CLI program or an HTTP Cloud Function.
+
+    Functions Framework calls the configured entry point with the Flask
+    request object.  The optional argument keeps ``python persistenc_1.py``
+    working while making ``main`` a valid Cloud Function HTTP handler.
+    """
     args = parse_args()
     config = ScannerConfig(
         min_avg_volatility=args.min_avg_volatility,
@@ -768,13 +844,14 @@ def main() -> None:
             print(", ".join(failures[:30]))
 
     if candidates.empty:
-        print("\nNo candidates matched. Try:")
+        message = "No candidates matched. Try:"
+        print(f"\n{message}")
         print("  --min-persistence 55        (lower persistence bar)")
         print("  --min-avg-volatility 3.0    (lower volatility bar)")
         print("  --min-persistence-sample 30 (allow smaller sample size)")
         print("  --min-rr 1.2                (relax risk/reward bar)")
         print("  --min-score 55              (relax the quality gate)")
-        return
+        return (message, 200) if request is not None else None
 
     display = candidates
     if args.only_buy:
@@ -816,6 +893,10 @@ def main() -> None:
         except Exception as exc:
             print(f"\nBigQuery write skipped/failed: {exc}")
             print("Use --no-bq to suppress this, or --project-id / set GCP_PROJECT to fix it.")
+
+    if request is not None:
+        return (f"Scanner completed: {len(candidates)} candidates processed.", 200)
+    return None
 
 
 if __name__ == "__main__":
