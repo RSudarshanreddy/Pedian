@@ -1,168 +1,59 @@
 config {
-  type: "operations",
-  hasOutput: false
+  type: "incremental",
+  schema: "data_options",
+  name: "fact_stock_scan",
+  uniqueKey: ["stock_key", "date_key"],
+  bigquery: {
+    partitionBy: "bar_date",
+    clusterBy: ["stock_key", "ticker"]
+  }
 }
 
-MERGE INTO `sudarshan-442212.data_options.fact_stock_scan` AS T
+SELECT
+  ds.stock_key,
+  dd.date_key,
+  S.Ticker AS ticker,
+  S.Bar_Date AS bar_date,
+  S.Action AS action,
+  S.Setup_Type AS setup_type,
+  S.Score AS score,
+  S.Reason AS reason,
+  S.Price AS price,
+  S.Avg_Volatility AS avg_volatility,
+  S.Median_Volatility AS median_volatility,
+  S.Volatile_Days AS volatile_days,
+  S.Volatility_Ratio AS volatility_ratio,
+  S.Today_Range AS today_range,
+  S.Persistence_Rate AS persistence_rate,
+  S.Persistence_Sample AS persistence_sample,
+  S.Expected_Move AS expected_move,
+  S.Persistence_Stability AS persistence_stability,
+  S.Traded_Value_Cr AS traded_value_cr,
+  S.Volume_Spike AS volume_spike,
+  S.Pullback_Pct AS pullback_pct,
+  S.Dist_Support_Pct AS dist_support_pct,
+  S.Dist_MA20_Pct AS dist_ma20_pct,
+  S.Entry AS entry,
+  S.Stop_Loss AS stop_loss,
+  S.Target AS target,
+  S.Risk_Per_Share AS risk_per_share,
+  S.Risk_Pct AS risk_pct,
+  S.RR_Ratio AS rr_ratio,
+  S.ATR AS atr,
+  S.Max_Hold_Days AS max_hold_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM `sudarshan-442212.data_options.daily_stocks_v2` S
 
-USING (
-  SELECT
-    ds.stock_key,
-    dd.date_key,
+JOIN `sudarshan-442212.data_options.dim_stock` ds
+  ON ds.ticker = S.Ticker
 
-    S.Ticker AS ticker,
-    S.Bar_Date AS bar_date,
+JOIN `sudarshan-442212.data_options.dim_date` dd
+  ON dd.calendar_date = S.Bar_Date
 
-    S.Action AS action,
-    S.Setup_Type AS setup_type,
-    S.Score AS score,
-    S.Reason AS reason,
+WHERE
+  S.Ticker IS NOT NULL
+  AND S.Bar_Date IS NOT NULL
 
-    S.Price AS price,
-
-    S.Avg_Volatility AS avg_volatility,
-    S.Median_Volatility AS median_volatility,
-    S.Volatile_Days AS volatile_days,
-    S.Volatility_Ratio AS volatility_ratio,
-    S.Today_Range AS today_range,
-
-    S.Persistence_Rate AS persistence_rate,
-    S.Persistence_Sample AS persistence_sample,
-    S.Expected_Move AS expected_move,
-    S.Persistence_Stability AS persistence_stability,
-
-    S.Traded_Value_Cr AS traded_value_cr,
-    S.Volume_Spike AS volume_spike,
-
-    S.Pullback_Pct AS pullback_pct,
-    S.Dist_Support_Pct AS dist_support_pct,
-    S.Dist_MA20_Pct AS dist_ma20_pct,
-
-    S.Entry AS entry,
-    S.Stop_Loss AS stop_loss,
-    S.Target AS target,
-    S.Risk_Per_Share AS risk_per_share,
-    S.Risk_Pct AS risk_pct,
-    S.RR_Ratio AS rr_ratio,
-    S.ATR AS atr,
-    S.Max_Hold_Days AS max_hold_days
-
-  FROM `sudarshan-442212.data_options.daily_stocks_v2` AS S
-
-  INNER JOIN `sudarshan-442212.data_options.dim_stock` AS ds
-    ON ds.ticker = S.Ticker
-
-  INNER JOIN `sudarshan-442212.data_options.dim_date` AS dd
-    ON dd.calendar_date = S.Bar_Date
-
-  WHERE
-    S.Ticker IS NOT NULL
-    AND S.Bar_Date IS NOT NULL
-) AS S
-
-ON T.stock_key = S.stock_key
-AND T.date_key = S.date_key
-
-WHEN MATCHED THEN
-  UPDATE SET
-    ticker = S.ticker,
-    bar_date = S.bar_date,
-    action = S.action,
-    setup_type = S.setup_type,
-    score = S.score,
-    reason = S.reason,
-    price = S.price,
-    avg_volatility = S.avg_volatility,
-    median_volatility = S.median_volatility,
-    volatile_days = S.volatile_days,
-    volatility_ratio = S.volatility_ratio,
-    today_range = S.today_range,
-    persistence_rate = S.persistence_rate,
-    persistence_sample = S.persistence_sample,
-    expected_move = S.expected_move,
-    persistence_stability = S.persistence_stability,
-    traded_value_cr = S.traded_value_cr,
-    volume_spike = S.volume_spike,
-    pullback_pct = S.pullback_pct,
-    dist_support_pct = S.dist_support_pct,
-    dist_ma20_pct = S.dist_ma20_pct,
-    entry = S.entry,
-    stop_loss = S.stop_loss,
-    target = S.target,
-    risk_per_share = S.risk_per_share,
-    risk_pct = S.risk_pct,
-    rr_ratio = S.rr_ratio,
-    atr = S.atr,
-    max_hold_days = S.max_hold_days,
-    loaded_at = CURRENT_TIMESTAMP()
-
-WHEN NOT MATCHED THEN
-  INSERT (
-    stock_key,
-    date_key,
-    ticker,
-    bar_date,
-    action,
-    setup_type,
-    score,
-    reason,
-    price,
-    avg_volatility,
-    median_volatility,
-    volatile_days,
-    volatility_ratio,
-    today_range,
-    persistence_rate,
-    persistence_sample,
-    expected_move,
-    persistence_stability,
-    traded_value_cr,
-    volume_spike,
-    pullback_pct,
-    dist_support_pct,
-    dist_ma20_pct,
-    entry,
-    stop_loss,
-    target,
-    risk_per_share,
-    risk_pct,
-    rr_ratio,
-    atr,
-    max_hold_days,
-    loaded_at
-  )
-
-  VALUES (
-    S.stock_key,
-    S.date_key,
-    S.ticker,
-    S.bar_date,
-    S.action,
-    S.setup_type,
-    S.score,
-    S.reason,
-    S.price,
-    S.avg_volatility,
-    S.median_volatility,
-    S.volatile_days,
-    S.volatility_ratio,
-    S.today_range,
-    S.persistence_rate,
-    S.persistence_sample,
-    S.expected_move,
-    S.persistence_stability,
-    S.traded_value_cr,
-    S.volume_spike,
-    S.pullback_pct,
-    S.dist_support_pct,
-    S.dist_ma20_pct,
-    S.entry,
-    S.stop_loss,
-    S.target,
-    S.risk_per_share,
-    S.risk_pct,
-    S.rr_ratio,
-    S.atr,
-    S.max_hold_days,
-    CURRENT_TIMESTAMP()
-  );
+${when(incremental(), `
+  AND S.Bar_Date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+`)}
