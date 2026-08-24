@@ -1,5 +1,5 @@
 defaultProject: sudarshan-442212
-defaultLocation: US
+defaultLocation: northamerica-northeast1
 defaultDataset: dataform
 defaultAssertionDataset: dataform_assertions
 dataformCoreVersion: 3.0.0

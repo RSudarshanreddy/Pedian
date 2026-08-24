@@ -1,0 +1,39 @@
+config {
+  type: "operations",
+  schema: "data_options",
+  name: "dim_date",
+  hasOutput: true
+}
+
+MERGE INTO `sudarshan-442212.data_options.dim_date` AS T
+
+USING (
+  SELECT DISTINCT
+    Bar_Date AS calendar_date
+  FROM `sudarshan-442212.data_options.daily_stocks_v2`
+  WHERE Bar_Date IS NOT NULL
+) AS S
+
+ON T.calendar_date = S.calendar_date
+
+WHEN NOT MATCHED THEN
+  INSERT (
+    date_key,
+    calendar_date,
+    year,
+    quarter,
+    month,
+    week,
+    day_of_week,
+    is_trading_day
+  )
+  VALUES (
+    CAST(FORMAT_DATE('%Y%m%d', S.calendar_date) AS INT64),
+    S.calendar_date,
+    EXTRACT(YEAR FROM S.calendar_date),
+    EXTRACT(QUARTER FROM S.calendar_date),
+    EXTRACT(MONTH FROM S.calendar_date),
+    EXTRACT(WEEK FROM S.calendar_date),
+    EXTRACT(DAYOFWEEK FROM S.calendar_date),
+    TRUE
+  );

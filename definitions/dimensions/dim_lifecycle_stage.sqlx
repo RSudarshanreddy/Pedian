@@ -1,0 +1,87 @@
+config {
+  type: "operations",
+  schema: "data_options",
+  name: "dim_lifecycle_stage",
+  hasOutput: true
+}
+
+MERGE INTO `sudarshan-442212.data_options.dim_lifecycle_stage` AS T
+
+USING (
+  SELECT
+    1 AS lifecycle_stage_key,
+    'COILING' AS lifecycle_stage,
+    'FORMATION' AS stage_group,
+    FALSE AS entry_eligible,
+    'Volatile stock consolidating and waiting for a trigger.' AS description
+
+  UNION ALL
+
+  SELECT
+    2,
+    'BREAKOUT_CONFIRMED',
+    'EXPANSION',
+    TRUE,
+    'Stock has broken out with confirmation.'
+
+  UNION ALL
+
+  SELECT
+    3,
+    'PULLBACK_FORMING',
+    'PULLBACK',
+    FALSE,
+    'Stock is undergoing a meaningful pullback.'
+
+  UNION ALL
+
+  SELECT
+    4,
+    'PULLBACK_BOUNCE',
+    'RECOVERY',
+    TRUE,
+    'Stock has bounced from a pullback.'
+
+  UNION ALL
+
+  SELECT
+    5,
+    'BELOW_TREND',
+    'WEAKNESS',
+    FALSE,
+    'Price is below trend and requires a reclaim.'
+
+  UNION ALL
+
+  SELECT
+    6,
+    'EXTENDED',
+    'EXPANSION',
+    FALSE,
+    'Stock has become extended after a strong move.'
+) AS S
+
+ON T.lifecycle_stage_key = S.lifecycle_stage_key
+
+WHEN MATCHED THEN
+  UPDATE SET
+    lifecycle_stage = S.lifecycle_stage,
+    stage_group = S.stage_group,
+    entry_eligible = S.entry_eligible,
+    description = S.description
+
+WHEN NOT MATCHED THEN
+  INSERT (
+    lifecycle_stage_key,
+    lifecycle_stage,
+    stage_group,
+    entry_eligible,
+    description
+  )
+  VALUES (
+    S.lifecycle_stage_key,
+    S.lifecycle_stage,
+    S.stage_group,
+    S.entry_eligible,
+    S.description
+  );
