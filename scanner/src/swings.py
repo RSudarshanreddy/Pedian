@@ -919,7 +919,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     """Run as either a CLI program or an HTTP Cloud Function.
 
     Functions Framework calls the configured entry point with the Flask
-    request object.  The optional argument keeps ``python persistenc_1.py``
+    request object.  The optional argument keeps ``python swings.py``
     working while making ``main`` a valid Cloud Function HTTP handler.
     """
     args = parse_args()
