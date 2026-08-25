@@ -3,11 +3,16 @@ VOLATILITY PERSISTENCE SWING SCANNER
 =====================================
 Core Philosophy:
 - A stock is "volatile" based on its full 6-month history (not a rolling 20-day window)
-- We VERIFY that volatility REPEATS in 2-3 day windows (persistence), tested against
-  the MOST RECENT `persistence_lookback` days (not stale, index-0-anchored history)
+- The exit rule is a FIXED profit target (config.target_pct, default 3%) -- not a
+  target sized as a multiple of risk. Stop-loss is sized so risk never exceeds what
+  that fixed target can justify at config.min_rr (see compute_trade_levels).
+- We BACKTEST that exact rule (buy at close, exit at +target_pct% or the stop,
+  whichever the next `max_hold_days` days hit first) against every historically
+  eligible day in the MOST RECENT `persistence_lookback` days (not stale,
+  index-0-anchored history) -- see run_barrier_backtest. The resulting win rate
+  and expected P&L are what actually matches "buy, take 3%, exit, repeat."
 - Persistence score is independent of today's entry trigger
 - Today's setup is a bonus for entry timing, not persistence ranking
-- Trades are only surfaced if their risk/reward clears a minimum bar
 - Results are written to BigQuery idempotently (safe to re-run same-day)
 """
 
@@ -58,13 +63,26 @@ class ScannerConfig:
     min_volatile_days: int = 30
     min_volatility_ratio: float = 0.20
 
-    # Persistence (tested against the MOST RECENT persistence_lookback days)
+    # Barrier backtest (tested against the MOST RECENT persistence_lookback days).
+    # min_persistence_rate is a WIN RATE now (see run_barrier_backtest), not a
+    # "did volatility touch X%" proxy. Breakeven win rate = risk/(risk+reward);
+    # with target_pct=3.0 and min_rr=1.0 (risk capped ~3%, see min_rr below)
+    # that's 50%. min_persistence_rate=50 is that breakeven line with zero
+    # margin -- deliberately left there rather than padded, so the scanner's
+    # actual historical hit rate is what does the filtering. Empirically (5
+    # tickers from a real trade book, 2y data): AEGISLOG/SKYGOLD/ANTELOPUS
+    # clear 50-56% and come out expected-P&L-positive; SKIPPER/BALUFORGE sit
+    # at 39-41% and are expected-P&L-negative at every risk level tested --
+    # i.e. this bar is doing real work, not rubber-stamping.
     persistence_lookback: int = 180
-    persistence_window: int = 3
-    persistence_move_needed: float = 3.0
-    min_persistence_sample: int = 60          # tightened: more evidence required
-    min_persistence_rate: float = 65.0        # tightened: repeats more reliably
-    persistence_stability_threshold: float = 4.0  # tightened: less erratic persistence
+    min_persistence_sample: int = 60
+    min_persistence_rate: float = 50.0
+    # Used only as a scoring bonus (see calculate_score), not a hard reject --
+    # a stock can have a strong win rate that's unevenly distributed across
+    # sub-periods and still be worth surfacing (e.g. AEGISLOG.NS: 95%+ raw
+    # persistence, 4.3% avg volatility, rejected outright by the old
+    # stability > threshold*2 hard gate).
+    persistence_stability_threshold: float = 4.0
 
     # Entry timing (independent of persistence)
     breakout_lookback: int = 20
@@ -74,19 +92,38 @@ class ScannerConfig:
     pullback_min: float = 2.0
     pullback_max: float = 8.0
 
-    # Trade levels / risk
+    # Trade levels / risk / exit
     atr_period: int = 14
     stop_atr_mult: float = 1.5
     recent_low_buffer: float = 0.975   # stop can't be looser than this * recent_low
-    target_risk_mult: float = 2.0      # target = entry + this * risk_per_share
-    max_risk_pct: float = 8.0          # hard filter: reject if risk/entry exceeds this
-    min_rr: float = 1.8                # tightened: reject if reward:risk is below this
+    target_pct: float = 3.0            # FIXED exit target: target = entry * (1 + target_pct/100)
+    max_risk_pct: float = 8.0          # safety-net hard filter; rarely binds since
+                                        # add_indicators' trade_stop already caps risk
+                                        # near target_pct/min_rr
+    min_rr: float = 1.0                # risk is capped at target_pct/min_rr (~3% here)
+                                        # in add_indicators, so this is a guaranteed floor,
+                                        # not just a post-hoc filter. 1.0 was chosen
+                                        # empirically: it's roughly where a fixed 3%
+                                        # target's stop distance stops being tighter than
+                                        # these stocks' own daily noise (see
+                                        # min_persistence_rate comment above) -- pushing
+                                        # min_rr higher tightens the stop below that noise
+                                        # floor and the win rate collapses for everything.
     max_hold_days: int = 5
 
     # Quality gate -- rejects candidates outright rather than just ranking them lower.
     # This is the main lever for "fewer but better": raise it to cut junk,
     # lower it if legitimate setups are getting excluded.
-    min_score: float = 65.0
+    # NOTE: persistence_score (max 30) and expected_move_score (max 10) now
+    # come from the barrier backtest's honest win rate / P&L-per-trade (see
+    # calculate_score), which structurally score lower than the old inflated
+    # proxy metrics did (~95% "persistence" / 5-7% "expected move" vs. real
+    # win rates of 40-60% and per-trade P&L of 0-1.5%). 65 rejected every
+    # single candidate tested, including known-profitable ones -- 40 is where
+    # AEGISLOG/ANTELOPUS actually score. min_persistence_rate is what does
+    # the expectancy filtering now; this gate mainly separates BUY-timed,
+    # low-noise setups from the rest. Retune after a real backtest run.
+    min_score: float = 40.0
 
     # Processing
     chunk_size: int = 100
@@ -213,52 +250,80 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
     ).max(axis=1)
     data["ATR"] = tr.rolling(config.atr_period).mean()
 
-    # Precomputed columns for verify_volatility_persistence (vectorized).
+    # Precomputed for run_barrier_backtest: was this stock already "volatile"
+    # (trailing average, no lookahead) as of each day.
     data["past_vol_mean"] = (
         data["volatility_measure"].rolling(config.volatility_lookback, min_periods=20).mean().shift(1)
     )
-    data["fwd_max_range"] = (
-        data["volatility_measure"].rolling(config.persistence_window).max().shift(-(config.persistence_window - 1))
-    )
+
+    # Trade levels for EVERY row (vectorized, no lookahead -- ATR/recent_low/Close
+    # are all trailing). The stop is the TIGHTEST (highest) of three candidates:
+    #   - an ATR-based stop (stop_atr_mult * ATR below entry)
+    #   - a structural floor (recent_low * recent_low_buffer)
+    #   - a floor implied by min_rr against the FIXED target_pct target: the
+    #     largest risk we can take and still clear min_rr for that target.
+    # That third candidate is what keeps risk from ballooning past what a fixed
+    # 3% target can justify on a wide-ATR (highly volatile) stock -- unlike a
+    # target sized as a multiple of risk (which trivially always hits the
+    # ratio), the target here is fixed at what the user actually wants.
+    atr_stop = data["Close"] - config.stop_atr_mult * data["ATR"]
+    structural_stop = data["recent_low"] * config.recent_low_buffer
+    rr_floor_stop = data["Close"] * (1 - (config.target_pct / config.min_rr) / 100)
+    data["trade_stop"] = pd.concat([atr_stop, structural_stop, rr_floor_stop], axis=1).max(axis=1)
+    data["trade_target"] = data["Close"] * (1 + config.target_pct / 100)
 
     return data
 
 
 # =========================================================
-# PERSISTENCE ENGINE
+# BARRIER BACKTEST -- simulates the exact "buy, take target_pct%, exit" rule
 # =========================================================
-def verify_volatility_persistence(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int, float, float]:
+def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int, float, float]:
     """
-    Checks: when this stock was 'volatile' historically, did it also deliver
-    a move in the next `persistence_window` days?
+    For each historically-eligible day (trailing avg volatility already >=
+    min_avg_volatility as of that day -- no lookahead), simulates the EXACT
+    rule this scanner surfaces today: buy at Close, exit at trade_target
+    (entry + target_pct%) or trade_stop, whichever the next `max_hold_days`
+    days hits first. A day that hits neither within the window is a TIMEOUT,
+    exited at that final day's close (counted as neither a win nor free --
+    its actual P&L is included in expected_pnl, and it does not count toward
+    hits/win_rate).
 
-    FIX (vs. prior version): the 4 sub-periods used to test persistence are
-    now anchored to the END of the array (most recent `persistence_lookback`
-    days), not to absolute index 0. The previous version tested only the
-    OLDEST `persistence_lookback` rows of the full download, so the most
-    recent ~2-3 months were never evaluated -- a stock whose volatility
-    regime changed recently was scored on stale behavior.
+    On a day that touches both stop and target, the stop is assumed hit
+    first -- daily OHLC can't tell us the intraday order, so this is the
+    conservative assumption.
 
-    Returns: (persistence_rate_pct, sample_size, expected_forward_move_pct, stability_std)
+    The 4 sub-periods are anchored to the END of the array (most recent
+    `persistence_lookback` days), not absolute index 0, so a stock whose
+    volatility regime changed recently isn't scored on stale behavior.
+
+    Returns: (win_rate_pct, sample_size, expected_pnl_pct, stability_std)
+      - win_rate_pct: % of trials that reached target_pct% before the stop/timeout.
+      - expected_pnl_pct: mean REALIZED return across all trials (wins at
+        +target_pct%, losses at their actual stop distance, timeouts at the
+        close on the final held day) -- the expected P&L per trade this rule
+        would have produced, not just a hit/miss rate.
     """
     lookback = config.persistence_lookback
-    window = config.persistence_window
-    needed = config.persistence_move_needed
-
-    if len(data) < lookback + window:
+    hold = config.max_hold_days
+    if len(data) < lookback + hold:
         return 0.0, 0, 0.0, 999.0
 
-    end_base = len(data) - window
-    start_base = end_base - lookback
+    end_base = len(data) - hold
+    start_base = max(0, end_base - lookback)
     period_size = max(1, lookback // 4)
 
-    eligible = data["past_vol_mean"] >= config.min_avg_volatility
-    hit = data["fwd_max_range"] >= needed
+    eligible = data["past_vol_mean"].to_numpy() >= config.min_avg_volatility
+    close = data["Close"].to_numpy()
+    high = data["High"].to_numpy()
+    low = data["Low"].to_numpy()
+    stop_arr = data["trade_stop"].to_numpy()
+    target_arr = data["trade_target"].to_numpy()
 
     hits = 0
     total = 0
-    forward_moves: list[float] = []
-    persistence_by_period: list[float] = []
+    pnl_pcts: list[float] = []
+    win_rate_by_period: list[float] = []
 
     for period_num in range(4):
         p_start = start_base + period_num * period_size
@@ -267,26 +332,46 @@ def verify_volatility_persistence(data: pd.DataFrame, config: ScannerConfig) -> 
         if p_start >= p_end:
             continue
 
-        mask = eligible.iloc[p_start:p_end]
-        idx = mask[mask].index
-        period_total = len(idx)
-        if period_total == 0:
-            continue
+        period_hits = 0
+        period_total = 0
+        for i in range(p_start, p_end):
+            if not eligible[i]:
+                continue
+            entry = close[i]
+            stop = stop_arr[i]
+            target = target_arr[i]
+            if not (np.isfinite(entry) and np.isfinite(stop) and np.isfinite(target)) or stop >= entry:
+                continue
 
-        period_hits = int(hit.loc[idx].sum())
-        forward_moves.extend(data.loc[idx, "fwd_max_range"].tolist())
-        hits += period_hits
-        total += period_total
-        persistence_by_period.append(period_hits / period_total * 100)
+            exit_pct = None
+            for j in range(i + 1, min(i + 1 + hold, len(data))):
+                if low[j] <= stop:
+                    exit_pct = (stop - entry) / entry * 100
+                    break
+                if high[j] >= target:
+                    exit_pct = config.target_pct
+                    hits += 1
+                    period_hits += 1
+                    break
+            if exit_pct is None:
+                last_idx = min(i + hold, len(data) - 1)
+                exit_pct = (close[last_idx] - entry) / entry * 100
+
+            pnl_pcts.append(exit_pct)
+            total += 1
+            period_total += 1
+
+        if period_total > 0:
+            win_rate_by_period.append(period_hits / period_total * 100)
 
     if total == 0:
         return 0.0, 0, 0.0, 999.0
 
-    persistence_rate = round(hits / total * 100, 1)
-    expected_move = round(float(np.mean(forward_moves)), 2)
-    stability = round(float(np.std(persistence_by_period)), 1) if len(persistence_by_period) > 1 else 0.0
+    win_rate = round(hits / total * 100, 1)
+    expected_pnl = round(float(np.mean(pnl_pcts)), 2)
+    stability = round(float(np.std(win_rate_by_period)), 1) if len(win_rate_by_period) > 1 else 0.0
 
-    return persistence_rate, total, expected_move, stability
+    return win_rate, total, expected_pnl, stability
 
 
 def verify_volatility_identity(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, float, int, float]:
@@ -348,30 +433,57 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
 
     return "WATCH", "coiling", "Volatile & coiling - watch for trigger"
 
+
+def compute_setup_age(data: pd.DataFrame, config: ScannerConfig, current_setup_type: str,
+                       max_lookback: int = 15) -> int:
+    """
+    How many most-recent consecutive trading days (including today) has this
+    exact setup_type held, walking backward one day at a time and re-running
+    get_entry_trigger as of each prior day (no lookahead -- indicators are
+    already trailing/causal, so truncating the frame is enough).
+
+    Why this exists: a BUY trigger is frequently a SINGLE-DAY event (e.g.
+    "reclaim" requires yesterday to have been below EMA20, by construction).
+    DYCL.NS surfaced BUY/pullback_bounce for exactly one day (2026-08-12)
+    then flipped to WATCH/coiling the next day and stayed there -- a report
+    read or acted on a few days late looks identical to a fresh one unless
+    something says otherwise. Setup_Age_Days == 1 means "triggered today";
+    a WATCH row with a large value has been sitting a while.
+    """
+    age = 0
+    for back in range(max_lookback):
+        end = len(data) - back
+        if end < 3:
+            break
+        _, setup_type, _ = get_entry_trigger(data.iloc[:end], config)
+        if setup_type != current_setup_type:
+            break
+        age += 1
+    return age
+
 # =========================================================
 # RISK / TRADE LEVELS
 # =========================================================
 def calculate_risk_reward(data: pd.DataFrame, config: ScannerConfig) -> Optional[dict[str, float]]:
     """
-    FIX (vs. prior version): stop-loss is now ATR-aware (max of an ATR-based
-    stop and a buffer below the recent low), and target scales with actual
-    risk taken rather than a flat percentage. Candidates whose risk % or R:R
-    don't clear config thresholds are rejected by the caller.
+    Reads the trade_stop / trade_target columns add_indicators already
+    computed for the latest row (see compute_trade_levels comment there for
+    how the stop is sized). Candidates whose risk % or R:R don't clear
+    config thresholds are rejected by the caller.
     """
     latest = data.iloc[-1]
     entry = float(latest["Close"])
     atr = float(latest["ATR"])
-    recent_low = float(latest["recent_low"])
+    stop_loss = float(latest["trade_stop"])
+    target = float(latest["trade_target"])
 
-    if not all(math.isfinite(x) for x in [entry, atr, recent_low]) or atr <= 0:
+    if not all(math.isfinite(x) for x in [entry, atr, stop_loss, target]) or atr <= 0:
         return None
 
-    stop_loss = max(entry - config.stop_atr_mult * atr, recent_low * config.recent_low_buffer)
     risk = entry - stop_loss
     if risk <= 0:
         return None
 
-    target = entry + config.target_risk_mult * risk
     rr = (target - entry) / risk
     risk_pct = risk / entry * 100
 
@@ -404,7 +516,11 @@ def calculate_score(
     config: ScannerConfig,
 ) -> float:
     persistence_score = min(persistence_rate / 100 * 30, 30)
-    expected_move_score = min(expected_move / 6 * 10, 10)
+    # expected_move is now the barrier backtest's mean realized P&L per trade
+    # (see run_barrier_backtest), bounded above by target_pct (a perfect
+    # win rate) -- score relative to that ceiling rather than a fixed divisor
+    # so it stays meaningful if target_pct is retuned.
+    expected_move_score = min(max(expected_move, 0) / config.target_pct * 10, 10)
 
     if persistence_stability < config.persistence_stability_threshold:
         stability_bonus = 10
@@ -472,15 +588,16 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if volatility_ratio < config.min_volatility_ratio:
         return None
 
-    persistence_rate, sample_size, expected_move, persistence_stability = verify_volatility_persistence(data, config)
+    persistence_rate, sample_size, expected_move, persistence_stability = run_barrier_backtest(data, config)
     if sample_size < config.min_persistence_sample:
         return None
     if persistence_rate < config.min_persistence_rate:
         return None
-    if persistence_stability > config.persistence_stability_threshold * 2:
-        return None
+    # persistence_stability is scoring-only (see calculate_score) -- not a
+    # hard reject. See the config field comment for why.
 
     action, setup_type, reason = get_entry_trigger(data, config)
+    setup_age_days = compute_setup_age(data, config, setup_type)
 
     risk = calculate_risk_reward(data, config)
     if risk is None:
@@ -509,6 +626,7 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Run_Date": run_date,
         "Action": action,
         "Setup_Type": setup_type,
+        "Setup_Age_Days": setup_age_days,
         "Score": score,
         "Reason": reason,
         "Price": round(last_close, 2),
@@ -610,6 +728,7 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Run_Date", "DATE"),
     bigquery.SchemaField("Action", "STRING"),
     bigquery.SchemaField("Setup_Type", "STRING"),
+    bigquery.SchemaField("Setup_Age_Days", "INT64"),
     bigquery.SchemaField("Score", "FLOAT64"),
     bigquery.SchemaField("Reason", "STRING"),
     bigquery.SchemaField("Price", "FLOAT64"),
@@ -749,8 +868,8 @@ def _resolve_project_id(project_id: Optional[str]) -> str:
 # =========================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Volatility persistence swing scanner - finds stocks that reliably "
-                    "repeat volatility in 2-3 day windows with stable persistence."
+        description="Volatility persistence swing scanner - buys volatile setups and "
+                    "backtests exiting each one at a fixed profit target."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
@@ -761,15 +880,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--range-event-threshold", default=3.5, type=float)
     p.add_argument("--min-volatile-days", default=30, type=int)
 
-    p.add_argument("--persistence-window", default=3, type=int)
-    p.add_argument("--persistence-move", default=3.0, type=float)
-    p.add_argument("--min-persistence", default=60.0, type=float)
-    p.add_argument("--min-persistence-sample", default=50, type=int)
+    p.add_argument("--min-persistence", default=ScannerConfig.min_persistence_rate, type=float,
+                    help="Minimum win rate (%%) from the barrier backtest -- see run_barrier_backtest")
+    p.add_argument("--min-persistence-sample", default=ScannerConfig.min_persistence_sample, type=int)
 
     p.add_argument("--min-price", default=ScannerConfig.min_price, type=float)
     p.add_argument("--max-price", default=ScannerConfig.max_price, type=float)
     p.add_argument("--min-traded-value-cr", default=ScannerConfig.min_avg_traded_value_cr, type=float)
 
+    p.add_argument("--target-pct", default=ScannerConfig.target_pct, type=float,
+                    help="Fixed profit target %% above entry -- this IS the exit rule")
     p.add_argument("--min-rr", default=ScannerConfig.min_rr, type=float)
     p.add_argument("--max-risk-pct", default=ScannerConfig.max_risk_pct, type=float)
     p.add_argument("--max-hold-days", default=ScannerConfig.max_hold_days, type=int)
@@ -807,13 +927,12 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         min_avg_volatility=args.min_avg_volatility,
         range_event_threshold=args.range_event_threshold,
         min_volatile_days=args.min_volatile_days,
-        persistence_window=args.persistence_window,
-        persistence_move_needed=args.persistence_move,
         min_persistence_rate=args.min_persistence,
         min_persistence_sample=args.min_persistence_sample,
         min_price=args.min_price,
         max_price=args.max_price,
         min_avg_traded_value_cr=args.min_traded_value_cr,
+        target_pct=args.target_pct,
         min_rr=args.min_rr,
         max_risk_pct=args.max_risk_pct,
         max_hold_days=args.max_hold_days,
@@ -826,12 +945,14 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     if args.limit > 0:
         tickers = tickers[:args.limit]
 
+    risk_cap_pct = config.target_pct / config.min_rr
     print(f"Universe: Rs.{config.min_price}-{config.max_price} | Liquidity >= {config.min_avg_traded_value_cr} Cr")
     print(f"Volatility: 6-month avg >= {config.min_avg_volatility}% | median >= {config.min_median_volatility}% | "
           f"{config.min_volatile_days}+ volatile days")
-    print(f"Persistence: repeat {config.min_persistence_rate}%+ ({config.min_persistence_sample}+ samples) | "
-          f"stability < {config.persistence_stability_threshold}% swing")
-    print(f"Risk: max risk {config.max_risk_pct}% | min R:R {config.min_rr}")
+    print(f"Exit rule: +{config.target_pct}% target, ATR/structure stop capped at "
+          f"~{risk_cap_pct:.2f}% risk (guarantees R:R >= {config.min_rr}), {config.max_hold_days}-day max hold")
+    print(f"Barrier backtest: win rate >= {config.min_persistence_rate}% "
+          f"({config.min_persistence_sample}+ eligible days in last {config.persistence_lookback})")
     print(f"Scanning {len(tickers)} tickers...")
     print("-" * 80)
 
@@ -860,16 +981,18 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             print("\nNo BUY signals today. Showing top WATCH candidates instead:")
             display = candidates.head(15)
 
-    print("\n" + "-" * 90)
+    print("\n" + "-" * 100)
     print("RESULTS (sorted: BUY first, then by persistence, stability, score)")
-    print("-" * 90)
-    header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Score':>6} {'Vol%':>6} "
+    print("Age = consecutive days this Setup has held. BUY only trust Age==1 as a fresh")
+    print("trigger -- most BUY setups are single-day; re-run before acting on an old report.")
+    print("-" * 100)
+    header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
               f"{'Persist%':>9} {'Stabil':>7} {'ExpMove':>8} {'Today%':>7} {'RR':>5} "
               f"{'Entry':>9} {'SL':>9} {'Target':>9}")
     print(header)
-    print("-" * 90)
+    print("-" * 100)
     for _, r in display.iterrows():
-        print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} "
+        print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} {r['Setup_Age_Days']:>4} "
               f"{r['Score']:>6.1f} {r['Avg_Volatility']:>5.1f}% "
               f"{r['Persistence_Rate']:>8.0f}% {r['Persistence_Stability']:>6.1f} "
               f"{r['Expected_Move']:>7.1f}% {r['Today_Range']:>6.1f}% {r['RR_Ratio']:>5.1f} "

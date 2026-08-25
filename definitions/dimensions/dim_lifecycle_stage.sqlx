@@ -5,9 +5,9 @@ config {
   hasOutput: true
 }
 
--- NOTE: setup_type values here are matched EXACTLY to what persistence.py's
+-- NOTE: setup_type values here are matched EXACTLY to what persistenc_1.py's
 -- get_entry_trigger() emits as Setup_Type (see setup_type strings in
--- get_entry_trigger / calculate_score in persistence.py). If that function's
+-- get_entry_trigger / calculate_score in persistenc_1.py). If that function's
 -- setup_type strings ever change, update this table in the same PR or
 -- fact_stock_scan's LEFT JOIN will start emitting NULL lifecycle_stage_key
 -- for the new/renamed setup.
