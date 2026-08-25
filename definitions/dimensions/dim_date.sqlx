@@ -10,7 +10,7 @@ MERGE INTO `sudarshan-442212.data_options.dim_date` AS T
 USING (
   SELECT DISTINCT
     Bar_Date AS calendar_date
-  FROM `sudarshan-442212.data_options.daily_stocks_v2`
+  FROM ${ref("daily_stocks_v2")}
   WHERE Bar_Date IS NOT NULL
 ) AS S
 

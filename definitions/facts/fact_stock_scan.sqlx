@@ -5,13 +5,18 @@ config {
   uniqueKey: ["stock_key", "date_key"],
   bigquery: {
     partitionBy: "bar_date",
-    clusterBy: ["stock_key", "ticker"]
+    clusterBy: ["ticker", "action"]
+  },
+  assertions: {
+    uniqueKey: ["stock_key", "date_key"],
+    nonNull: ["stock_key", "date_key", "ticker", "bar_date"]
   }
 }
 
 SELECT
   ds.stock_key,
   dd.date_key,
+  dls.lifecycle_stage_key,
   S.Ticker AS ticker,
   S.Bar_Date AS bar_date,
   S.Action AS action,
@@ -42,18 +47,30 @@ SELECT
   S.ATR AS atr,
   S.Max_Hold_Days AS max_hold_days,
   CURRENT_TIMESTAMP() AS loaded_at
-FROM `sudarshan-442212.data_options.daily_stocks_v2` S
 
-JOIN `sudarshan-442212.data_options.dim_stock` ds
+FROM ${ref("daily_stocks_v2")} S
+
+JOIN ${ref("dim_stock")} ds
   ON ds.ticker = S.Ticker
 
-JOIN `sudarshan-442212.data_options.dim_date` dd
+JOIN ${ref("dim_date")} dd
   ON dd.calendar_date = S.Bar_Date
+
+-- LEFT JOIN: an unmapped/new Setup_Type should still land in the fact table
+-- (with a NULL lifecycle_stage_key) rather than being silently dropped the
+-- way an INNER JOIN would drop it.
+LEFT JOIN ${ref("dim_lifecycle_stage")} dls
+  ON dls.setup_type = S.Setup_Type
 
 WHERE
   S.Ticker IS NOT NULL
   AND S.Bar_Date IS NOT NULL
 
 ${when(incremental(), `
-  AND S.Bar_Date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+  -- Widened from 2 to 14 days: a 2-day window means any Bar_Date older than
+  -- that (a missed scan day, a backfill, a rerun after a bug fix) is
+  -- silently unreachable by this incremental query forever. uniqueKey
+  -- already makes reruns idempotent, so a wider window costs little and
+  -- closes that gap.
+  AND S.Bar_Date >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
 `)}

@@ -1,0 +1,60 @@
+config {
+  type: "view",
+  schema: "data_options",
+  name: "vw_stock_lifecycle_observation"
+}
+
+-- One row per (stock, bar_date) with the prior observation's key fields
+-- attached via LAG, so downstream queries (see vw_stock_lifecycle_transitions)
+-- can compute deltas and transition labels without re-joining.
+
+SELECT
+    stock_key,
+    date_key,
+    ticker,
+    bar_date,
+
+    action,
+    setup_type,
+    score,
+    reason,
+
+    price,
+
+    avg_volatility,
+    median_volatility,
+    volatile_days,
+    volatility_ratio,
+    today_range,
+
+    persistence_rate,
+    persistence_sample,
+    expected_move,
+    persistence_stability,
+
+    traded_value_cr,
+    volume_spike,
+
+    pullback_pct,
+    dist_support_pct,
+    dist_ma20_pct,
+
+    entry,
+    stop_loss,
+    target,
+    risk_per_share,
+    risk_pct,
+    rr_ratio,
+    atr,
+    max_hold_days,
+
+    LAG(setup_type) OVER w AS previous_setup_type,
+    LAG(action) OVER w AS previous_action,
+    LAG(score) OVER w AS previous_score,
+    LAG(price) OVER w AS previous_price,
+    LAG(today_range) OVER w AS previous_today_range,
+    LAG(pullback_pct) OVER w AS previous_pullback_pct,
+    LAG(dist_ma20_pct) OVER w AS previous_dist_ma20_pct
+
+FROM ${ref("fact_stock_scan")}
+WINDOW w AS (PARTITION BY stock_key ORDER BY bar_date)
