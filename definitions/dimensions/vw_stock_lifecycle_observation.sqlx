@@ -13,9 +13,11 @@ SELECT
     date_key,
     ticker,
     bar_date,
+    run_date,
 
     action,
     setup_type,
+    setup_age_days,
     score,
     reason,
 
