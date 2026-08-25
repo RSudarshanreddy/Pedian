@@ -1,0 +1,103 @@
+config {
+  type: "operations",
+  schema: "data_options",
+  name: "dim_lifecycle_stage",
+  hasOutput: true
+}
+
+-- NOTE: setup_type values here are matched EXACTLY to what persistence.py's
+-- get_entry_trigger() emits as Setup_Type (see setup_type strings in
+-- get_entry_trigger / calculate_score in persistence.py). If that function's
+-- setup_type strings ever change, update this table in the same PR or
+-- fact_stock_scan's LEFT JOIN will start emitting NULL lifecycle_stage_key
+-- for the new/renamed setup.
+
+MERGE INTO `sudarshan-442212.data_options.dim_lifecycle_stage` AS T
+
+USING (
+  SELECT
+    1 AS lifecycle_stage_key,
+    'coiling' AS setup_type,
+    'FORMATION' AS stage_group,
+    FALSE AS entry_eligible,
+    'Volatile stock consolidating and waiting for a trigger.' AS description
+
+  UNION ALL
+
+  SELECT
+    2,
+    'breakout',
+    'EXPANSION',
+    TRUE,
+    'Stock has broken out with confirmation.'
+
+  UNION ALL
+
+  SELECT
+    3,
+    'deep_pullback',
+    'PULLBACK',
+    FALSE,
+    'Stock is undergoing a meaningful pullback.'
+
+  UNION ALL
+
+  SELECT
+    4,
+    'pullback_bounce',
+    'RECOVERY',
+    TRUE,
+    'Stock has bounced from a pullback.'
+
+  UNION ALL
+
+  SELECT
+    5,
+    'below_trend',
+    'WEAKNESS',
+    FALSE,
+    'Price is below trend and requires a reclaim.'
+
+  UNION ALL
+
+  SELECT
+    6,
+    'extended',
+    'EXPANSION',
+    FALSE,
+    'Stock has become extended after a strong move.'
+
+  UNION ALL
+
+  SELECT
+    7,
+    'reclaim',
+    'RECOVERY',
+    TRUE,
+    'Reclaimed EMA20 with a bullish close.'
+) AS S
+
+ON T.lifecycle_stage_key = S.lifecycle_stage_key
+
+WHEN MATCHED THEN
+  UPDATE SET
+    setup_type = S.setup_type,
+    stage_group = S.stage_group,
+    entry_eligible = S.entry_eligible,
+    description = S.description
+
+WHEN NOT MATCHED THEN
+  INSERT (
+    lifecycle_stage_key,
+    setup_type,
+    stage_group,
+    entry_eligible,
+    description
+  )
+  VALUES (
+    S.lifecycle_stage_key,
+    S.setup_type,
+    S.stage_group,
+    S.entry_eligible,
+    S.description
+  );

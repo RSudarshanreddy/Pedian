@@ -1,0 +1,48 @@
+config {
+  type: "view",
+  schema: "data_options",
+  name: "vw_stock_lifecycle_transitions"
+}
+
+-- Labels each observation with how it got there (INITIAL / X_CONTINUATION /
+-- a curated transition name / generic X_TO_Y fallback), plus deltas since
+-- the previous observation. Curated branches only exist where they read
+-- better than the generic fallback would (PULLBACK_TO_BOUNCE instead of
+-- DEEP_PULLBACK_TO_PULLBACK_BOUNCE, etc.) -- transitions whose curated
+-- label would be identical to the generic fallback are omitted rather than
+-- duplicated, so there's one source of truth per transition.
+
+SELECT
+    *,
+
+    CASE
+        WHEN previous_setup_type IS NULL
+            THEN 'INITIAL'
+
+        WHEN setup_type = previous_setup_type
+            THEN CONCAT(UPPER(setup_type), '_CONTINUATION')
+
+        WHEN previous_setup_type = 'deep_pullback' AND setup_type = 'pullback_bounce'
+            THEN 'PULLBACK_TO_BOUNCE'
+
+        WHEN previous_setup_type = 'extended' AND setup_type = 'deep_pullback'
+            THEN 'EXTENDED_TO_PULLBACK'
+
+        WHEN previous_setup_type = 'below_trend' AND setup_type = 'pullback_bounce'
+            THEN 'TREND_RECLAIM'
+
+        ELSE CONCAT(UPPER(previous_setup_type), '_TO_', UPPER(setup_type))
+    END AS lifecycle_transition,
+
+    score - previous_score AS score_change,
+
+    SAFE_DIVIDE(
+        price - previous_price,
+        NULLIF(previous_price, 0)
+    ) * 100 AS price_change_pct,
+
+    pullback_pct - previous_pullback_pct AS pullback_change_pct,
+
+    dist_ma20_pct - previous_dist_ma20_pct AS ma20_distance_change_pct
+
+FROM ${ref("vw_stock_lifecycle_observation")}

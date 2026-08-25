@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+node_modules/
+=======
 # Python
 __pycache__/
 *.py[cod]
@@ -34,3 +37,4 @@ Thumbs.db
 *.xlsx
 *.parquet
 *.pkl
+>>>>>>> refs/heads/feature/restructure-project
