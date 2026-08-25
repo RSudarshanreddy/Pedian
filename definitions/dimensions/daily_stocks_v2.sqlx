@@ -1,7 +1,0 @@
-config {
-  type: "declaration",
-  database: "sudarshan-442212",
-  schema: "data_options",
-  name: "daily_stocks_v2",
-  description: "Raw scanner output loaded by swings.py. One row per (Ticker, Bar_Date)."
-}

@@ -37,7 +37,7 @@ LOGGER = logging.getLogger(__name__)
 
 NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 REQUIRED_COLUMNS = {"Open", "High", "Low", "Close", "Volume"}
-DEFAULT_BQ_TABLE_ID = "daily_stocks_v2"
+DEFAULT_BQ_TABLE_ID = "swings"
 
 # =========================================================
 # CONFIG

@@ -60,7 +60,7 @@ SELECT
   S.Max_Hold_Days AS max_hold_days,
   CURRENT_TIMESTAMP() AS loaded_at
 
-FROM ${ref("daily_stocks_v2")} S
+FROM ${ref("swings")} S
 
 JOIN ${ref("dim_stock")} ds
   ON ds.ticker = S.Ticker

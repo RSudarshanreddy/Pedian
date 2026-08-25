@@ -10,7 +10,7 @@ MERGE INTO `sudarshan-442212.data_options.dim_stock` AS T
 USING (
   SELECT DISTINCT
     Ticker AS ticker
-  FROM ${ref("daily_stocks_v2")}
+  FROM ${ref("swings")}
   WHERE Ticker IS NOT NULL
 ) AS S
 
