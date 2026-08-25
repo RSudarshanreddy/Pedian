@@ -13,14 +13,24 @@ config {
   }
 }
 
+-- Column list matches swings.py's actual BQ_SCHEMA / build_candidate() output
+-- exactly (verified against the live `swings` table schema). Earlier versions
+-- of this SELECT referenced columns (Today_Close_Move, Gap_Pct, Three_Day_Move,
+-- Upper_Circuit_Like_Days, Recent_Range_Avg/Median, Range_3Pct_Days/Ratio,
+-- Continuation_*) from a scanner schema that was never actually implemented --
+-- the first four groups are legacy dead columns left over in the live table
+-- from an older pipeline (always NULL), and the Continuation_* fields never
+-- existed in the table at all, which is what broke this query.
 SELECT
   ds.stock_key,
   dd.date_key,
   dls.lifecycle_stage_key,
   S.Ticker AS ticker,
   S.Bar_Date AS bar_date,
+  S.Run_Date AS run_date,
   S.Action AS action,
   S.Setup_Type AS setup_type,
+  S.Setup_Age_Days AS setup_age_days,
   S.Score AS score,
   S.Reason AS reason,
   S.Price AS price,
@@ -29,18 +39,6 @@ SELECT
   S.Volatile_Days AS volatile_days,
   S.Volatility_Ratio AS volatility_ratio,
   S.Today_Range AS today_range,
-  S.Today_Close_Move AS today_close_move,
-  S.Gap_Pct AS gap_pct,
-  S.Three_Day_Move AS three_day_move,
-  S.Upper_Circuit_Like_Days AS upper_circuit_like_days,
-  S.Recent_Range_Avg AS recent_range_avg,
-  S.Recent_Range_Median AS recent_range_median,
-  S.Range_3Pct_Days AS range_3pct_days,
-  S.Range_3Pct_Ratio AS range_3pct_ratio,
-  S.Continuation_3Pct_Hit_Rate AS continuation_3pct_hit_rate,
-  S.Continuation_Sample AS continuation_sample,
-  S.Continuation_Median_Upside AS continuation_median_upside,
-  S.Continuation_End_Return AS continuation_end_return,
   S.Persistence_Rate AS persistence_rate,
   S.Persistence_Sample AS persistence_sample,
   S.Expected_Move AS expected_move,
