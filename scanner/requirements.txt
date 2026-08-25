@@ -1,0 +1,7 @@
+# Dependencies for the Cloud Run / Cloud Functions deployment.
+functions-framework>=3.8,<4
+google-cloud-bigquery>=3.38
+numpy>=2.0
+pandas>=2.2
+pyarrow>=18
+yfinance>=0.2.54
