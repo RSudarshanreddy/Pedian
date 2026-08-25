@@ -1,0 +1,40 @@
+<<<<<<< HEAD
+node_modules/
+=======
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Google Cloud credentials
+*-service-account.json
+service-account.json
+credentials.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated data
+*.csv
+*.xlsx
+*.parquet
+*.pkl
+>>>>>>> refs/heads/feature/restructure-project

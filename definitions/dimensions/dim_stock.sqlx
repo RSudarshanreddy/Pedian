@@ -1,0 +1,29 @@
+config {
+  type: "operations",
+  schema: "data_options",
+  name: "dim_stock",
+  hasOutput: true
+}
+
+MERGE INTO `sudarshan-442212.data_options.dim_stock` AS T
+
+USING (
+  SELECT DISTINCT
+    Ticker AS ticker
+  FROM ${ref("daily_stocks_v2")}
+  WHERE Ticker IS NOT NULL
+) AS S
+
+ON T.ticker = S.ticker
+
+WHEN NOT MATCHED THEN
+  INSERT (
+    stock_key,
+    ticker,
+    active_flag
+  )
+  VALUES (
+    FARM_FINGERPRINT(S.ticker),
+    S.ticker,
+    TRUE
+  );
