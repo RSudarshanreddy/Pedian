@@ -1,0 +1,38 @@
+config {
+  type: "view",
+  schema: "data_options",
+  name: "vw_daily_digest"
+}
+
+-- The "5-minute daily check" view: today's actionable rows only, trimmed to
+-- the columns that actually drive a decision (see the Tier 1 list worked out
+-- earlier -- everything else is either a join key, already summarized by
+-- these fields, or context you'd only dig into after something here flags
+-- your attention). Meant to be the thing connected to Google Sheets for
+-- mobile viewing, not vw_stock_action_signals directly.
+
+SELECT
+    ticker,
+    bar_date,
+    action_signal,
+    action,
+    setup_type,
+    previous_setup_type,
+    setup_age_days,
+    score,
+    persistence_rate,
+    expected_move,
+    reason,
+    entry,
+    stop_loss,
+    target,
+    rr_ratio
+
+FROM ${ref("vw_stock_action_signals")}
+
+WHERE bar_date = (SELECT MAX(bar_date) FROM ${ref("swings")})
+  AND (action_signal IS NOT NULL OR action = 'BUY')
+
+ORDER BY
+  CASE action_signal WHEN 'ENTRY' THEN 0 WHEN 'EXIT' THEN 1 ELSE 2 END,
+  score DESC
