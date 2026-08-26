@@ -987,30 +987,83 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     Functions Framework calls the configured entry point with the Flask
     request object.  The optional argument keeps ``python swings.py``
     working while making ``main`` a valid Cloud Function HTTP handler.
-    """
-    args = parse_args()
-    config = ScannerConfig(
-        min_avg_volatility=args.min_avg_volatility,
-        range_event_threshold=args.range_event_threshold,
-        min_volatile_days=args.min_volatile_days,
-        min_persistence_rate=args.min_persistence,
-        min_persistence_sample=args.min_persistence_sample,
-        min_price=args.min_price,
-        max_price=args.max_price,
-        min_avg_traded_value_cr=args.min_traded_value_cr,
-        target_pct=args.target_pct,
-        max_extension_days=args.max_extension_days,
-        min_rr=args.min_rr,
-        max_risk_pct=args.max_risk_pct,
-        max_hold_days=args.max_hold_days,
-        min_score=args.min_score,
-        top_n=args.top_n,
-        verbose=args.verbose,
-    )
 
-    tickers = parse_tickers(args.tickers) if args.tickers else load_nse_tickers(args.symbols_source)
-    if args.limit > 0:
-        tickers = tickers[:args.limit]
+    IMPORTANT: when invoked over HTTP, sys.argv still holds whatever flags
+    the CONTAINER was launched with (e.g. functions-framework's own
+    "--target=main --source=swings.py --port=8080"), not anything about
+    this request -- parse_args() must never run in that path. It used to,
+    and argparse's prefix-matching silently mapped "--target=main" onto this
+    file's own --target-pct flag, then crashed trying to parse "main" as a
+    float -- which failed every single HTTP request. Config here comes from
+    the request's JSON body (if any) or plain defaults instead.
+    """
+    if request is not None:
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+
+        config = ScannerConfig(
+            min_avg_volatility=float(body.get("min_avg_volatility", ScannerConfig.min_avg_volatility)),
+            range_event_threshold=float(body.get("range_event_threshold", ScannerConfig.range_event_threshold)),
+            min_volatile_days=int(body.get("min_volatile_days", ScannerConfig.min_volatile_days)),
+            min_persistence_rate=float(body.get("min_persistence", ScannerConfig.min_persistence_rate)),
+            min_persistence_sample=int(body.get("min_persistence_sample", ScannerConfig.min_persistence_sample)),
+            min_price=float(body.get("min_price", ScannerConfig.min_price)),
+            max_price=float(body.get("max_price", ScannerConfig.max_price)),
+            min_avg_traded_value_cr=float(body.get("min_traded_value_cr", ScannerConfig.min_avg_traded_value_cr)),
+            target_pct=float(body.get("target_pct", ScannerConfig.target_pct)),
+            max_extension_days=int(body.get("max_extension_days", ScannerConfig.max_extension_days)),
+            min_rr=float(body.get("min_rr", ScannerConfig.min_rr)),
+            max_risk_pct=float(body.get("max_risk_pct", ScannerConfig.max_risk_pct)),
+            max_hold_days=int(body.get("max_hold_days", ScannerConfig.max_hold_days)),
+            min_score=float(body.get("min_score", ScannerConfig.min_score)),
+            top_n=int(body.get("top_n", ScannerConfig.top_n)),
+            verbose=bool(body.get("verbose", False)),
+        )
+        raw_tickers = body.get("tickers")
+        tickers = parse_tickers(raw_tickers) if raw_tickers else load_nse_tickers(body.get("symbols_source", NSE_EQUITY_LIST_URL))
+        limit = int(body.get("limit", 0))
+        if limit > 0:
+            tickers = tickers[:limit]
+
+        only_buy = bool(body.get("only_buy", False))
+        output_path = ""
+        no_bq = bool(body.get("no_bq", False))
+        project_id = body.get("project_id")
+        dataset_id = body.get("dataset_id", "data_options")
+        table_id = body.get("table_id", DEFAULT_BQ_TABLE_ID)
+    else:
+        args = parse_args()
+        config = ScannerConfig(
+            min_avg_volatility=args.min_avg_volatility,
+            range_event_threshold=args.range_event_threshold,
+            min_volatile_days=args.min_volatile_days,
+            min_persistence_rate=args.min_persistence,
+            min_persistence_sample=args.min_persistence_sample,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_avg_traded_value_cr=args.min_traded_value_cr,
+            target_pct=args.target_pct,
+            max_extension_days=args.max_extension_days,
+            min_rr=args.min_rr,
+            max_risk_pct=args.max_risk_pct,
+            max_hold_days=args.max_hold_days,
+            min_score=args.min_score,
+            top_n=args.top_n,
+            verbose=args.verbose,
+        )
+
+        tickers = parse_tickers(args.tickers) if args.tickers else load_nse_tickers(args.symbols_source)
+        if args.limit > 0:
+            tickers = tickers[:args.limit]
+
+        only_buy = args.only_buy
+        output_path = args.output
+        no_bq = args.no_bq
+        project_id = args.project_id
+        dataset_id = args.dataset_id
+        table_id = args.table_id
 
     risk_cap_pct = config.target_pct / config.min_rr
     print(f"Universe: Rs.{config.min_price}-{config.max_price} | Liquidity >= {config.min_avg_traded_value_cr} Cr")
@@ -1044,7 +1097,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         return (message, 200) if request is not None else None
 
     display = candidates
-    if args.only_buy:
+    if only_buy:
         display = candidates[candidates["Action"] == "BUY"]
         if display.empty:
             print("\nNo BUY signals today. Showing top WATCH candidates instead:")
@@ -1067,9 +1120,9 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
               f"{r['Expected_Move']:>7.1f}% {r['Today_Range']:>6.1f}% {r['RR_Ratio']:>5.1f} "
               f"{r['Entry']:>9.2f} {r['Stop_Loss']:>9.2f} {r['Target']:>9.2f}")
 
-    if args.output:
-        candidates.to_csv(args.output, index=False)
-        print(f"\nSaved {len(candidates)} rows to {args.output}")
+    if output_path:
+        candidates.to_csv(output_path, index=False)
+        print(f"\nSaved {len(candidates)} rows to {output_path}")
 
     if total_quality > len(candidates):
         print(f"\nNote: {total_quality} total quality candidates found, only top {config.top_n} shown/saved. "
@@ -1077,11 +1130,11 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     else:
         print(f"\nTotal quality candidates: {total_quality}")
 
-    if not args.no_bq:
+    if not no_bq:
         try:
-            project_id = _resolve_project_id(args.project_id)
-            n = write_to_bigquery(candidates, project_id, args.dataset_id, args.table_id)
-            print(f"Wrote {n} rows to {project_id}.{args.dataset_id}.{args.table_id}")
+            resolved_project_id = _resolve_project_id(project_id)
+            n = write_to_bigquery(candidates, resolved_project_id, dataset_id, table_id)
+            print(f"Wrote {n} rows to {resolved_project_id}.{dataset_id}.{table_id}")
         except Exception as exc:
             print(f"\nBigQuery write skipped/failed: {exc}")
             print("Use --no-bq to suppress this, or --project-id / set GCP_PROJECT to fix it.")
