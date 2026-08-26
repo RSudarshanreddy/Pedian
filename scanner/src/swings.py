@@ -925,6 +925,60 @@ def _resolve_project_id(project_id: Optional[str]) -> str:
     return resolved
 
 
+DATAFORM_LOCATION = "us-central1"
+DATAFORM_REPOSITORY_ID = "sudarshan_repo"
+DATAFORM_GIT_COMMITISH = "feature/restructure-project"
+DATAFORM_SERVICE_ACCOUNT = "347050126858-compute@developer.gserviceaccount.com"
+
+
+def trigger_dataform_run(
+    project_id: str,
+    location: str = DATAFORM_LOCATION,
+    repository_id: str = DATAFORM_REPOSITORY_ID,
+    git_commitish: str = DATAFORM_GIT_COMMITISH,
+    service_account: str = DATAFORM_SERVICE_ACCOUNT,
+) -> str:
+    """
+    Triggers a Dataform workflow invocation (compile the repo at
+    git_commitish, then run it) via the REST API, so fact_stock_scan / the
+    lifecycle views / vw_daily_digest pick up this run's fresh rows without
+    a human manually starting an execution. No Dataform CLI is available in
+    every environment this runs in, and a separate orchestration service
+    would be overkill for two sequential API calls -- this runs inside the
+    same Cloud Run invocation that just wrote to BigQuery, using whatever
+    credentials that service already has (needs roles/dataform.editor on
+    the calling service account).
+
+    Returns the workflow invocation resource name. Raises on failure --
+    callers should catch this so a Dataform hiccup doesn't take down the
+    scan/BQ-write response that already succeeded.
+    """
+    import google.auth
+    import google.auth.transport.requests
+
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = google.auth.transport.requests.AuthorizedSession(credentials)
+
+    base = (
+        f"https://dataform.googleapis.com/v1/projects/{project_id}"
+        f"/locations/{location}/repositories/{repository_id}"
+    )
+
+    compile_resp = session.post(f"{base}/compilationResults", json={"gitCommitish": git_commitish})
+    compile_resp.raise_for_status()
+    compilation_result_name = compile_resp.json()["name"]
+
+    invoke_resp = session.post(
+        f"{base}/workflowInvocations",
+        json={
+            "compilationResult": compilation_result_name,
+            "invocationConfig": {"serviceAccount": service_account},
+        },
+    )
+    invoke_resp.raise_for_status()
+    return invoke_resp.json()["name"]
+
+
 # =========================================================
 # ARGS
 # =========================================================
@@ -965,6 +1019,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-n", default=ScannerConfig.top_n, type=int)
     p.add_argument("--output", default="", help="CSV output path")
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
+    p.add_argument("--no-dataform-trigger", action="store_true",
+                    help="Skip triggering a Dataform run after a successful BigQuery write")
     p.add_argument("--project-id", default=None, help="GCP project (else uses GCP_PROJECT env var)")
     p.add_argument("--dataset-id", default="data_options")
     p.add_argument(
@@ -1030,6 +1086,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         only_buy = bool(body.get("only_buy", False))
         output_path = ""
         no_bq = bool(body.get("no_bq", False))
+        no_dataform = bool(body.get("no_dataform_trigger", False))
         project_id = body.get("project_id")
         dataset_id = body.get("dataset_id", "data_options")
         table_id = body.get("table_id", DEFAULT_BQ_TABLE_ID)
@@ -1061,6 +1118,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         only_buy = args.only_buy
         output_path = args.output
         no_bq = args.no_bq
+        no_dataform = args.no_dataform_trigger
         project_id = args.project_id
         dataset_id = args.dataset_id
         table_id = args.table_id
@@ -1135,6 +1193,15 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             resolved_project_id = _resolve_project_id(project_id)
             n = write_to_bigquery(candidates, resolved_project_id, dataset_id, table_id)
             print(f"Wrote {n} rows to {resolved_project_id}.{dataset_id}.{table_id}")
+
+            if not no_dataform:
+                try:
+                    invocation_name = trigger_dataform_run(resolved_project_id)
+                    print(f"Triggered Dataform run: {invocation_name}")
+                except Exception as exc:
+                    print(f"\nDataform trigger skipped/failed: {exc}")
+                    print("Use --no-dataform-trigger to suppress this, or check the calling "
+                          "service account has roles/dataform.editor.")
         except Exception as exc:
             print(f"\nBigQuery write skipped/failed: {exc}")
             print("Use --no-bq to suppress this, or --project-id / set GCP_PROJECT to fix it.")
