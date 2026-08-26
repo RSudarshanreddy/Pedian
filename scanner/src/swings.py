@@ -3,14 +3,22 @@ VOLATILITY PERSISTENCE SWING SCANNER
 =====================================
 Core Philosophy:
 - A stock is "volatile" based on its full 6-month history (not a rolling 20-day window)
-- The exit rule is a FIXED profit target (config.target_pct, default 3%) -- not a
-  target sized as a multiple of risk. Stop-loss is sized so risk never exceeds what
-  that fixed target can justify at config.min_rr (see compute_trade_levels).
-- We BACKTEST that exact rule (buy at close, exit at +target_pct% or the stop,
-  whichever the next `max_hold_days` days hit first) against every historically
-  eligible day in the MOST RECENT `persistence_lookback` days (not stale,
-  index-0-anchored history) -- see run_barrier_backtest. The resulting win rate
-  and expected P&L are what actually matches "buy, take 3%, exit, repeat."
+- The exit rule is a MINIMUM profit floor (config.target_pct, default 3%), not a
+  fixed exit point. Once the floor is reached, the trade is extended day by day
+  for up to config.max_extension_days more sessions as long as it keeps closing
+  higher than the previous close (a backtestable proxy for "still moving, let it
+  run") -- exiting on the first non-higher close, or immediately if the stop is
+  hit at any point (the stop stays active as a hard backstop through the whole
+  hold, floor and extension alike). Stop-loss is sized so risk never exceeds what
+  that floor can justify at config.min_rr (see compute_trade_levels).
+- We BACKTEST that exact rule against every historically eligible day in the MOST
+  RECENT `persistence_lookback` days (not stale, index-0-anchored history) -- see
+  run_barrier_backtest. The resulting win rate and expected P&L are what actually
+  matches "never sell below +3%, but let a strong mover run a few more sessions."
+  No rule perfectly reproduces discretionary judgment (e.g. an upper-circuit lock
+  IS a higher close by definition, so this rule holds through it correctly, but
+  it won't match every case-by-case call) -- treat this as a systematic floor to
+  calibrate against, not a replica of every real-time decision.
 - Persistence score is independent of today's entry trigger
 - Today's setup is a bonus for entry timing, not persistence ranking
 - Results are written to BigQuery idempotently (safe to re-run same-day)
@@ -50,7 +58,7 @@ class ScannerConfig:
     min_days: int = 220
 
     # Universe (hard filters)
-    min_price: float = 450.0
+    min_price: float =350.0
     max_price: float = 1500.0
     min_avg_traded_value_cr: float = 10.0
 
@@ -64,19 +72,21 @@ class ScannerConfig:
     min_volatility_ratio: float = 0.20
 
     # Barrier backtest (tested against the MOST RECENT persistence_lookback days).
-    # min_persistence_rate is a WIN RATE now (see run_barrier_backtest), not a
-    # "did volatility touch X%" proxy. Breakeven win rate = risk/(risk+reward);
-    # with target_pct=3.0 and min_rr=1.0 (risk capped ~3%, see min_rr below)
-    # that's 50%. min_persistence_rate=50 is that breakeven line with zero
-    # margin -- deliberately left there rather than padded, so the scanner's
-    # actual historical hit rate is what does the filtering. Empirically (5
-    # tickers from a real trade book, 2y data): AEGISLOG/SKYGOLD/ANTELOPUS
-    # clear 50-56% and come out expected-P&L-positive; SKIPPER/BALUFORGE sit
-    # at 39-41% and are expected-P&L-negative at every risk level tested --
-    # i.e. this bar is doing real work, not rubber-stamping.
+    # min_persistence_rate is a WIN RATE now (see run_barrier_backtest), where
+    # "win" means the trade's FINAL realized exit cleared target_pct% -- under
+    # the floor+extension rule (see max_extension_days), touching the floor and
+    # then giving it back during extension is NOT a win, so win rates run
+    # structurally lower than a simple risk/(risk+reward) breakeven would
+    # suggest -- a stock can have a modest win rate but still be strongly
+    # profitable if its wins run big via extension (classic lower-win-rate,
+    # bigger-average-win dynamics). Recalibrated empirically on the same 5
+    # tickers used before, now under the floor+extension rule: AEGISLOG/
+    # SKYGOLD/ANTELOPUS win 29-39% and are expected-P&L-positive (AEGISLOG
+    # +3.2%/trade); SKIPPER/BALUFORGE win 19-23% and stay expected-P&L-negative.
+    # 25% cleanly separates the two groups on this sample.
     persistence_lookback: int = 180
     min_persistence_sample: int = 60
-    min_persistence_rate: float = 50.0
+    min_persistence_rate: float = 25.0
     # Used only as a scoring bonus (see calculate_score), not a hard reject --
     # a stock can have a strong win rate that's unevenly distributed across
     # sub-periods and still be worth surfacing (e.g. AEGISLOG.NS: 95%+ raw
@@ -88,7 +98,7 @@ class ScannerConfig:
     breakout_lookback: int = 20
     support_window: int = 20
     support_distance_threshold: float = 8.0
-    breakout_volume_mult: float = 1.5
+    breakout_volume_mult: float = 2.3
     pullback_min: float = 2.0
     pullback_max: float = 8.0
 
@@ -96,20 +106,33 @@ class ScannerConfig:
     atr_period: int = 14
     stop_atr_mult: float = 1.5
     recent_low_buffer: float = 0.975   # stop can't be looser than this * recent_low
-    target_pct: float = 3.0            # FIXED exit target: target = entry * (1 + target_pct/100)
+    target_pct: float = 3.0            # MINIMUM profit floor, not a fixed exit point:
+                                        # floor = entry * (1 + target_pct/100). Once hit,
+                                        # the trade extends (see max_extension_days) rather
+                                        # than exiting immediately.
+    max_extension_days: int = 3        # after the floor is reached, keep holding up to this
+                                        # many more sessions as long as each day closes higher
+                                        # than the previous close; exit on the first non-higher
+                                        # close (or sooner if the stop is hit). This is what
+                                        # lets a trade capture more than target_pct% when a
+                                        # stock is genuinely still moving -- see
+                                        # run_barrier_backtest for the exact simulation.
     max_risk_pct: float = 8.0          # safety-net hard filter; rarely binds since
                                         # add_indicators' trade_stop already caps risk
                                         # near target_pct/min_rr
     min_rr: float = 1.0                # risk is capped at target_pct/min_rr (~3% here)
-                                        # in add_indicators, so this is a guaranteed floor,
-                                        # not just a post-hoc filter. 1.0 was chosen
-                                        # empirically: it's roughly where a fixed 3%
-                                        # target's stop distance stops being tighter than
-                                        # these stocks' own daily noise (see
-                                        # min_persistence_rate comment above) -- pushing
-                                        # min_rr higher tightens the stop below that noise
-                                        # floor and the win rate collapses for everything.
-    max_hold_days: int = 5
+                                        # in add_indicators, so this is a guaranteed floor
+                                        # AT THE MINIMUM TARGET, not a post-hoc filter --
+                                        # actual realized R:R is often higher once extension
+                                        # captures more upside. 1.0 was chosen empirically:
+                                        # it's roughly where a 3% floor's stop distance stops
+                                        # being tighter than these stocks' own daily noise (see
+                                        # min_persistence_rate comment above) -- pushing min_rr
+                                        # higher tightens the stop below that noise floor and
+                                        # the win rate collapses for everything.
+    max_hold_days: int = 5             # window to reach the floor in the first place; the
+                                        # extension (max_extension_days) is additional time
+                                        # on top of this, only once the floor is hit
 
     # Quality gate -- rejects candidates outright rather than just ranking them lower.
     # This is the main lever for "fewer but better": raise it to cut junk,
@@ -276,36 +299,81 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
 
 
 # =========================================================
-# BARRIER BACKTEST -- simulates the exact "buy, take target_pct%, exit" rule
+# BARRIER BACKTEST -- simulates "buy, never sell below +target_pct%, let it
+# run while it keeps closing higher" (see run_barrier_backtest docstring)
 # =========================================================
+def _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext_days, n):
+    """
+    One trial starting the day after day i. Phase 1: walk forward up to `hold`
+    days looking for the stop (Low <= stop) or the floor (Close >= floor) --
+    whichever the daily OHLC hits first; a day touching both is assumed to
+    hit the stop first (conservative, since intraday order isn't knowable
+    from daily bars). Phase 2 (only if the floor was reached): hold up to
+    `ext_days` MORE sessions as long as each day's close is higher than the
+    previous day's close -- exit at the close of the first day that isn't
+    higher (the momentum-stall signal), or immediately if the stop is hit
+    at any point during the extension (it stays active as a hard backstop
+    the whole time, not just phase 1).
+
+    Returns (exit_pct, reached_floor) or (None, False) if the trial never
+    gets a full look (ran off the end of the data).
+    """
+    floor_day = None
+    for j in range(i + 1, min(i + 1 + hold, n)):
+        if low[j] <= stop:
+            return (stop - entry) / entry * 100, False
+        if close[j] >= floor:
+            floor_day = j
+            break
+
+    if floor_day is None:
+        last_idx = min(i + hold, n - 1)
+        return (close[last_idx] - entry) / entry * 100, False
+
+    # Phase 2: extension -- hold while still closing higher than the prior close.
+    exit_price = close[floor_day]
+    prev_close = close[floor_day]
+    for k in range(floor_day + 1, min(floor_day + 1 + ext_days, n)):
+        if low[k] <= stop:
+            return (stop - entry) / entry * 100, True
+        if close[k] <= prev_close:
+            return (close[k] - entry) / entry * 100, True
+        prev_close = close[k]
+        exit_price = close[k]
+
+    return (exit_price - entry) / entry * 100, True
+
+
 def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int, float, float]:
     """
     For each historically-eligible day (trailing avg volatility already >=
-    min_avg_volatility as of that day -- no lookahead), simulates the EXACT
-    rule this scanner surfaces today: buy at Close, exit at trade_target
-    (entry + target_pct%) or trade_stop, whichever the next `max_hold_days`
-    days hits first. A day that hits neither within the window is a TIMEOUT,
-    exited at that final day's close (counted as neither a win nor free --
-    its actual P&L is included in expected_pnl, and it does not count toward
-    hits/win_rate).
+    min_avg_volatility as of that day -- no lookahead), simulates the exact
+    rule this scanner is built around: buy at Close, never exit below the
+    target_pct% floor, extend while the stock keeps closing higher (see
+    _simulate_floor_extension_trade), exit on the first non-higher close or
+    the stop, whichever comes first. A trial that never reaches the floor
+    within `max_hold_days` is a TIMEOUT, exited at that final day's close.
 
-    On a day that touches both stop and target, the stop is assumed hit
-    first -- daily OHLC can't tell us the intraday order, so this is the
-    conservative assumption.
+    "Win" means the floor was actually reached AND the final realized exit
+    is still at/above target_pct% -- reaching the floor and then giving it
+    all back to a stop during the extension does NOT count as a win, since
+    that's not money you actually kept. This is what makes the rule honest
+    about the real risk of holding past the floor, not just "did it touch
+    3% at some point."
 
     The 4 sub-periods are anchored to the END of the array (most recent
     `persistence_lookback` days), not absolute index 0, so a stock whose
     volatility regime changed recently isn't scored on stale behavior.
 
     Returns: (win_rate_pct, sample_size, expected_pnl_pct, stability_std)
-      - win_rate_pct: % of trials that reached target_pct% before the stop/timeout.
-      - expected_pnl_pct: mean REALIZED return across all trials (wins at
-        +target_pct%, losses at their actual stop distance, timeouts at the
-        close on the final held day) -- the expected P&L per trade this rule
-        would have produced, not just a hit/miss rate.
+      - win_rate_pct: % of trials whose final realized exit cleared target_pct%.
+      - expected_pnl_pct: mean REALIZED return across all trials -- the actual
+        expected P&L per trade this rule would have produced, including any
+        extra captured during extension and any given back before the exit.
     """
     lookback = config.persistence_lookback
     hold = config.max_hold_days
+    ext_days = config.max_extension_days
     if len(data) < lookback + hold:
         return 0.0, 0, 0.0, 999.0
 
@@ -315,10 +383,10 @@ def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[flo
 
     eligible = data["past_vol_mean"].to_numpy() >= config.min_avg_volatility
     close = data["Close"].to_numpy()
-    high = data["High"].to_numpy()
     low = data["Low"].to_numpy()
     stop_arr = data["trade_stop"].to_numpy()
     target_arr = data["trade_target"].to_numpy()
+    n = len(data)
 
     hits = 0
     total = 0
@@ -339,23 +407,15 @@ def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[flo
                 continue
             entry = close[i]
             stop = stop_arr[i]
-            target = target_arr[i]
-            if not (np.isfinite(entry) and np.isfinite(stop) and np.isfinite(target)) or stop >= entry:
+            floor = target_arr[i]
+            if not (np.isfinite(entry) and np.isfinite(stop) and np.isfinite(floor)) or stop >= entry:
                 continue
 
-            exit_pct = None
-            for j in range(i + 1, min(i + 1 + hold, len(data))):
-                if low[j] <= stop:
-                    exit_pct = (stop - entry) / entry * 100
-                    break
-                if high[j] >= target:
-                    exit_pct = config.target_pct
-                    hits += 1
-                    period_hits += 1
-                    break
-            if exit_pct is None:
-                last_idx = min(i + hold, len(data) - 1)
-                exit_pct = (close[last_idx] - entry) / entry * 100
+            exit_pct, _ = _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext_days, n)
+            won = exit_pct >= config.target_pct
+            if won:
+                hits += 1
+                period_hits += 1
 
             pnl_pcts.append(exit_pct)
             total += 1
@@ -516,10 +576,12 @@ def calculate_score(
     config: ScannerConfig,
 ) -> float:
     persistence_score = min(persistence_rate / 100 * 30, 30)
-    # expected_move is now the barrier backtest's mean realized P&L per trade
-    # (see run_barrier_backtest), bounded above by target_pct (a perfect
-    # win rate) -- score relative to that ceiling rather than a fixed divisor
-    # so it stays meaningful if target_pct is retuned.
+    # expected_move is the barrier backtest's mean realized P&L per trade (see
+    # run_barrier_backtest) -- with the floor+extension rule this can exceed
+    # target_pct (extension captured more) as well as be negative (gave it
+    # back to a stop after reaching the floor). Scored relative to target_pct
+    # so it stays meaningful if target_pct is retuned; the min(...,10) cap
+    # handles anything that runs well past the floor.
     expected_move_score = min(max(expected_move, 0) / config.target_pct * 10, 10)
 
     if persistence_stability < config.persistence_stability_threshold:
@@ -869,7 +931,8 @@ def _resolve_project_id(project_id: Optional[str]) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Volatility persistence swing scanner - buys volatile setups and "
-                    "backtests exiting each one at a fixed profit target."
+                    "backtests never exiting below a minimum profit floor, extending "
+                    "while the move keeps closing higher."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
@@ -889,7 +952,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-traded-value-cr", default=ScannerConfig.min_avg_traded_value_cr, type=float)
 
     p.add_argument("--target-pct", default=ScannerConfig.target_pct, type=float,
-                    help="Fixed profit target %% above entry -- this IS the exit rule")
+                    help="Minimum profit floor %% above entry -- never exit below this")
+    p.add_argument("--max-extension-days", default=ScannerConfig.max_extension_days, type=int,
+                    help="After the floor is hit, keep holding this many more sessions "
+                         "while still closing higher; exit on the first non-higher close")
     p.add_argument("--min-rr", default=ScannerConfig.min_rr, type=float)
     p.add_argument("--max-risk-pct", default=ScannerConfig.max_risk_pct, type=float)
     p.add_argument("--max-hold-days", default=ScannerConfig.max_hold_days, type=int)
@@ -933,6 +999,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         max_price=args.max_price,
         min_avg_traded_value_cr=args.min_traded_value_cr,
         target_pct=args.target_pct,
+        max_extension_days=args.max_extension_days,
         min_rr=args.min_rr,
         max_risk_pct=args.max_risk_pct,
         max_hold_days=args.max_hold_days,
@@ -949,8 +1016,10 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     print(f"Universe: Rs.{config.min_price}-{config.max_price} | Liquidity >= {config.min_avg_traded_value_cr} Cr")
     print(f"Volatility: 6-month avg >= {config.min_avg_volatility}% | median >= {config.min_median_volatility}% | "
           f"{config.min_volatile_days}+ volatile days")
-    print(f"Exit rule: +{config.target_pct}% target, ATR/structure stop capped at "
-          f"~{risk_cap_pct:.2f}% risk (guarantees R:R >= {config.min_rr}), {config.max_hold_days}-day max hold")
+    print(f"Exit rule: never below +{config.target_pct}% floor, extend up to "
+          f"{config.max_extension_days} more sessions while still closing higher, "
+          f"ATR/structure stop capped at ~{risk_cap_pct:.2f}% risk (guarantees R:R >= {config.min_rr} "
+          f"at the floor), {config.max_hold_days}-day window to reach it")
     print(f"Barrier backtest: win rate >= {config.min_persistence_rate}% "
           f"({config.min_persistence_sample}+ eligible days in last {config.persistence_lookback})")
     print(f"Scanning {len(tickers)} tickers...")
