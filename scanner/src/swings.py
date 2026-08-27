@@ -31,6 +31,7 @@ import datetime as dt
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Optional
@@ -931,6 +932,10 @@ DATAFORM_GIT_COMMITISH = "feature/restructure-project"
 DATAFORM_SERVICE_ACCOUNT = "347050126858-compute@developer.gserviceaccount.com"
 
 
+DATAFORM_COMPILE_RETRIES = 3
+DATAFORM_COMPILE_RETRY_DELAY_SEC = 8
+
+
 def trigger_dataform_run(
     project_id: str,
     location: str = DATAFORM_LOCATION,
@@ -949,6 +954,15 @@ def trigger_dataform_run(
     credentials that service already has (needs roles/dataform.editor on
     the calling service account).
 
+    The compilation step fetches from GitHub through Developer Connect's
+    proxy, which has shown intermittent "Remote repository ... could not be
+    reached" failures in practice -- confirmed transient by hand (retrying
+    seconds later with zero changes succeeded both times it happened) but
+    frequent enough now that a scheduled run shouldn't depend on someone
+    noticing and re-triggering manually. Retried here with a short delay;
+    the workflow invocation step itself doesn't touch GitHub again (it just
+    runs the already-compiled result), so it isn't retried.
+
     Returns the workflow invocation resource name. Raises on failure --
     callers should catch this so a Dataform hiccup doesn't take down the
     scan/BQ-write response that already succeeded.
@@ -964,8 +978,25 @@ def trigger_dataform_run(
         f"/locations/{location}/repositories/{repository_id}"
     )
 
-    compile_resp = session.post(f"{base}/compilationResults", json={"gitCommitish": git_commitish})
-    compile_resp.raise_for_status()
+    compile_resp = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, DATAFORM_COMPILE_RETRIES + 1):
+        try:
+            compile_resp = session.post(f"{base}/compilationResults", json={"gitCommitish": git_commitish})
+            compile_resp.raise_for_status()
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            compile_resp = None
+            if attempt < DATAFORM_COMPILE_RETRIES:
+                LOGGER.warning(
+                    "Dataform compile attempt %d/%d failed (%s), retrying in %ds",
+                    attempt, DATAFORM_COMPILE_RETRIES, exc, DATAFORM_COMPILE_RETRY_DELAY_SEC,
+                )
+                time.sleep(DATAFORM_COMPILE_RETRY_DELAY_SEC)
+    if last_exc is not None:
+        raise last_exc
     compilation_result_name = compile_resp.json()["name"]
 
     invoke_resp = session.post(
