@@ -928,7 +928,7 @@ def _resolve_project_id(project_id: Optional[str]) -> str:
 
 DATAFORM_LOCATION = "us-central1"
 DATAFORM_REPOSITORY_ID = "sudarshan_repo"
-DATAFORM_WORKSPACE_ID = "worker1"
+DATAFORM_GIT_COMMITISH = "feature/restructure-project"
 DATAFORM_SERVICE_ACCOUNT = "347050126858-compute@developer.gserviceaccount.com"
 
 
@@ -940,31 +940,31 @@ def trigger_dataform_run(
     project_id: str,
     location: str = DATAFORM_LOCATION,
     repository_id: str = DATAFORM_REPOSITORY_ID,
-    workspace_id: str = DATAFORM_WORKSPACE_ID,
+    git_commitish: str = DATAFORM_GIT_COMMITISH,
     service_account: str = DATAFORM_SERVICE_ACCOUNT,
 ) -> str:
     """
-    Triggers a Dataform workflow invocation (compile the repo's current
-    workspace state, then run it) via the REST API, so fact_stock_scan /
-    the lifecycle views / vw_daily_digest pick up this run's fresh rows
-    without a human manually starting an execution. No Dataform CLI is
-    available in every environment this runs in, and a separate
-    orchestration service would be overkill for two sequential API calls --
-    this runs inside the same Cloud Run invocation that just wrote to
-    BigQuery, using whatever credentials that service already has (needs
-    roles/dataform.editor on the calling service account).
+    Triggers a Dataform workflow invocation (compile the repo at
+    git_commitish, then run it) via the REST API, so fact_stock_scan / the
+    lifecycle views / vw_daily_digest pick up this run's fresh rows without
+    a human manually starting an execution. No Dataform CLI is available in
+    every environment this runs in, and a separate orchestration service
+    would be overkill for two sequential API calls -- this runs inside the
+    same Cloud Run invocation that just wrote to BigQuery, using whatever
+    credentials that service already has (needs roles/dataform.editor on
+    the calling service account).
 
-    Compiles from the WORKSPACE (Dataform's own stored file state), not a
-    live gitCommitish fetch -- a live git fetch through Developer Connect's
-    proxy showed intermittent "Remote repository ... could not be reached"
-    failures in practice (confirmed transient by hand each time, but
-    frequent enough that a scheduled run shouldn't depend on it). Compiling
-    from the workspace instead means the trigger itself never touches
-    GitHub -- it just needs the workspace to already be synced, which in
-    this repo happens automatically on push (verified: a same-session push
-    showed up in the workspace's file listing with no manual pull).
-    Retries are kept here as defense-in-depth for any other transient API
-    failure, not specifically the GitHub-fetch issue anymore.
+    Compiles from gitCommitish (a live fetch through Developer Connect's
+    proxy), not a Dataform workspace -- workspace compilation was tried and
+    reverted: it avoids the flaky GitHub fetch, but workspace sync turned
+    out to be MANUAL, not automatic (confirmed directly, not assumed this
+    time) -- meaning a scheduled, unattended run would silently keep using
+    whatever was last manually pulled, drifting further from GitHub with
+    every push nobody remembers to sync. gitCommitish always reflects
+    what's actually on GitHub; the retry loop below is what makes that
+    tolerable despite the proxy's intermittent "Remote repository ... could
+    not be reached" failures (confirmed transient every time it's
+    happened -- retrying seconds later with zero changes always succeeded).
 
     Returns the workflow invocation resource name. Raises on failure --
     callers should catch this so a Dataform hiccup doesn't take down the
@@ -976,15 +976,16 @@ def trigger_dataform_run(
     credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     session = google.auth.transport.requests.AuthorizedSession(credentials)
 
-    resource_base = f"projects/{project_id}/locations/{location}/repositories/{repository_id}"
-    base = f"https://dataform.googleapis.com/v1/{resource_base}"
-    workspace_name = f"{resource_base}/workspaces/{workspace_id}"
+    base = (
+        f"https://dataform.googleapis.com/v1/projects/{project_id}"
+        f"/locations/{location}/repositories/{repository_id}"
+    )
 
     compile_resp = None
     last_exc: Optional[Exception] = None
     for attempt in range(1, DATAFORM_COMPILE_RETRIES + 1):
         try:
-            compile_resp = session.post(f"{base}/compilationResults", json={"workspace": workspace_name})
+            compile_resp = session.post(f"{base}/compilationResults", json={"gitCommitish": git_commitish})
             compile_resp.raise_for_status()
             last_exc = None
             break
