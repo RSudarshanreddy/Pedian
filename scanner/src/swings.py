@@ -99,7 +99,7 @@ class ScannerConfig:
     breakout_lookback: int = 20
     support_window: int = 20
     support_distance_threshold: float = 8.0
-    breakout_volume_mult: float = 2.3
+    breakout_volume_mult: float = 1.5
     pullback_min: float = 2.0
     pullback_max: float = 8.0
 
@@ -1018,6 +1018,53 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
+def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[str]:
+    """
+    Builds the notification text: only same-day-fresh BUY signals
+    (Setup_Age_Days == 1) -- the whole point of pushing this immediately is
+    to close the "already high by the time I woke up" gap, so anything
+    already a day or more stale doesn't belong in an urgent alert. Returns
+    None if there's nothing fresh to send (caller should skip sending).
+    """
+    if candidates.empty:
+        return None
+
+    fresh_buys = candidates[
+        (candidates["Action"] == "BUY") & (candidates["Setup_Age_Days"] == 1)
+    ].sort_values("Score", ascending=False)
+
+    if fresh_buys.empty:
+        return None
+
+    lines = [f"*Swing scan -- {run_date}*", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
+    for _, r in fresh_buys.iterrows():
+        lines.append(
+            f"*{r['Ticker']}* ({r['Setup_Type']}) score {r['Score']:.0f}, "
+            f"win rate {r['Persistence_Rate']:.0f}%\n"
+            f"Entry {r['Entry']:.2f} | SL {r['Stop_Loss']:.2f} | Target {r['Target']:.2f}"
+        )
+    lines.append("")
+    lines.append("Age==1 only -- check current price before acting, it may have already moved.")
+    return "\n".join(lines)
+
+
+def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
+    """
+    Sends `text` to a single Telegram chat via the Bot API. Raises on
+    failure -- callers should catch this so a notification hiccup doesn't
+    take down the scan/BQ-write/Dataform-trigger response that already
+    succeeded (same pattern as trigger_dataform_run).
+    """
+    import requests
+
+    resp = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
 # =========================================================
 # ARGS
 # =========================================================
@@ -1060,6 +1107,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
     p.add_argument("--no-dataform-trigger", action="store_true",
                     help="Skip triggering a Dataform run after a successful BigQuery write")
+    p.add_argument("--no-telegram", action="store_true",
+                    help="Skip sending a Telegram notification for fresh BUY signals")
     p.add_argument("--project-id", default=None, help="GCP project (else uses GCP_PROJECT env var)")
     p.add_argument("--dataset-id", default="data_options")
     p.add_argument(
@@ -1126,6 +1175,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         output_path = ""
         no_bq = bool(body.get("no_bq", False))
         no_dataform = bool(body.get("no_dataform_trigger", False))
+        no_telegram = bool(body.get("no_telegram", False))
         project_id = body.get("project_id")
         dataset_id = body.get("dataset_id", "data_options")
         table_id = body.get("table_id", DEFAULT_BQ_TABLE_ID)
@@ -1158,6 +1208,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         output_path = args.output
         no_bq = args.no_bq
         no_dataform = args.no_dataform_trigger
+        no_telegram = args.no_telegram
         project_id = args.project_id
         dataset_id = args.dataset_id
         table_id = args.table_id
@@ -1226,6 +1277,23 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
               f"Raise --top-n to see the rest.")
     else:
         print(f"\nTotal quality candidates: {total_quality}")
+
+    if not no_telegram:
+        try:
+            bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID")
+            if not bot_token or not chat_id:
+                print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
+            else:
+                digest_text = format_telegram_digest(candidates, run_date)
+                if digest_text is None:
+                    print("\nNo fresh (Age==1) BUY signals -- Telegram notification skipped.")
+                else:
+                    send_telegram_notification(digest_text, bot_token, chat_id)
+                    print("\nSent Telegram notification.")
+        except Exception as exc:
+            print(f"\nTelegram notification skipped/failed: {exc}")
+            print("Use --no-telegram to suppress this.")
 
     if not no_bq:
         try:
