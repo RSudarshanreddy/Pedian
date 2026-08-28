@@ -99,7 +99,7 @@ class ScannerConfig:
     breakout_lookback: int = 20
     support_window: int = 20
     support_distance_threshold: float = 8.0
-    breakout_volume_mult: float = 1.5
+    breakout_volume_mult: float = 2.3
     pullback_min: float = 2.0
     pullback_max: float = 8.0
 
