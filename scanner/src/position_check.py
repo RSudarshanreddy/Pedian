@@ -151,6 +151,121 @@ def import_holdings_csv(csv_path: str, project_id: str) -> None:
     print(f"Imported {len(new_rows)} active holdings from {csv_path}")
 
 
+def _fifo_open_lots(trades: pd.DataFrame) -> tuple[float, float, str, str, int]:
+    """
+    FIFO-consumes buy/sell rows (already sorted by execution time) for one
+    symbol down to whatever's still open. Returns (qty, weighted_avg_price,
+    oldest_lot_date, newest_lot_date, num_open_lots). A sell that exceeds
+    the lots this dataframe knows about (a pre-existing position from
+    before the tradebook's window) just runs the open-lot list to empty --
+    it does NOT go negative, so a heavier sell than tracked buys silently
+    zeroes out rather than producing a nonsense answer; the caller is
+    expected to sanity-check the resulting qty against the real holding.
+    """
+    lots: list[list] = []  # [qty, price, date]
+    for _, row in trades.iterrows():
+        qty = float(row["quantity"])
+        if row["trade_type"] == "buy":
+            lots.append([qty, float(row["price"]), row["trade_date"]])
+        else:
+            remaining = qty
+            while remaining > 1e-9 and lots:
+                consume = min(lots[0][0], remaining)
+                lots[0][0] -= consume
+                remaining -= consume
+                if lots[0][0] <= 1e-9:
+                    lots.pop(0)
+    total_qty = sum(l[0] for l in lots)
+    if total_qty <= 1e-9:
+        return 0.0, 0.0, "", "", 0
+    wavg_price = sum(l[0] * l[1] for l in lots) / total_qty
+    return total_qty, wavg_price, min(l[2] for l in lots), max(l[2] for l in lots), len(lots)
+
+
+def apply_tradebook_entry_dates(tradebook_csv: str, project_id: str) -> None:
+    """
+    Zerodha Console's holdings CSV (used by import_holdings_csv) has no
+    purchase date, so anything new to tracking gets Entry_Date defaulted
+    to today -- a real gap, since the momentum/stop/time-stop checks in
+    check_position_momentum can't trace history from a fabricated date.
+
+    A Zerodha tradebook export (every individual fill, with real dates)
+    can recover the real date for a currently-open position: FIFO-consume
+    each symbol's buys/sells down to what's still open, and use the
+    OLDEST remaining lot's date as the entry date -- the date the
+    currently-held tranche started being accumulated.
+
+    Only touches holdings rows whose Entry_Date is still today (the
+    "unknown" marker this same script wrote); rows with a real date
+    already (manually seeded, or fixed in an earlier run) are left alone.
+    Some positions won't fully reconcile against this file (pre-existing
+    shares from before the tradebook's window, e.g. Zerodha's own "long
+    term" quantity flag) -- when the FIFO qty is less than the actual
+    holding, the true entry is even older than what's found here, so the
+    oldest resolvable lot is still a safe (if approximate) choice: it
+    understates how long the capital has been deployed, never overstates
+    it. Symbols with NO trades in this file at all (bought entirely
+    outside its window) are left untouched and reported as unresolved.
+    """
+    trades = pd.read_csv(tradebook_csv)
+    trades["order_execution_time"] = pd.to_datetime(trades["order_execution_time"])
+    trades = trades.sort_values("order_execution_time")
+
+    client = bigquery.Client(project=project_id)
+    today = dt.date.today().isoformat()
+    holdings = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    updates = []
+    for symbol, g in trades.groupby("symbol"):
+        ticker = swings.to_yahoo_nse_ticker(symbol)
+        if ticker not in holdings or str(holdings[ticker]["Entry_Date"]) != today:
+            continue
+        fifo_qty, _, oldest_date, _, _ = _fifo_open_lots(g)
+        if fifo_qty <= 1e-9:
+            continue
+        held_qty = float(holdings[ticker]["Quantity"])
+        note = "" if abs(fifo_qty - held_qty) < 0.5 else f" (approx -- tradebook shows {fifo_qty:.0f} vs {held_qty:.0f} held, some shares predate this file)"
+        updates.append((ticker, oldest_date, note))
+
+    if updates:
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@tickers)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", [t for t, _, _ in updates])
+            ]),
+        ).result()
+        new_rows = pd.DataFrame([
+            {
+                "Ticker": t, "Entry_Price": holdings[t]["Entry_Price"], "Entry_Date": new_date,
+                "Quantity": holdings[t]["Quantity"], "Active": True, "Notes": holdings[t]["Notes"],
+            }
+            for t, new_date, _ in updates
+        ])
+        client.load_table_from_dataframe(
+            new_rows, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    for t, new_date, note in updates:
+        print(f"Corrected {t}: Entry_Date -> {new_date}{note}")
+
+    corrected = {t for t, _, _ in updates}
+    still_unresolved = sorted(
+        t for t, h in holdings.items()
+        if str(h["Entry_Date"]) == today and t not in corrected
+    )
+    if still_unresolved:
+        print(f"\nStill unresolved (no usable trades in this file -- position predates it "
+              f"or was entirely offset within it): {', '.join(still_unresolved)}")
+    print(f"\nUpdated {len(updates)} Entry_Date(s) from {tradebook_csv}")
+
+
 def check_position_momentum(
     ticker: str, entry_price: float, entry_date: str, config: swings.ScannerConfig
 ) -> dict:
@@ -465,6 +580,9 @@ def main():
     parser.add_argument("--import-csv", default=None,
                          help="Path to a Zerodha Console holdings CSV export -- imports into "
                               "data_options.holdings before running the check")
+    parser.add_argument("--tradebook-csv", default=None,
+                         help="Path to a Zerodha tradebook export -- recovers real Entry_Date "
+                              "(via FIFO) for holdings rows still defaulted to today")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
     parser.add_argument("--book-profit-ticker", default=None, help="Ticker to book a sell against, e.g. DYCL")
     parser.add_argument("--book-profit-qty", type=float, default=None, help="Quantity sold")
@@ -474,6 +592,9 @@ def main():
 
     if args.import_csv:
         import_holdings_csv(args.import_csv, args.project_id)
+
+    if args.tradebook_csv:
+        apply_tradebook_entry_dates(args.tradebook_csv, args.project_id)
 
     if args.book_profit_ticker or args.book_profit_qty or args.book_profit_price:
         if not (args.book_profit_ticker and args.book_profit_qty and args.book_profit_price):
