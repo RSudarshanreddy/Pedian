@@ -1018,6 +1018,9 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
+IST_OFFSET = dt.timedelta(hours=5, minutes=30)
+
+
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[str]:
     """
     Builds the notification text: only same-day-fresh BUY signals
@@ -1025,6 +1028,12 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     to close the "already high by the time I woke up" gap, so anything
     already a day or more stale doesn't belong in an urgent alert. Returns
     None if there's nothing fresh to send (caller should skip sending).
+
+    Includes the actual run time (IST, not just the date) in the header --
+    with 4 scheduled runs a day, the same ticker can legitimately appear in
+    more than one, and "9:07 AM run" vs "3 PM run" for the same name is
+    very different information: was this signal just caught, or has it
+    already had hours to move since it first showed up.
     """
     if candidates.empty:
         return None
@@ -1036,16 +1045,22 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     if fresh_buys.empty:
         return None
 
+    run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
+
     # Plain text, deliberately -- see send_telegram_notification for why.
-    lines = [f"Swing scan -- {run_date}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
+    lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
+        # breakout decays fastest of the three setup types (best win rate in
+        # backtest, but also the sharpest/most volume-driven moves) -- flag
+        # it so it's obvious which alerts are most time-sensitive to act on.
+        tag = " [BREAKOUT -- act fast]" if r["Setup_Type"] == "breakout" else ""
         lines.append(
-            f"{r['Ticker']} ({r['Setup_Type']}) score {r['Score']:.0f}, "
+            f"{r['Ticker']} ({r['Setup_Type']}){tag} score {r['Score']:.0f}, "
             f"win rate {r['Persistence_Rate']:.0f}%\n"
             f"Entry {r['Entry']:.2f} | SL {r['Stop_Loss']:.2f} | Target {r['Target']:.2f}"
         )
     lines.append("")
-    lines.append("Age==1 only -- check current price before acting, it may have already moved.")
+    lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
     return "\n".join(lines)
 
 
