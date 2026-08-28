@@ -248,6 +248,82 @@ def check_position_momentum(
     }
 
 
+def book_profit(
+    ticker: str, exit_qty: float, exit_price: float, project_id: str,
+    exit_date: Optional[str] = None, notes: Optional[str] = None,
+) -> dict:
+    """
+    Records a real sell against an active holding: logs the realized trade
+    to data_options.realized_trades (append-only ledger -- the "position
+    ledger" gap), then updates data_options.holdings -- full exit closes
+    the row (Active=FALSE), partial exit reduces Quantity and keeps the
+    original Entry_Price/Entry_Date for the remaining shares (cost basis
+    isn't reaveraged on a partial sell).
+    """
+    ticker = swings.to_yahoo_nse_ticker(ticker.strip())
+    client = bigquery.Client(project=project_id)
+
+    rows = list(client.query(
+        f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+        f"FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker AND Active = TRUE",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result())
+    if not rows:
+        raise ValueError(f"No active holding found for {ticker} in data_options.holdings")
+
+    current = dict(rows[0].items())
+    entry_price = float(current["Entry_Price"])
+    entry_date = str(current["Entry_Date"])
+    held_qty = float(current["Quantity"])
+    if exit_qty > held_qty:
+        raise ValueError(f"Exit qty {exit_qty} exceeds held qty {held_qty} for {ticker}")
+
+    exit_date = exit_date or dt.date.today().isoformat()
+    pnl_amount = (exit_price - entry_price) * exit_qty
+    pnl_pct = (exit_price - entry_price) / entry_price * 100
+
+    trade_row = pd.DataFrame([{
+        "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+        "Exit_Price": exit_price, "Exit_Date": exit_date, "Quantity": exit_qty,
+        "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2), "Notes": notes,
+    }])
+    client.load_table_from_dataframe(
+        trade_row, f"{project_id}.data_options.realized_trades",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+    ).result()
+
+    remaining_qty = held_qty - exit_qty
+    client.query(
+        f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result()
+    if remaining_qty > 0:
+        updated_row = pd.DataFrame([{
+            "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+            "Quantity": remaining_qty, "Active": True, "Notes": current["Notes"],
+        }])
+        client.load_table_from_dataframe(
+            updated_row, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    result = {
+        "Ticker": ticker, "Exit_Qty": exit_qty, "Remaining_Qty": remaining_qty,
+        "Entry_Price": entry_price, "Exit_Price": exit_price,
+        "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2),
+    }
+    print(
+        f"Booked {exit_qty} of {ticker} @ {exit_price:.2f} (entry {entry_price:.2f}): "
+        f"{pnl_amount:+.2f} ({pnl_pct:+.2f}%). "
+        + (f"{remaining_qty} left, still active." if remaining_qty > 0 else "Position closed.")
+    )
+    return result
+
+
 def run_position_check(project_id: str, config: Optional[swings.ScannerConfig] = None) -> pd.DataFrame:
     """
     Reads active rows from data_options.holdings, runs check_position_momentum
@@ -324,10 +400,22 @@ def main():
                          help="Path to a Zerodha Console holdings CSV export -- imports into "
                               "data_options.holdings before running the check")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
+    parser.add_argument("--book-profit-ticker", default=None, help="Ticker to book a sell against, e.g. DYCL")
+    parser.add_argument("--book-profit-qty", type=float, default=None, help="Quantity sold")
+    parser.add_argument("--book-profit-price", type=float, default=None, help="Actual sell price")
+    parser.add_argument("--book-profit-notes", default=None, help="Optional note for the realized_trades row")
     args = parser.parse_args()
 
     if args.import_csv:
         import_holdings_csv(args.import_csv, args.project_id)
+
+    if args.book_profit_ticker or args.book_profit_qty or args.book_profit_price:
+        if not (args.book_profit_ticker and args.book_profit_qty and args.book_profit_price):
+            raise SystemExit("--book-profit-ticker, --book-profit-qty, and --book-profit-price must all be given together")
+        book_profit(
+            args.book_profit_ticker, args.book_profit_qty, args.book_profit_price,
+            args.project_id, notes=args.book_profit_notes,
+        )
 
     results_df = run_position_check(args.project_id)
 
