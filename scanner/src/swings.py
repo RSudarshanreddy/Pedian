@@ -1036,10 +1036,11 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     if fresh_buys.empty:
         return None
 
-    lines = [f"*Swing scan -- {run_date}*", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
+    # Plain text, deliberately -- see send_telegram_notification for why.
+    lines = [f"Swing scan -- {run_date}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
         lines.append(
-            f"*{r['Ticker']}* ({r['Setup_Type']}) score {r['Score']:.0f}, "
+            f"{r['Ticker']} ({r['Setup_Type']}) score {r['Score']:.0f}, "
             f"win rate {r['Persistence_Rate']:.0f}%\n"
             f"Entry {r['Entry']:.2f} | SL {r['Stop_Loss']:.2f} | Target {r['Target']:.2f}"
         )
@@ -1054,12 +1055,21 @@ def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
     failure -- callers should catch this so a notification hiccup doesn't
     take down the scan/BQ-write/Dataform-trigger response that already
     succeeded (same pattern as trigger_dataform_run).
+
+    Deliberately plain text, no parse_mode. Telegram's legacy Markdown
+    parser treats a single "_" as an unclosed italic marker -- setup types
+    like "pullback_bounce" and "deep_pullback" have exactly one underscore
+    each, which broke every notification with a 400 "can't parse entities"
+    error (confirmed: this is exactly what silently killed the first two
+    real notifications this was tested against). Ticker/setup content here
+    is data-driven and not fully predictable, so the fix is to stop relying
+    on a fragile parser for it rather than trying to escape every value.
     """
     import requests
 
     resp = requests.post(
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+        json={"chat_id": chat_id, "text": text},
         timeout=15,
     )
     resp.raise_for_status()
