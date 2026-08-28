@@ -31,7 +31,7 @@ import swings
 # export version) -- matched case-insensitively, with a couple of common
 # aliases, rather than hardcoding one exact spelling.
 CSV_TICKER_COLUMNS = ["instrument", "symbol", "tradingsymbol"]
-CSV_QTY_COLUMNS = ["qty.", "qty", "quantity"]
+CSV_QTY_COLUMNS = ["qty.", "qty", "quantity", "quantity available"]
 CSV_AVG_COST_COLUMNS = ["avg. cost", "avg cost", "average price", "avg_cost"]
 
 
@@ -93,6 +93,11 @@ def import_holdings_csv(csv_path: str, project_id: str) -> None:
         raw_symbol = str(row[ticker_col]).strip()
         if not raw_symbol or raw_symbol.lower() == "nan":
             continue
+        # Zerodha appends "-T" to the symbol for T1 (not-yet-settled) lots --
+        # that's a settlement-status marker, not part of the real ticker
+        # (confirmed: BLISSGVS-T/E2E-T fail on Yahoo, BLISSGVS/E2E don't).
+        if raw_symbol.upper().endswith("-T"):
+            raw_symbol = raw_symbol[:-2]
         ticker = swings.to_yahoo_nse_ticker(raw_symbol)
         qty = float(str(row[qty_col]).replace(",", ""))
         avg_cost = float(str(row[avg_col]).replace(",", ""))
@@ -172,6 +177,18 @@ def check_position_momentum(
         data = swings.normalize_single_ticker_columns(raw)
     except Exception as exc:
         return {"Ticker": ticker, "Verdict": f"DATA ERROR: {exc}"}
+
+    # Some symbols (e.g. AGOL) aren't available on NSE via Yahoo but resolve
+    # fine on BSE -- confirmed via direct testing (AGOL.NS empty, AGOL.BO ok).
+    if data.empty and ticker.upper().endswith(".NS"):
+        bse_ticker = ticker[:-3] + ".BO"
+        try:
+            raw = yf.download(bse_ticker, period="3mo", interval="1d", progress=False, auto_adjust=True, threads=False)
+            data = swings.normalize_single_ticker_columns(raw)
+            if not data.empty:
+                ticker = bse_ticker
+        except Exception:
+            pass
 
     entry_ts = pd.Timestamp(entry_date)
     post_entry = data.loc[data.index >= entry_ts]
