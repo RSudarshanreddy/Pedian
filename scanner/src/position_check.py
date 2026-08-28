@@ -156,16 +156,27 @@ def check_position_momentum(
 ) -> dict:
     """
     Traces the actual day-by-day price action from a REAL entry point (not
-    a scanner-signal day) using the exact same floor+extension rule the
-    exit logic is built on.
+    a scanner-signal day) using the exact same rule run_barrier_backtest
+    simulates (see _simulate_floor_extension_trade) -- not just the
+    floor+extension part, the full two-phase rule with both backstops:
 
-    Mirrors the scanner's own extension bounds exactly -- the window is
-    capped at config.max_extension_days past the day the floor was first
-    crossed. If a non-higher close already happened inside that window,
-    the verdict reflects that the rule's exit trigger already fired (even
-    if price recovered later -- the rule exits on the FIRST break, it
-    doesn't wait to see what happens next), not just "did it close lower
-    today."
+    Phase 1 (before the floor is reached): walks forward up to
+    config.max_hold_days sessions looking for the stop or the floor,
+    whichever comes first. A position that never reaches the floor within
+    that window is a TIME STOP -- capital that isn't working doesn't get
+    to sit indefinitely just because it hasn't technically lost yet.
+
+    Phase 2 (after the floor is reached): same floor+extension logic as
+    before -- hold up to config.max_extension_days more sessions while
+    still closing higher, exit on the first non-higher close -- but the
+    stop stays active as a hard backstop throughout, same as phase 1.
+
+    The stop itself is the same ATR/structural/RR-floor stop
+    add_indicators computes for a fresh scanner signal, evaluated as of
+    the entry day (no lookahead). This was the real gap before: a holding
+    that never reached the floor had no exit trigger at all, no matter how
+    far it fell (confirmed live -- IRCTC/AGOL/WAAREERTL were sitting at
+    -40% to -60% and still just read "NOT YET AT FLOOR").
 
     Returns a dict; does not raise on missing data (returns a NO DATA
     verdict instead), since this is meant to run across many holdings
@@ -173,7 +184,7 @@ def check_position_momentum(
     """
     yf = swings.load_yfinance()
     try:
-        raw = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True, threads=False)
+        raw = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True, threads=False)
         data = swings.normalize_single_ticker_columns(raw)
     except Exception as exc:
         return {"Ticker": ticker, "Verdict": f"DATA ERROR: {exc}"}
@@ -183,69 +194,119 @@ def check_position_momentum(
     if data.empty and ticker.upper().endswith(".NS"):
         bse_ticker = ticker[:-3] + ".BO"
         try:
-            raw = yf.download(bse_ticker, period="3mo", interval="1d", progress=False, auto_adjust=True, threads=False)
+            raw = yf.download(bse_ticker, period="6mo", interval="1d", progress=False, auto_adjust=True, threads=False)
             data = swings.normalize_single_ticker_columns(raw)
             if not data.empty:
                 ticker = bse_ticker
         except Exception:
             pass
 
+    if data.empty:
+        return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
+
+    indexed = swings.add_indicators(data, config)
     entry_ts = pd.Timestamp(entry_date)
-    post_entry = data.loc[data.index >= entry_ts]
+    post_entry = indexed.loc[indexed.index >= entry_ts]
     if post_entry.empty:
         return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
 
     closes = post_entry["Close"].to_numpy()
+    lows = post_entry["Low"].to_numpy()
     dates = post_entry.index
+    n = len(closes)
     current_price = float(closes[-1])
     pnl_pct = (current_price - entry_price) / entry_price * 100
     floor = entry_price * (1 + config.target_pct / 100)
 
-    floor_day_idx = next((i for i, c in enumerate(closes) if c >= floor), None)
+    stop_raw = post_entry["trade_stop"].iloc[0]
+    stop = float(stop_raw) if pd.notna(stop_raw) else None
 
-    if floor_day_idx is None:
+    base = {
+        "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+        "Current_Price": round(current_price, 2), "PnL_Pct": round(pnl_pct, 2),
+        "Days_Since_Entry": n, "Stop": round(stop, 2) if stop is not None else None,
+    }
+
+    def _stop_hit_verdict(idx: int, during_extension: bool) -> dict:
+        exit_price = float(lows[idx])
+        exit_pnl = (exit_price - entry_price) / entry_price * 100
+        suffix = " during extension" if during_extension else ""
         return {
-            "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
-            "Current_Price": round(current_price, 2), "PnL_Pct": round(pnl_pct, 2),
-            "Days_Since_Entry": len(closes), "Verdict": "NOT YET AT FLOOR",
+            **base,
+            "Verdict": (
+                f"STOP HIT on {dates[idx].date()} at {exit_price:.2f} ({exit_pnl:+.2f}%) "
+                f"-- exit, downside protection triggered{suffix}"
+            ),
+            "Still_In_Momentum": False,
         }
 
-    ext_end = min(floor_day_idx + 1 + config.max_extension_days, len(closes))
-    prev_close = closes[floor_day_idx]
-    broke_at_idx = None
-    for i in range(floor_day_idx + 1, ext_end):
-        if closes[i] <= prev_close:
-            broke_at_idx = i
+    # Phase 1: entry day itself (index 0) isn't monitored -- the position
+    # starts being watched the day after, same convention as the backtest.
+    # Unlike the backtest's bounded trial window, this search is NOT capped
+    # at max_hold_days -- a live position that converts a little late still
+    # converted, and should move into normal phase-2 tracking, not get
+    # frozen into a timeout verdict it already grew out of (a position that
+    # crossed the floor on day 6 instead of day 5 is not still "stuck").
+    # max_hold_days is only used below to judge "stuck as of today."
+    hold = config.max_hold_days
+    floor_day_idx = None
+    for j in range(1, n):
+        if stop is not None and lows[j] <= stop:
+            return _stop_hit_verdict(j, during_extension=False)
+        if closes[j] >= floor:
+            floor_day_idx = j
             break
-        prev_close = closes[i]
 
-    if broke_at_idx is not None:
-        exit_price = float(closes[broke_at_idx])
-        exit_pnl = (exit_price - entry_price) / entry_price * 100
-        verdict = (
-            f"MOMENTUM BROKEN on {dates[broke_at_idx].date()} at {exit_price:.2f} "
-            f"({exit_pnl:+.2f}%) -- rule's exit already triggered, even though "
-            f"current price may differ"
-        )
-        still_in_momentum = False
-    elif ext_end - floor_day_idx - 1 >= config.max_extension_days:
-        verdict = f"EXTENSION WINDOW EXPIRED ({config.max_extension_days} days past floor) -- rule says exit now"
-        still_in_momentum = False
+    if floor_day_idx is None:
+        if n - 1 >= hold:
+            base["Verdict"] = (
+                f"TIME STOP -- {hold}+ sessions since entry, never reached the "
+                f"{config.target_pct}% floor -- exit, capital isn't converting"
+            )
+            base["Still_In_Momentum"] = False
+        elif pnl_pct <= -config.max_risk_pct:
+            # Catches positions whose Entry_Date is unreliable (CSV import
+            # defaults it to today for anything not already tracked, since
+            # Zerodha's export has no real purchase date -- see
+            # import_holdings_csv) so day-count logic above can't see their
+            # real history. PnL_Pct itself is still accurate (it comes
+            # straight from Average Price), so a loss past the scanner's
+            # own max-acceptable-risk threshold is flagged regardless.
+            base["Verdict"] = (
+                f"DEEP LOSS -- {pnl_pct:+.2f}% exceeds max acceptable risk "
+                f"({config.max_risk_pct}%) -- review for exit"
+            )
+            base["Still_In_Momentum"] = False
+        else:
+            base["Verdict"] = "NOT YET AT FLOOR"
+        return base
+
+    # Phase 2: extension window, stop still active throughout.
+    base["Floor_Crossed_On"] = str(dates[floor_day_idx].date())
+    ext_end = min(floor_day_idx + 1 + config.max_extension_days, n)
+    prev_close = closes[floor_day_idx]
+    for k in range(floor_day_idx + 1, ext_end):
+        if stop is not None and lows[k] <= stop:
+            return _stop_hit_verdict(k, during_extension=True)
+        if closes[k] <= prev_close:
+            exit_price = float(closes[k])
+            exit_pnl = (exit_price - entry_price) / entry_price * 100
+            base["Verdict"] = (
+                f"MOMENTUM BROKEN on {dates[k].date()} at {exit_price:.2f} "
+                f"({exit_pnl:+.2f}%) -- rule's exit already triggered, even though "
+                f"current price may differ"
+            )
+            base["Still_In_Momentum"] = False
+            return base
+        prev_close = closes[k]
+
+    if ext_end - floor_day_idx - 1 >= config.max_extension_days:
+        base["Verdict"] = f"EXTENSION WINDOW EXPIRED ({config.max_extension_days} days past floor) -- rule says exit now"
+        base["Still_In_Momentum"] = False
     else:
-        verdict = "STILL IN MOMENTUM -- hold"
-        still_in_momentum = True
-
-    return {
-        "Ticker": ticker,
-        "Entry_Price": entry_price,
-        "Entry_Date": entry_date,
-        "Current_Price": round(current_price, 2),
-        "PnL_Pct": round(pnl_pct, 2),
-        "Floor_Crossed_On": str(dates[floor_day_idx].date()),
-        "Still_In_Momentum": still_in_momentum,
-        "Days_Since_Entry": len(closes),
-        "Verdict": verdict,
-    }
+        base["Verdict"] = "STILL IN MOMENTUM -- hold"
+        base["Still_In_Momentum"] = True
+    return base
 
 
 def book_profit(
@@ -361,7 +422,12 @@ def run_position_check(project_id: str, config: Optional[swings.ScannerConfig] =
 
     results_df = pd.DataFrame(rows)
     try:
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+        # ALLOW_FIELD_ADDITION -- this run added Stop, a new column the
+        # existing table's schema doesn't have yet.
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND",
+            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+        )
         client.load_table_from_dataframe(
             results_df, f"{project_id}.data_options.position_momentum_check", job_config=job_config
         ).result()
