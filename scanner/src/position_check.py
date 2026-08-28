@@ -27,6 +27,124 @@ from google.cloud import bigquery
 
 import swings
 
+# Zerodha Console's holdings CSV export uses these headers (case varies by
+# export version) -- matched case-insensitively, with a couple of common
+# aliases, rather than hardcoding one exact spelling.
+CSV_TICKER_COLUMNS = ["instrument", "symbol", "tradingsymbol"]
+CSV_QTY_COLUMNS = ["qty.", "qty", "quantity"]
+CSV_AVG_COST_COLUMNS = ["avg. cost", "avg cost", "average price", "avg_cost"]
+
+
+def _find_column(columns: list[str], candidates: list[str]) -> Optional[str]:
+    lower_map = {c.lower().strip(): c for c in columns}
+    for candidate in candidates:
+        if candidate in lower_map:
+            return lower_map[candidate]
+    return None
+
+
+def import_holdings_csv(csv_path: str, project_id: str) -> None:
+    """
+    Loads a Zerodha Console holdings CSV export into data_options.holdings.
+
+    Zerodha's export has quantity and average cost, but NOT the original
+    entry date -- that's a real gap, handled deliberately, not glossed
+    over: for a ticker already in holdings, only Quantity/Entry_Price are
+    updated, the existing Entry_Date is kept as-is (it's the one piece of
+    truth the CSV can't provide). For a ticker not already in holdings,
+    Entry_Date is set to today and printed with an explicit warning --
+    correct it manually if it wasn't actually bought today, since the
+    momentum trace is meaningless from the wrong starting point.
+
+    Any ticker currently Active=TRUE in holdings but NOT present in this
+    CSV is treated as closed (the export is a complete current snapshot)
+    and marked Active=FALSE.
+    """
+    df = pd.read_csv(csv_path)
+    columns = list(df.columns)
+
+    ticker_col = _find_column(columns, CSV_TICKER_COLUMNS)
+    qty_col = _find_column(columns, CSV_QTY_COLUMNS)
+    avg_col = _find_column(columns, CSV_AVG_COST_COLUMNS)
+
+    if not (ticker_col and qty_col and avg_col):
+        raise ValueError(
+            f"Could not find expected columns in {csv_path}. Found: {columns}. "
+            f"Need something matching ticker={CSV_TICKER_COLUMNS}, qty={CSV_QTY_COLUMNS}, "
+            f"avg_cost={CSV_AVG_COST_COLUMNS}."
+        )
+
+    client = bigquery.Client(project=project_id)
+    # Full existing rows, not just Ticker/Entry_Date -- closed positions need
+    # their Entry_Price/Quantity/Notes carried over too, not just flipped to
+    # inactive with data loss.
+    existing = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    today = dt.date.today().isoformat()
+    csv_tickers = set()
+    new_rows = []
+    for _, row in df.iterrows():
+        raw_symbol = str(row[ticker_col]).strip()
+        if not raw_symbol or raw_symbol.lower() == "nan":
+            continue
+        ticker = swings.to_yahoo_nse_ticker(raw_symbol)
+        qty = float(str(row[qty_col]).replace(",", ""))
+        avg_cost = float(str(row[avg_col]).replace(",", ""))
+        if qty <= 0:
+            continue
+
+        csv_tickers.add(ticker)
+        if ticker in existing:
+            entry_date = str(existing[ticker]["Entry_Date"])
+        else:
+            entry_date = today
+            print(f"NEW position detected: {ticker} -- Entry_Date set to {today}. "
+                  f"Correct manually if it wasn't actually bought today.")
+
+        new_rows.append({
+            "Ticker": ticker, "Entry_Price": avg_cost, "Entry_Date": entry_date,
+            "Quantity": qty, "Active": True, "Notes": None,
+        })
+
+    closed_tickers = set(existing) - csv_tickers
+    closed_rows = [
+        {
+            "Ticker": t, "Entry_Price": existing[t]["Entry_Price"], "Entry_Date": str(existing[t]["Entry_Date"]),
+            "Quantity": existing[t]["Quantity"], "Active": False, "Notes": existing[t]["Notes"],
+        }
+        for t in closed_tickers
+    ]
+
+    all_touched = csv_tickers | closed_tickers
+    if all_touched:
+        # DELETE-then-LOAD, not a streaming insert -- streamed rows (and the
+        # whole table, briefly) can't be UPDATE'd/DELETE'd for a while after
+        # insert_rows_json, which silently broke the "mark closed" step the
+        # first time this ran. A LOAD job doesn't have that limitation, same
+        # pattern already proven safe in swings.py's write_to_bigquery.
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@tickers)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", list(all_touched))
+            ]),
+        ).result()
+
+        all_rows = pd.DataFrame(new_rows + closed_rows)
+        client.load_table_from_dataframe(
+            all_rows, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    if closed_tickers:
+        print(f"Marked as closed (no longer in CSV): {', '.join(sorted(closed_tickers))}")
+    print(f"Imported {len(new_rows)} active holdings from {csv_path}")
+
 
 def check_position_momentum(
     ticker: str, entry_price: float, entry_date: str, config: swings.ScannerConfig
@@ -161,11 +279,57 @@ def run_position_check(project_id: str, config: Optional[swings.ScannerConfig] =
     return results_df
 
 
+def format_position_telegram_summary(results_df: pd.DataFrame) -> Optional[str]:
+    """
+    Plain text, same reasoning as swings.format_telegram_digest -- setup/
+    verdict text here is data-driven, not worth risking a Markdown parse
+    error over. Only worth sending if something needs a decision: skips
+    positions that are just "NOT YET AT FLOOR" (nothing to act on) and
+    sends nothing at all if every position is in that state.
+    """
+    if results_df.empty:
+        return None
+
+    actionable = results_df[results_df["Verdict"] != "NOT YET AT FLOOR"]
+    if actionable.empty:
+        return None
+
+    lines = ["Position check -- action needed or momentum update:", ""]
+    for _, r in actionable.iterrows():
+        lines.append(f"{r['Ticker']}: {r['PnL_Pct']:+.2f}% -- {r['Verdict']}")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check real holdings against the floor+extension exit rule.")
     parser.add_argument("--project-id", default="sudarshan-442212")
+    parser.add_argument("--import-csv", default=None,
+                         help="Path to a Zerodha Console holdings CSV export -- imports into "
+                              "data_options.holdings before running the check")
+    parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
     args = parser.parse_args()
-    run_position_check(args.project_id)
+
+    if args.import_csv:
+        import_holdings_csv(args.import_csv, args.project_id)
+
+    results_df = run_position_check(args.project_id)
+
+    if not args.no_telegram:
+        import os
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not bot_token or not chat_id:
+            print("\nTelegram summary skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
+        else:
+            text = format_position_telegram_summary(results_df)
+            if text is None:
+                print("\nNothing actionable -- Telegram summary skipped.")
+            else:
+                try:
+                    swings.send_telegram_notification(text, bot_token, chat_id)
+                    print("\nSent Telegram position summary.")
+                except Exception as exc:
+                    print(f"\nTelegram summary skipped/failed: {exc}")
 
 
 if __name__ == "__main__":
