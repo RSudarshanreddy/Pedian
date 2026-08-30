@@ -617,7 +617,7 @@ def calculate_score(
 # =========================================================
 # CANDIDATE BUILDER
 # =========================================================
-def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str) -> Optional[dict[str, Any]]:
+def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str, run_timestamp: str) -> Optional[dict[str, Any]]:
     if len(data) < config.min_days:
         return None
 
@@ -687,6 +687,7 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Ticker": ticker,
         "Bar_Date": pd.Timestamp(data.index[-1]).date().isoformat(),
         "Run_Date": run_date,
+        "Run_Timestamp": run_timestamp,
         "Action": action,
         "Setup_Type": setup_type,
         "Setup_Age_Days": setup_age_days,
@@ -719,14 +720,14 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
 # =========================================================
 # SCANNER
 # =========================================================
-def scan_ticker_data(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str) -> Optional[dict[str, Any]]:
+def scan_ticker_data(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str, run_timestamp: str) -> Optional[dict[str, Any]]:
     if not has_enough_data(data, config):
         return None
     data = add_indicators(data, config)
-    return build_candidate(ticker, data, config, run_date)
+    return build_candidate(ticker, data, config, run_date, run_timestamp)
 
 
-def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str) -> tuple[pd.DataFrame, list[str], int]:
+def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_timestamp: str) -> tuple[pd.DataFrame, list[str], int]:
     """Returns (results, failed_tickers, total_quality_candidates_before_top_n_cap).
     failed_tickers lets a systemic failure (bad batch, API change) surface
     instead of just looking like '0 candidates found'. total_quality_candidates
@@ -754,7 +755,7 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str) -> tu
         else:
             for ticker in batch:
                 try:
-                    candidate = scan_ticker_data(ticker, get_ticker_frame(batch_data, ticker), config, run_date)
+                    candidate = scan_ticker_data(ticker, get_ticker_frame(batch_data, ticker), config, run_date, run_timestamp)
                     if candidate:
                         results.append(candidate)
                 except Exception as exc:
@@ -789,6 +790,7 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Ticker", "STRING"),
     bigquery.SchemaField("Bar_Date", "DATE"),
     bigquery.SchemaField("Run_Date", "DATE"),
+    bigquery.SchemaField("Run_Timestamp", "TIMESTAMP"),
     bigquery.SchemaField("Action", "STRING"),
     bigquery.SchemaField("Setup_Type", "STRING"),
     bigquery.SchemaField("Setup_Age_Days", "INT64"),
@@ -874,6 +876,8 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
     output = df.copy()
     output["Bar_Date"] = pd.to_datetime(output["Bar_Date"]).dt.date
     output["Run_Date"] = pd.to_datetime(output["Run_Date"]).dt.date
+    if "Run_Timestamp" in output.columns:
+        output["Run_Timestamp"] = pd.to_datetime(output["Run_Timestamp"], utc=True)
     output = output.rename(columns={source: target for source, target in field_map.items() if source != target})
 
     # The legacy table stores score as INTEGER.  Retain that established type
@@ -1251,8 +1255,10 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     print(f"Scanning {len(tickers)} tickers...")
     print("-" * 80)
 
-    run_date = dt.datetime.now(dt.timezone.utc).date().isoformat()
-    candidates, failures, total_quality = scan_tickers(tickers, config, run_date)
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    run_date = now_utc.date().isoformat()
+    run_timestamp = now_utc.isoformat()
+    candidates, failures, total_quality = scan_tickers(tickers, config, run_date, run_timestamp)
 
     if failures:
         print(f"\n{len(failures)} tickers failed or had no usable data.")
