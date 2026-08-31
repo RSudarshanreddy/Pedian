@@ -28,6 +28,7 @@ SELECT
   S.Ticker AS ticker,
   S.Bar_Date AS bar_date,
   S.Run_Date AS run_date,
+  S.Run_Timestamp AS run_timestamp,
   S.Action AS action,
   S.Setup_Type AS setup_type,
   S.Setup_Age_Days AS setup_age_days,
