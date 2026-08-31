@@ -98,7 +98,7 @@ class ScannerConfig:
     # Entry timing (independent of persistence)
     breakout_lookback: int = 20
     support_window: int = 20
-    support_distance_threshold: float = 8.0
+    support_distance: float = 8.0
     breakout_volume_mult: float = 2.3
     pullback_min: float = 2.0
     pullback_max: float = 8.0
@@ -604,7 +604,7 @@ def calculate_score(
     else:
         setup_bonus = 0
 
-    support_penalty = min(max(distance_from_support - config.support_distance_threshold, 0) * 0.3, 5)
+    support_penalty = min(max(distance_from_support - config.support_distance, 0) * 0.3, 5)
 
     score = (
         persistence_score + expected_move_score + stability_bonus
