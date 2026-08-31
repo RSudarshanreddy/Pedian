@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import re
 from typing import Optional
 
 import pandas as pd
@@ -33,6 +34,17 @@ import swings
 CSV_TICKER_COLUMNS = ["instrument", "symbol", "tradingsymbol"]
 CSV_QTY_COLUMNS = ["qty.", "qty", "quantity", "quantity available"]
 CSV_AVG_COST_COLUMNS = ["avg. cost", "avg cost", "average price", "avg_cost"]
+
+# Zerodha appends a trailing "-<SERIES>" marker to the tradingsymbol for
+# anything not on the default EQ series -- "-T" for a T1/not-yet-settled
+# lot, "-BE"/"-BZ"/"-BL" etc. for trade-to-trade restricted series. It's a
+# settlement/series marker, not part of the real ticker (confirmed:
+# BLISSGVS-T, BLISSGVS-BE, E2E-T all fail on Yahoo; BLISSGVS/E2E don't).
+_SERIES_SUFFIX_RE = re.compile(r"-[A-Z]{1,3}$")
+
+
+def _strip_series_suffix(raw_symbol: str) -> str:
+    return _SERIES_SUFFIX_RE.sub("", raw_symbol.upper())
 
 
 def _find_column(columns: list[str], candidates: list[str]) -> Optional[str]:
@@ -93,12 +105,7 @@ def import_holdings_csv(csv_path: str, project_id: str) -> None:
         raw_symbol = str(row[ticker_col]).strip()
         if not raw_symbol or raw_symbol.lower() == "nan":
             continue
-        # Zerodha appends "-T" to the symbol for T1 (not-yet-settled) lots --
-        # that's a settlement-status marker, not part of the real ticker
-        # (confirmed: BLISSGVS-T/E2E-T fail on Yahoo, BLISSGVS/E2E don't).
-        if raw_symbol.upper().endswith("-T"):
-            raw_symbol = raw_symbol[:-2]
-        ticker = swings.to_yahoo_nse_ticker(raw_symbol)
+        ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(raw_symbol))
         qty = float(str(row[qty_col]).replace(",", ""))
         avg_cost = float(str(row[avg_col]).replace(",", ""))
         if qty <= 0:
@@ -180,6 +187,103 @@ def _fifo_open_lots(trades: pd.DataFrame) -> tuple[float, float, str, str, int]:
         return 0.0, 0.0, "", "", 0
     wavg_price = sum(l[0] * l[1] for l in lots) / total_qty
     return total_qty, wavg_price, min(l[2] for l in lots), max(l[2] for l in lots), len(lots)
+
+
+def _fifo_realized_trades(trades: pd.DataFrame) -> list[dict]:
+    """
+    Same FIFO walk as _fifo_open_lots, but returns a record for every SELL
+    instead of just the final open state -- one row per sell event, entry
+    price/date blended (weighted average price, earliest date) across
+    whichever buy lots got consumed by it. A sell that eats into shares
+    bought before this file's window (no matching lot left) reports
+    unmatched_qty > 0 for that portion -- its P&L can't be computed from
+    this file alone, so the caller should skip logging that slice rather
+    than guess.
+    """
+    lots: list[list] = []  # [qty, price, date]
+    realized: list[dict] = []
+    for _, row in trades.iterrows():
+        qty = float(row["quantity"])
+        if row["trade_type"] == "buy":
+            lots.append([qty, float(row["price"]), row["trade_date"]])
+        else:
+            remaining = qty
+            matched_cost = 0.0
+            matched_qty = 0.0
+            earliest_date = None
+            while remaining > 1e-9 and lots:
+                consume = min(lots[0][0], remaining)
+                matched_cost += consume * lots[0][1]
+                matched_qty += consume
+                if earliest_date is None or lots[0][2] < earliest_date:
+                    earliest_date = lots[0][2]
+                lots[0][0] -= consume
+                remaining -= consume
+                if lots[0][0] <= 1e-9:
+                    lots.pop(0)
+            if matched_qty > 1e-9:
+                realized.append({
+                    "qty": matched_qty, "entry_price": matched_cost / matched_qty, "entry_date": str(earliest_date),
+                    "exit_price": float(row["price"]), "exit_date": str(row["trade_date"]),
+                    "unmatched_qty": remaining,
+                })
+    return realized
+
+
+def backfill_realized_trades_from_tradebook(tradebook_csv: str, project_id: str) -> None:
+    """
+    One-time backfill: data_options.realized_trades only has trades booked
+    through book_profit since that feature existed -- everything sold
+    before that (confirmed against a real Zerodha P&L export: AEGISLOG
+    +10,025, MSTCLTD's Aug-19 sale +3,928, SHILPAMED, SKYGOLD, etc.) was
+    never logged. Recovers those from the tradebook via FIFO matching.
+
+    Guards against a double-run: if any row already has
+    Notes='Backfilled from tradebook (FIFO)', does nothing -- re-running
+    this would otherwise duplicate the whole ledger.
+    """
+    client = bigquery.Client(project=project_id)
+    already_done = list(client.query(
+        f"SELECT 1 FROM `{project_id}.data_options.realized_trades` "
+        f"WHERE Notes = 'Backfilled from tradebook (FIFO)' LIMIT 1"
+    ).result())
+    if already_done:
+        print("Backfill already run once (found existing 'Backfilled from tradebook (FIFO)' rows) -- skipping.")
+        return
+
+    trades = pd.read_csv(tradebook_csv)
+    trades["order_execution_time"] = pd.to_datetime(trades["order_execution_time"])
+    trades = trades.sort_values("order_execution_time")
+
+    rows_to_write = []
+    unmatched_notes = []
+    for symbol, g in trades.groupby("symbol"):
+        ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(symbol))
+        for r in _fifo_realized_trades(g):
+            pnl_amount = (r["exit_price"] - r["entry_price"]) * r["qty"]
+            pnl_pct = (r["exit_price"] - r["entry_price"]) / r["entry_price"] * 100
+            rows_to_write.append({
+                "Ticker": ticker, "Entry_Price": round(r["entry_price"], 4), "Entry_Date": r["entry_date"],
+                "Exit_Price": r["exit_price"], "Exit_Date": r["exit_date"], "Quantity": r["qty"],
+                "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2),
+                "Notes": "Backfilled from tradebook (FIFO)",
+            })
+            if r["unmatched_qty"] > 1e-9:
+                unmatched_notes.append(f"{ticker} on {r['exit_date']}: {r['unmatched_qty']:.0f} shares "
+                                        f"sold with no matching buy lot in this file (pre-existing, P&L not computable)")
+
+    if rows_to_write:
+        client.load_table_from_dataframe(
+            pd.DataFrame(rows_to_write), f"{project_id}.data_options.realized_trades",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    total_pnl = sum(r["PnL_Amount"] for r in rows_to_write)
+    print(f"Backfilled {len(rows_to_write)} realized trade(s) from {tradebook_csv}, total P&L {total_pnl:+.2f}")
+    if unmatched_notes:
+        print("Unmatched (skipped, no computable P&L):")
+        for note in unmatched_notes:
+            print(f"  {note}")
 
 
 def apply_tradebook_entry_dates(tradebook_csv: str, project_id: str) -> None:
@@ -443,7 +547,7 @@ def book_profit(
     original Entry_Price/Entry_Date for the remaining shares (cost basis
     isn't reaveraged on a partial sell).
     """
-    ticker = swings.to_yahoo_nse_ticker(ticker.strip())
+    ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(ticker.strip()))
     client = bigquery.Client(project=project_id)
 
     rows = list(client.query(
@@ -504,6 +608,69 @@ def book_profit(
         f"{pnl_amount:+.2f} ({pnl_pct:+.2f}%). "
         + (f"{remaining_qty} left, still active." if remaining_qty > 0 else "Position closed.")
     )
+    return result
+
+
+def book_buy(
+    ticker: str, buy_qty: float, buy_price: float, project_id: str,
+    buy_date: Optional[str] = None, notes: Optional[str] = None,
+) -> dict:
+    """
+    Records a real buy: a brand-new ticker creates a fresh active row; an
+    existing active holding gets the new lot averaged into a single blended
+    cost basis (same weighted-average methodology Zerodha's own Average
+    Price uses, confirmed exact match against real data earlier this
+    session) with Quantity increased. Entry_Date is NOT changed on an
+    add -- the position started when the first shares were bought, adding
+    more doesn't reset how long capital has been deployed (same reasoning
+    as apply_tradebook_entry_dates' oldest-lot choice).
+    """
+    ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(ticker.strip()))
+    client = bigquery.Client(project=project_id)
+    buy_date = buy_date or dt.date.today().isoformat()
+
+    rows = list(client.query(
+        f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+        f"FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker AND Active = TRUE",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result())
+
+    client.query(
+        f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result()
+
+    if rows:
+        current = dict(rows[0].items())
+        old_qty = float(current["Quantity"])
+        old_price = float(current["Entry_Price"])
+        new_qty = old_qty + buy_qty
+        new_avg_price = (old_qty * old_price + buy_qty * buy_price) / new_qty
+        entry_date = str(current["Entry_Date"])
+        row_notes = current["Notes"]
+        action_desc = f"added to existing {old_qty:.0f} @ {old_price:.2f} -> {new_qty:.0f} @ {new_avg_price:.2f} avg"
+    else:
+        new_qty = buy_qty
+        new_avg_price = buy_price
+        entry_date = buy_date
+        row_notes = notes
+        action_desc = "new position"
+
+    new_row = pd.DataFrame([{
+        "Ticker": ticker, "Entry_Price": round(new_avg_price, 4), "Entry_Date": entry_date,
+        "Quantity": new_qty, "Active": True, "Notes": row_notes,
+    }])
+    client.load_table_from_dataframe(
+        new_row, f"{project_id}.data_options.holdings",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+    ).result()
+
+    result = {"Ticker": ticker, "Quantity": new_qty, "Entry_Price": round(new_avg_price, 4), "Entry_Date": entry_date}
+    print(f"Booked BUY {buy_qty:.0f} of {ticker} @ {buy_price:.2f} ({action_desc})")
     return result
 
 
