@@ -298,8 +298,16 @@ def check_position_momentum(
     unattended.
     """
     yf = swings.load_yfinance()
+    # Window sized off the real entry date, not a fixed lookback -- a fixed
+    # "6mo" silently truncated history for anything entered further back
+    # than that (confirmed live: a position entered ~895 days ago got no
+    # usable history at all under a flat 6mo window). The extra 90-day
+    # buffer before entry is warm-up room for add_indicators' rolling
+    # windows (ATR/support_window need ~20 bars of lead-in).
+    entry_ts = pd.Timestamp(entry_date)
+    start = (entry_ts - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
     try:
-        raw = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True, threads=False)
+        raw = yf.download(ticker, start=start, interval="1d", progress=False, auto_adjust=True, threads=False)
         data = swings.normalize_single_ticker_columns(raw)
     except Exception as exc:
         return {"Ticker": ticker, "Verdict": f"DATA ERROR: {exc}"}
@@ -309,7 +317,7 @@ def check_position_momentum(
     if data.empty and ticker.upper().endswith(".NS"):
         bse_ticker = ticker[:-3] + ".BO"
         try:
-            raw = yf.download(bse_ticker, period="6mo", interval="1d", progress=False, auto_adjust=True, threads=False)
+            raw = yf.download(bse_ticker, start=start, interval="1d", progress=False, auto_adjust=True, threads=False)
             data = swings.normalize_single_ticker_columns(raw)
             if not data.empty:
                 ticker = bse_ticker
@@ -320,7 +328,6 @@ def check_position_momentum(
         return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
 
     indexed = swings.add_indicators(data, config)
-    entry_ts = pd.Timestamp(entry_date)
     post_entry = indexed.loc[indexed.index >= entry_ts]
     if post_entry.empty:
         return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
