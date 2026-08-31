@@ -184,9 +184,70 @@ def to_yahoo_nse_ticker(symbol: str) -> str:
     return symbol if symbol.endswith(".NS") else f"{symbol}.NS"
 
 
-def load_nse_tickers(source: str = NSE_EQUITY_LIST_URL) -> list[str]:
-    symbols = pd.read_csv(source)["SYMBOL"].dropna().astype(str)
-    return [to_yahoo_nse_ticker(s) for s in symbols]
+def _cache_nse_tickers(tickers: list[str], project_id: str) -> None:
+    """Best-effort -- a caching failure should never break a live fetch that
+    just succeeded. WRITE_TRUNCATE: this is a snapshot of the current
+    universe, not history worth accumulating."""
+    try:
+        client = bigquery.Client(project=project_id)
+        df = pd.DataFrame({"Ticker": tickers, "Cached_At": dt.datetime.now(dt.timezone.utc)})
+        client.load_table_from_dataframe(
+            df, f"{project_id}.data_options.nse_ticker_cache",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+        ).result()
+    except Exception as exc:
+        LOGGER.warning("Failed to cache NSE ticker list (non-fatal): %s", exc)
+
+
+def _load_cached_nse_tickers(project_id: str) -> list[str]:
+    try:
+        client = bigquery.Client(project=project_id)
+        rows = client.query(f"SELECT Ticker FROM `{project_id}.data_options.nse_ticker_cache`").result()
+        return [row["Ticker"] for row in rows]
+    except Exception:
+        return []
+
+
+def load_nse_tickers(source: str = NSE_EQUITY_LIST_URL, project_id: Optional[str] = None) -> list[str]:
+    """
+    Retries the live NSE fetch a few times, then falls back to the last
+    successfully-fetched list cached in BigQuery.
+
+    Confirmed live: Cloud Run's egress IP gets a persistent 403 Forbidden
+    from archives.nseindia.com (the identical fetch works fine from other
+    IPs; not transient -- 5 straight scheduled runs failed the same way
+    over 6.5 hours). Retrying from the same blocked IP won't fix that, but
+    a stock universe list changes rarely (a handful of tickers a month), so
+    falling back to a slightly stale cached list is a far better failure
+    mode than the scanner producing nothing at all.
+    """
+    try:
+        resolved_project = _resolve_project_id(project_id)
+    except Exception:
+        resolved_project = None
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            symbols = pd.read_csv(source)["SYMBOL"].dropna().astype(str)
+            tickers = [to_yahoo_nse_ticker(s) for s in symbols]
+            if resolved_project:
+                _cache_nse_tickers(tickers, resolved_project)
+            return tickers
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(5)
+
+    if resolved_project:
+        cached = _load_cached_nse_tickers(resolved_project)
+        if cached:
+            LOGGER.warning(
+                "Live NSE fetch failed after retries (%s) -- using %d cached tickers instead",
+                last_exc, len(cached),
+            )
+            return cached
+    raise last_exc
 
 
 def parse_tickers(raw: list[str]) -> list[str]:
@@ -1194,7 +1255,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             verbose=bool(body.get("verbose", False)),
         )
         raw_tickers = body.get("tickers")
-        tickers = parse_tickers(raw_tickers) if raw_tickers else load_nse_tickers(body.get("symbols_source", NSE_EQUITY_LIST_URL))
+        tickers = parse_tickers(raw_tickers) if raw_tickers else load_nse_tickers(
+            body.get("symbols_source", NSE_EQUITY_LIST_URL), body.get("project_id"))
         limit = int(body.get("limit", 0))
         if limit > 0:
             tickers = tickers[:limit]
@@ -1228,7 +1290,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             verbose=args.verbose,
         )
 
-        tickers = parse_tickers(args.tickers) if args.tickers else load_nse_tickers(args.symbols_source)
+        tickers = parse_tickers(args.tickers) if args.tickers else load_nse_tickers(args.symbols_source, args.project_id)
         if args.limit > 0:
             tickers = tickers[:args.limit]
 
