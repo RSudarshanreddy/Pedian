@@ -1052,17 +1052,16 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
 
     # Plain text, deliberately -- see send_telegram_notification for why.
+    # Kept to one line per ticker on purpose -- score/entry/SL/target are all
+    # in BigQuery (vw_daily_digest) for whoever wants to dig in; this is the
+    # 5-second phone read, not the full record.
     lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
         # breakout decays fastest of the three setup types (best win rate in
         # backtest, but also the sharpest/most volume-driven moves) -- flag
         # it so it's obvious which alerts are most time-sensitive to act on.
-        tag = " [BREAKOUT -- act fast]" if r["Setup_Type"] == "breakout" else ""
-        lines.append(
-            f"{r['Ticker']} ({r['Setup_Type']}){tag} score {r['Score']:.0f}, "
-            f"win rate {r['Persistence_Rate']:.0f}%\n"
-            f"Entry {r['Entry']:.2f} | SL {r['Stop_Loss']:.2f} | Target {r['Target']:.2f}"
-        )
+        tag = " [act fast]" if r["Setup_Type"] == "breakout" else ""
+        lines.append(f"{r['Ticker']} ({r['Setup_Type']}){tag} -- win rate {r['Persistence_Rate']:.0f}%")
     lines.append("")
     lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
     return "\n".join(lines)
