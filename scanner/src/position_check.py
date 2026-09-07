@@ -158,6 +158,28 @@ def import_holdings_csv(csv_path: str, project_id: str) -> None:
     print(f"Imported {len(new_rows)} active holdings from {csv_path}")
 
 
+def load_account_ledger(csv_path: str, project_id: str) -> None:
+    """
+    Loads a Zerodha Console fund ledger export (deposits, withdrawals,
+    settlements, DP/AMC/delayed-payment charges, running balance) into
+    data_options.account_ledger, so this history is queryable in BigQuery
+    instead of needing the CSV re-pasted every time. WRITE_TRUNCATE --
+    each export is the full account history to date, not an incremental
+    diff, so a fresh export is the new source of truth wholesale.
+    """
+    df = pd.read_csv(csv_path)
+    df = df[df["posting_date"].notna()].copy()
+    df["posting_date"] = pd.to_datetime(df["posting_date"]).dt.date
+
+    client = bigquery.Client(project=project_id)
+    client.load_table_from_dataframe(
+        df, f"{project_id}.data_options.account_ledger",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+    ).result()
+    print(f"Loaded {len(df)} ledger rows into {project_id}.data_options.account_ledger "
+          f"({df['posting_date'].min()} to {df['posting_date'].max()})")
+
+
 def _fifo_open_lots(trades: pd.DataFrame) -> tuple[float, float, str, str, int]:
     """
     FIFO-consumes buy/sell rows (already sorted by execution time) for one
