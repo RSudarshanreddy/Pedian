@@ -824,8 +824,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     if not no_telegram:
         import os
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
+        chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
+        if not bot_token or not chat_id_raw:
             print("\nTelegram summary skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
         else:
             text = format_position_telegram_summary(results_df)
@@ -833,8 +833,13 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
                 print("\nNothing actionable -- Telegram summary skipped.")
             else:
                 try:
-                    swings.send_telegram_notification(text, bot_token, chat_id)
-                    print("\nSent Telegram position summary.")
+                    chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
+                    failures = swings.send_telegram_to_all(text, bot_token, chat_ids)
+                    if failures:
+                        print(f"\nSent Telegram position summary to {len(chat_ids) - len(failures)}/{len(chat_ids)} "
+                              f"recipient(s); failed: {failures}")
+                    else:
+                        print(f"\nSent Telegram position summary to {len(chat_ids)} recipient(s).")
                 except Exception as exc:
                     print(f"\nTelegram summary skipped/failed: {exc}")
 

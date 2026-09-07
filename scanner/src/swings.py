@@ -60,7 +60,7 @@ class ScannerConfig:
 
     # Universe (hard filters)
     min_price: float =350.0
-    max_price: float = 1500.0
+    max_price: float = 1100.0
     min_avg_traded_value_cr: float = 10.0
 
     # Volatility identity (what makes a stock "volatile")
@@ -1154,6 +1154,24 @@ def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
     resp.raise_for_status()
 
 
+def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list[str]:
+    """
+    Sends to every chat_id, continuing past individual failures -- one bad
+    ID (someone blocked the bot, a typo'd ID) shouldn't silently drop the
+    notification to everyone else. Returns the chat_ids that failed
+    (empty if all succeeded), so the caller can log which ones need
+    attention rather than a single opaque exception.
+    """
+    failures = []
+    for cid in chat_ids:
+        try:
+            send_telegram_notification(text, bot_token, cid)
+        except Exception as exc:
+            failures.append(cid)
+            LOGGER.warning("Telegram send failed for chat_id %s: %s", cid, exc)
+    return failures
+
+
 # =========================================================
 # ARGS
 # =========================================================
@@ -1373,16 +1391,21 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     if not no_telegram:
         try:
             bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-            chat_id = os.getenv("TELEGRAM_CHAT_ID")
-            if not bot_token or not chat_id:
+            chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
+            if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
                 digest_text = format_telegram_digest(candidates, run_date)
                 if digest_text is None:
                     print("\nNo fresh (Age==1) BUY signals -- Telegram notification skipped.")
                 else:
-                    send_telegram_notification(digest_text, bot_token, chat_id)
-                    print("\nSent Telegram notification.")
+                    chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
+                    failures = send_telegram_to_all(digest_text, bot_token, chat_ids)
+                    if failures:
+                        print(f"\nSent Telegram notification to {len(chat_ids) - len(failures)}/{len(chat_ids)} "
+                              f"recipient(s); failed: {failures}")
+                    else:
+                        print(f"\nSent Telegram notification to {len(chat_ids)} recipient(s).")
         except Exception as exc:
             print(f"\nTelegram notification skipped/failed: {exc}")
             print("Use --no-telegram to suppress this.")
