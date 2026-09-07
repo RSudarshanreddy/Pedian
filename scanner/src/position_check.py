@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 from google.cloud import bigquery
@@ -770,39 +770,58 @@ def format_position_telegram_summary(results_df: pd.DataFrame) -> Optional[str]:
     return "\n".join(lines)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Check real holdings against the floor+extension exit rule.")
-    parser.add_argument("--project-id", default="sudarshan-442212")
-    parser.add_argument("--import-csv", default=None,
-                         help="Path to a Zerodha Console holdings CSV export -- imports into "
-                              "data_options.holdings before running the check")
-    parser.add_argument("--tradebook-csv", default=None,
-                         help="Path to a Zerodha tradebook export -- recovers real Entry_Date "
-                              "(via FIFO) for holdings rows still defaulted to today")
-    parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
-    parser.add_argument("--book-profit-ticker", default=None, help="Ticker to book a sell against, e.g. DYCL")
-    parser.add_argument("--book-profit-qty", type=float, default=None, help="Quantity sold")
-    parser.add_argument("--book-profit-price", type=float, default=None, help="Actual sell price")
-    parser.add_argument("--book-profit-notes", default=None, help="Optional note for the realized_trades row")
-    args = parser.parse_args()
+def main(request: Any = None) -> Optional[tuple[str, int]]:
+    """
+    Branches cleanly on request is not None, same fix swings.py needed --
+    argparse must never see the container's own launch argv on an HTTP
+    invocation (that's what caused swings.py's Cloud Run crash earlier).
+    The HTTP path is deliberately narrower than the CLI: a scheduled
+    trigger should just run the check and notify, not import a CSV or
+    book a trade -- those stay manual, CLI-only actions.
+    """
+    if request is not None:
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        project_id = body.get("project_id", "sudarshan-442212")
+        no_telegram = bool(body.get("no_telegram", False))
+    else:
+        parser = argparse.ArgumentParser(description="Check real holdings against the floor+extension exit rule.")
+        parser.add_argument("--project-id", default="sudarshan-442212")
+        parser.add_argument("--import-csv", default=None,
+                             help="Path to a Zerodha Console holdings CSV export -- imports into "
+                                  "data_options.holdings before running the check")
+        parser.add_argument("--tradebook-csv", default=None,
+                             help="Path to a Zerodha tradebook export -- recovers real Entry_Date "
+                                  "(via FIFO) for holdings rows still defaulted to today")
+        parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
+        parser.add_argument("--book-profit-ticker", default=None, help="Ticker to book a sell against, e.g. DYCL")
+        parser.add_argument("--book-profit-qty", type=float, default=None, help="Quantity sold")
+        parser.add_argument("--book-profit-price", type=float, default=None, help="Actual sell price")
+        parser.add_argument("--book-profit-notes", default=None, help="Optional note for the realized_trades row")
+        args = parser.parse_args()
 
-    if args.import_csv:
-        import_holdings_csv(args.import_csv, args.project_id)
+        if args.import_csv:
+            import_holdings_csv(args.import_csv, args.project_id)
 
-    if args.tradebook_csv:
-        apply_tradebook_entry_dates(args.tradebook_csv, args.project_id)
+        if args.tradebook_csv:
+            apply_tradebook_entry_dates(args.tradebook_csv, args.project_id)
 
-    if args.book_profit_ticker or args.book_profit_qty or args.book_profit_price:
-        if not (args.book_profit_ticker and args.book_profit_qty and args.book_profit_price):
-            raise SystemExit("--book-profit-ticker, --book-profit-qty, and --book-profit-price must all be given together")
-        book_profit(
-            args.book_profit_ticker, args.book_profit_qty, args.book_profit_price,
-            args.project_id, notes=args.book_profit_notes,
-        )
+        if args.book_profit_ticker or args.book_profit_qty or args.book_profit_price:
+            if not (args.book_profit_ticker and args.book_profit_qty and args.book_profit_price):
+                raise SystemExit("--book-profit-ticker, --book-profit-qty, and --book-profit-price must all be given together")
+            book_profit(
+                args.book_profit_ticker, args.book_profit_qty, args.book_profit_price,
+                args.project_id, notes=args.book_profit_notes,
+            )
 
-    results_df = run_position_check(args.project_id)
+        project_id = args.project_id
+        no_telegram = args.no_telegram
 
-    if not args.no_telegram:
+    results_df = run_position_check(project_id)
+
+    if not no_telegram:
         import os
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -818,6 +837,9 @@ def main():
                     print("\nSent Telegram position summary.")
                 except Exception as exc:
                     print(f"\nTelegram summary skipped/failed: {exc}")
+
+    if request is not None:
+        return (f"Position check completed: {len(results_df)} holdings checked", 200)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+# Separate image for position_check.py -- same sqlite3 reasoning as the
+# main Dockerfile (see that file's comment): yfinance's cookie/cache layer
+# needs libsqlite3, which python:3.13-slim ships with and buildpacks don't.
+
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/swings.py .
+COPY src/position_check.py .
+
+ENV PORT=8080
+CMD exec functions-framework --target=main --source=position_check.py --port=${PORT}
