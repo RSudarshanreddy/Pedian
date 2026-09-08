@@ -155,6 +155,18 @@ class ScannerConfig:
     top_n: int = 200                   # high ceiling -- min_score does the real filtering
     verbose: bool = False
 
+    def __post_init__(self) -> None:
+        # min_rr divides target_pct in add_indicators' rr_floor_stop and in
+        # main's risk_cap_pct print. It's exposed via --min-rr, so 0 is
+        # reachable from the CLI and would blow up mid-scan with a bare
+        # ZeroDivisionError. Fail loudly here instead.
+        if self.min_rr <= 0:
+            raise ValueError(f"min_rr must be > 0 (got {self.min_rr}) -- it divides target_pct")
+        if self.target_pct <= 0:
+            raise ValueError(f"target_pct must be > 0 (got {self.target_pct})")
+        if self.min_price >= self.max_price:
+            raise ValueError(f"min_price ({self.min_price}) must be < max_price ({self.max_price})")
+
 
 # =========================================================
 # HELPERS
@@ -364,7 +376,24 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
 # BARRIER BACKTEST -- simulates "buy, never sell below +target_pct%, let it
 # run while it keeps closing higher" (see run_barrier_backtest docstring)
 # =========================================================
-def _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext_days, n):
+def _stop_fill(stop: float, day_open: float) -> float:
+    """
+    Realistic fill price for a stop that triggered on this bar.
+
+    A stop is not a guaranteed price. If the bar OPENED below the stop (an
+    overnight gap down), the order fills at the open, not at the stop --
+    you never got the chance to exit at your level. Only when the stop is
+    breached intraday, from an open above it, do you fill at roughly the
+    stop itself.
+
+    Assuming a clean fill at `stop` overstates every losing trial, and on a
+    universe deliberately selected for 3.5%+ daily volatility that gap is
+    not a rounding error.
+    """
+    return min(stop, day_open) if np.isfinite(day_open) else stop
+
+
+def _simulate_floor_extension_trade(entry, stop, floor, close, low, open_, i, hold, ext_days, n):
     """
     One trial starting the day after day i. Phase 1: walk forward up to `hold`
     days looking for the stop (Low <= stop) or the floor (Close >= floor) --
@@ -377,13 +406,16 @@ def _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext
     at any point during the extension (it stays active as a hard backstop
     the whole time, not just phase 1).
 
-    Returns (exit_pct, reached_floor) or (None, False) if the trial never
-    gets a full look (ran off the end of the data).
+    Stop exits fill at _stop_fill (gap-aware), not at `stop` itself.
+
+    Returns (exit_pct, reached_floor). Always a float exit_pct -- callers
+    compare it numerically, so None is never returned.
     """
     floor_day = None
     for j in range(i + 1, min(i + 1 + hold, n)):
         if low[j] <= stop:
-            return (stop - entry) / entry * 100, False
+            fill = _stop_fill(stop, open_[j])
+            return (fill - entry) / entry * 100, False
         if close[j] >= floor:
             floor_day = j
             break
@@ -397,7 +429,8 @@ def _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext
     prev_close = close[floor_day]
     for k in range(floor_day + 1, min(floor_day + 1 + ext_days, n)):
         if low[k] <= stop:
-            return (stop - entry) / entry * 100, True
+            fill = _stop_fill(stop, open_[k])
+            return (fill - entry) / entry * 100, True
         if close[k] <= prev_close:
             return (close[k] - entry) / entry * 100, True
         prev_close = close[k]
@@ -436,16 +469,24 @@ def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[flo
     lookback = config.persistence_lookback
     hold = config.max_hold_days
     ext_days = config.max_extension_days
-    if len(data) < lookback + hold:
+    # A trial needs room for BOTH phases: up to `hold` days to reach the
+    # floor, then up to `ext_days` more of extension. Reserving only `hold`
+    # let the most recent trials run off the end of the array, where the
+    # min(..., n) bounds inside the simulator silently clipped their
+    # extension short -- truncating exactly the winners that were still
+    # running, and biasing recent expectancy down.
+    full_trial = hold + ext_days
+    if len(data) < lookback + full_trial:
         return 0.0, 0, 0.0, 999.0
 
-    end_base = len(data) - hold
+    end_base = len(data) - full_trial
     start_base = max(0, end_base - lookback)
     period_size = max(1, lookback // 4)
 
     eligible = data["past_vol_mean"].to_numpy() >= config.min_avg_volatility
     close = data["Close"].to_numpy()
     low = data["Low"].to_numpy()
+    open_ = data["Open"].to_numpy()
     stop_arr = data["trade_stop"].to_numpy()
     target_arr = data["trade_target"].to_numpy()
     n = len(data)
@@ -473,7 +514,8 @@ def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[flo
             if not (np.isfinite(entry) and np.isfinite(stop) and np.isfinite(floor)) or stop >= entry:
                 continue
 
-            exit_pct, _ = _simulate_floor_extension_trade(entry, stop, floor, close, low, i, hold, ext_days, n)
+            exit_pct, _ = _simulate_floor_extension_trade(
+                entry, stop, floor, close, low, open_, i, hold, ext_days, n)
             won = exit_pct >= config.target_pct
             if won:
                 hits += 1
@@ -749,6 +791,15 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     risk = calculate_risk_reward(data, config)
     if risk is None:
         return None
+    # NOTE: both checks below are currently UNREACHABLE by construction --
+    # add_indicators' trade_stop takes the max of three candidates, one of
+    # which (rr_floor_stop) caps risk at exactly target_pct/min_rr = 3.0%.
+    # So risk_pct <= 3.0 < max_risk_pct (8.0), and rr_ratio >= min_rr always.
+    # Confirmed empirically: 384 of 384 rows written since the floor+extension
+    # rework have Risk_Pct == exactly 3.00.
+    # They are kept deliberately, NOT dead weight: they stop being inert the
+    # moment rr_floor_stop, min_rr or the stop formula changes, and a silently
+    # missing risk guard is a worse failure than two redundant comparisons.
     if risk["risk_pct"] > config.max_risk_pct:
         return None
     if risk["rr_ratio"] < config.min_rr:
@@ -1141,11 +1192,12 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     # 5-second phone read, not the full record.
     lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
-        # breakout decays fastest of the three setup types (best win rate in
-        # backtest, but also the sharpest/most volume-driven moves) -- flag
-        # it so it's obvious which alerts are most time-sensitive to act on.
-        tag = " [act fast]" if r["Setup_Type"] == "breakout" else ""
-        lines.append(f"{r['Ticker']} ({r['Setup_Type']}){tag} -- win rate {r['Persistence_Rate']:.0f}%")
+        # No per-setup tagging: pullback_bounce is the only setup that reaches
+        # BUY now (see get_entry_trigger), so every line here is the same type.
+        # The old "[act fast]" breakout tag became dead code the moment
+        # breakout went WATCH-only -- fresh_buys filters Action == "BUY", so
+        # it could never render.
+        lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- win rate {r['Persistence_Rate']:.0f}%")
     lines.append("")
     lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
     return "\n".join(lines)
@@ -1370,11 +1422,17 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     if candidates.empty:
         message = "No candidates matched. Try:"
         print(f"\n{message}")
-        print("  --min-persistence 55        (lower persistence bar)")
-        print("  --min-avg-volatility 3.0    (lower volatility bar)")
-        print("  --min-persistence-sample 30 (allow smaller sample size)")
-        print("  --min-rr 1.2                (relax risk/reward bar)")
-        print("  --min-score 55              (relax the quality gate)")
+        # Hints must be LOWER than the current defaults to actually relax
+        # anything -- the old block suggested --min-persistence 55 and
+        # --min-score 55, both ABOVE today's defaults (25 / 40), which would
+        # have tightened the scan while claiming to loosen it. --min-rr is
+        # not listed: raising it tightens the stop and rr_floor_stop already
+        # guarantees the ratio, so it can't surface more candidates.
+        print(f"  --min-persistence 15         (lower win-rate bar, now {config.min_persistence_rate:.0f})")
+        print(f"  --min-avg-volatility 3.0     (lower volatility bar, now {config.min_avg_volatility})")
+        print(f"  --min-persistence-sample 30  (allow smaller sample, now {config.min_persistence_sample})")
+        print(f"  --min-score 30               (relax the quality gate, now {config.min_score:.0f})")
+        print(f"  --max-price 2000             (widen the universe, now {config.max_price:.0f})")
         return (message, 200) if request is not None else None
 
     display = candidates
@@ -1423,10 +1481,14 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
                     print("\nNo fresh (Age==1) BUY signals -- Telegram notification skipped.")
                 else:
                     chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
-                    failures = send_telegram_to_all(digest_text, bot_token, chat_ids)
-                    if failures:
-                        print(f"\nSent Telegram notification to {len(chat_ids) - len(failures)}/{len(chat_ids)} "
-                              f"recipient(s); failed: {failures}")
+                    # NOT `failures` -- that name already holds the failed
+                    # TICKER list from scan_tickers above, and reusing it here
+                    # silently destroyed it (it's still printed further up, but
+                    # anything added later would have read Telegram chat ids).
+                    telegram_failures = send_telegram_to_all(digest_text, bot_token, chat_ids)
+                    if telegram_failures:
+                        print(f"\nSent Telegram notification to {len(chat_ids) - len(telegram_failures)}/{len(chat_ids)} "
+                              f"recipient(s); failed: {telegram_failures}")
                     else:
                         print(f"\nSent Telegram notification to {len(chat_ids)} recipient(s).")
         except Exception as exc:
