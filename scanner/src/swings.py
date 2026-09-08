@@ -534,8 +534,28 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     if pd.isna(ema20) or pd.isna(high_20_prev) or pd.isna(pullback):
         return "WATCH", "no_data", "Indicators not ready"
 
+    # pullback_bounce is the ONLY BUY trigger. breakout and reclaim still get
+    # detected and reported (so the setup history and lifecycle transitions
+    # stay intact) but as WATCH, not actionable.
+    #
+    # Deliberate choice, and NOT a win-rate claim -- across three independent
+    # 400-500 stock samples the three setups were statistically
+    # indistinguishable (breakout 22.2%/27.3%, pullback_bounce 25.8%/21.7%,
+    # reclaim 13.3%/26.7% -- the ranking flipped between samples, so the gaps
+    # are sampling noise at n=15-46 per setup). The reasons are structural:
+    #   - breakout fires a median +6.35% AFTER the move (measured over 979
+    #     real trigger days; 87% of them closed >3% up). The 2.3x volume
+    #     requirement guarantees that lateness -- a stock can't trade 2.3x
+    #     normal volume without having already moved. Chasing a 6% pop for a
+    #     3% target is a bad entry price even when the win rate is the same.
+    #   - pullback_bounce buys a dip inside an uptrend instead: entering
+    #     weakness that's expected to resume, not strength that already ran.
+    #   - restricting to one trigger cuts candidate count ~60%, which cuts
+    #     per-trade STT/DP drag (real money at this frequency -- charges
+    #     roughly matched the entire realized loss for Jul-Sep) and pushes
+    #     toward fewer, larger positions.
     if close > high_20_prev and volume_spike >= config.breakout_volume_mult and bullish:
-        return "BUY", "breakout", f"Broke 20D high on {volume_spike:.1f}x volume"
+        return "WATCH", "breakout", f"Broke 20D high on {volume_spike:.1f}x volume - already moved, not chased"
 
     if (config.pullback_min <= pullback <= config.pullback_max
             and close > ema20 and bullish and closed_above_prev_high):
@@ -544,7 +564,7 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     prev_close = float(prev["Close"])
     prev_ema20 = float(prev["EMA20"])
     if close > ema20 and prev_close <= prev_ema20 and bullish:
-        return "BUY", "reclaim", "Reclaimed EMA20 with bullish close"
+        return "WATCH", "reclaim", "Reclaimed EMA20 with bullish close - watch only"
 
     if pullback > 12:
         return "WATCH", "deep_pullback", f"{pullback:.1f}% pullback - wait for base"
@@ -660,10 +680,13 @@ def calculate_score(
     today_bonus = min(today_range / 6 * 8, 8)
     volume_bonus = min(volume_spike / 3 * 5, 5)
 
-    if action == "BUY":
-        setup_bonus = {"breakout": 7, "pullback_bounce": 6, "reclaim": 5}.get(setup_type, 3)
-    else:
-        setup_bonus = 0
+    # Keyed on setup_type, NOT on action. breakout/reclaim are WATCH now (see
+    # get_entry_trigger) but they're still real triggers that fired, and
+    # scoring them 0 here would drop several below min_score and delete them
+    # from the report entirely -- losing visibility on breakouts rather than
+    # just not buying them. Passive states (coiling, extended, ...) still get
+    # 0, exactly as before.
+    setup_bonus = {"breakout": 7, "pullback_bounce": 6, "reclaim": 5}.get(setup_type, 0)
 
     support_penalty = min(max(distance_from_support - config.support_distance, 0) * 0.3, 5)
 
@@ -1409,7 +1432,6 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         except Exception as exc:
             print(f"\nTelegram notification skipped/failed: {exc}")
             print("Use --no-telegram to suppress this.")
-
     if not no_bq:
         try:
             resolved_project_id = _resolve_project_id(project_id)
@@ -1431,7 +1453,6 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     if request is not None:
         return (f"Scanner completed: {len(candidates)} candidates processed.", 200)
     return None
-
 
 if __name__ == "__main__":
     main()
