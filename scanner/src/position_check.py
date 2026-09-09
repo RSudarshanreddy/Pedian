@@ -23,6 +23,7 @@ import datetime as dt
 import re
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 from google.cloud import bigquery
 
@@ -45,6 +46,17 @@ _SERIES_SUFFIX_RE = re.compile(r"-[A-Z]{1,3}$")
 
 def _strip_series_suffix(raw_symbol: str) -> str:
     return _SERIES_SUFFIX_RE.sub("", raw_symbol.upper())
+
+
+def _bse_fallback(ticker: str) -> Optional[str]:
+    """
+    BSE equivalent of an NSE ticker, or None if not applicable. Some symbols
+    (AGOL) simply aren't on NSE via Yahoo but resolve fine on BSE -- confirmed
+    by direct test (AGOL.NS empty, AGOL.BO ok). Same fallback
+    check_position_momentum does inline; factored out so regime checking
+    handles those holdings too instead of reporting them as NO_DATA.
+    """
+    return ticker[:-3] + ".BO" if ticker.upper().endswith(".NS") else None
 
 
 def _find_column(columns: list[str], candidates: list[str]) -> Optional[str]:
@@ -696,6 +708,229 @@ def book_buy(
     return result
 
 
+# =========================================================
+# REGIME CLASSIFICATION
+# =========================================================
+# The floor+extension rule in check_position_momentum is a MOMENTUM rule --
+# it assumes a stock that moves up keeps moving up, and exits when it stops.
+# Applied to a stock that is actually oscillating in a band, or one in
+# structural decline, it answers the wrong question. AGOL and IRCTC sat for
+# weeks under momentum logic that could only ever say "not yet at floor"
+# while they fell 44-63%.
+#
+# This classifies which of three regimes a stock is actually in, so the
+# right question gets asked of each:
+#   OSCILLATING  -> where in its band is it? (buy low / sell high)
+#   TRENDING_UP  -> the momentum rule applies; let it run, respect the stop
+#   BREAKOUT_UP  -> left its old band upward; band levels are stale, don't
+#                   read "overbought" into a position above the band
+#   TRENDING_DOWN / BREAKDOWN -> neither rule applies; this is an exit
+#                   question, not an entry one
+REGIME_LOOKBACK_DAYS = 60
+REGIME_DRIFT_THRESHOLD_PCT = 15.0   # |drift| across the window below this = flat enough to call a range
+# 10/90 rather than 15/85: the band is used to judge "has price left its
+# range", and a 15/85 band leaves ~30% of days outside it BY CONSTRUCTION --
+# which made a genuinely range-bound stock sitting at its low (exactly the
+# buy signal) come out as BREAKDOWN. Caught by unit test, not in review.
+REGIME_BAND_LOW_PCTILE = 10
+REGIME_BAND_HIGH_PCTILE = 90
+# ...and even then, only treat price as having LEFT the band when it's
+# decisively outside, not a fraction past the edge.
+REGIME_BREAKOUT_POS = 125.0
+REGIME_BREAKDOWN_POS = -25.0
+
+
+def classify_regime(closes: np.ndarray, lookback: int = REGIME_LOOKBACK_DAYS) -> Optional[dict]:
+    """
+    Characterises the most recent `lookback` sessions as a band plus a drift,
+    and labels the regime.
+
+    Band = 15th/85th percentile of closes (not min/max -- a single spike
+    shouldn't define the range). `pos_in_band` is where price sits in it as
+    a percentage: 0 = at the band low, 100 = at the band high, and values
+    outside 0-100 mean price has left the band entirely, which is exactly
+    the case where a naive mean-reversion reading is dangerous.
+
+    Returns None if there isn't enough history.
+    """
+    if closes is None or len(closes) < lookback:
+        return None
+    w = closes[-lookback:]
+    if not np.all(np.isfinite(w)):
+        w = w[np.isfinite(w)]
+        if len(w) < lookback // 2:
+            return None
+
+    lo = float(np.percentile(w, REGIME_BAND_LOW_PCTILE))
+    hi = float(np.percentile(w, REGIME_BAND_HIGH_PCTILE))
+    band = hi - lo
+    if lo <= 0:
+        return None
+    degenerate_band = False
+    if band <= 0:
+        # Degenerate percentile band: price sat at one level for most of the
+        # window (a long flat base, then a late move). Percentiles collapse to
+        # a point and every downstream ratio divides by zero. Fall back to the
+        # window's true min/max so the ticker still gets reported.
+        #
+        # But note what that fallback costs: with the band set to min..max,
+        # pos is bounded to 0-100 BY CONSTRUCTION, so the breakout/breakdown
+        # thresholds can never fire on this path. Position is therefore
+        # meaningless here and the regime is decided on drift alone.
+        degenerate_band = True
+        lo, hi = float(np.min(w)), float(np.max(w))
+        band = hi - lo
+        if band <= 0:
+            return None   # genuinely no movement at all (suspended/illiquid)
+
+    last = float(w[-1])
+    pos = (last - lo) / band * 100
+    width_pct = band / lo * 100
+    # drift = linear trend across the window, expressed as % of mean price,
+    # so it's comparable across stocks at different price levels.
+    x = np.arange(len(w))
+    drift = float(np.polyfit(x, w, 1)[0] * len(w) / w.mean() * 100)
+    inside_pct = float(((w >= lo) & (w <= hi)).mean() * 100)
+
+    # Order matters, and both orderings have a failure mode -- this is the
+    # third attempt and each earlier one was caught by a concrete case:
+    #   position-first  -> a range-bound stock sitting at its low (the BUY
+    #                      signal) was labelled BREAKDOWN. Wrong, because a
+    #                      10/90 band leaves ~20% of days outside it normally.
+    #   drift-first     -> ANTELOPUS at 366% of band read "OSCILLATING", and
+    #                      IRCTC at -31% read "oscillating, buy zone" while
+    #                      sitting on a -44% loss. Both wrong and the second
+    #                      is dangerous.
+    # So: DECISIVELY outside the band wins first (the band is stale, no zone
+    # reading is valid), and drift only decides among prices still in range.
+    if degenerate_band:
+        # Position carries no information here (see the fallback above). Nor
+        # does linear drift: a long flat base with a sharp move at the end
+        # dilutes the fit badly (55 flat days then a 60% crash fits to just
+        # -14.9%, which reads as "flat"). The meaningful comparison on this
+        # path is the last price against the base level itself.
+        base = float(np.median(w))
+        move_from_base = (last - base) / base * 100 if base > 0 else 0.0
+        if move_from_base > REGIME_DRIFT_THRESHOLD_PCT:
+            regime, note = "TRENDING_UP", (f"flat base then {move_from_base:+.0f}% move up -- "
+                                            f"no usable band, treat levels as unknown")
+        elif move_from_base < -REGIME_DRIFT_THRESHOLD_PCT:
+            regime, note = "TRENDING_DOWN", (f"flat base then {move_from_base:+.0f}% move down -- "
+                                              f"no usable band, exit question")
+        else:
+            regime, note = "OSCILLATING", "barely moved over the window -- no usable band, no edge either way"
+    elif pos > REGIME_BREAKOUT_POS:
+        regime = "BREAKOUT_UP"
+        note = (f"{pos:.0f}% of band -- left its range upward. Band levels are STALE; "
+                f"do NOT read this as overbought")
+    elif pos < REGIME_BREAKDOWN_POS:
+        regime = "BREAKDOWN"
+        note = (f"{pos:.0f}% of band -- broken below its range. NOT a dip to buy; "
+                f"this is an exit question")
+    elif abs(drift) <= REGIME_DRIFT_THRESHOLD_PCT:
+        regime = "OSCILLATING"
+        if pos >= 75:
+            note = f"oscillating, near the TOP of its band ({pos:.0f}%) -- sell zone"
+        elif pos <= 25:
+            note = f"oscillating, near the BOTTOM of its band ({pos:.0f}%) -- buy zone"
+        else:
+            note = f"oscillating, mid-band ({pos:.0f}%) -- no edge either way"
+    elif drift > 0:
+        regime = "TRENDING_UP"
+        note = "trending up inside its range -- the momentum rule applies, band levels do not"
+    else:
+        regime = "TRENDING_DOWN"
+        note = "trending down inside its range -- exit question, not an entry one"
+
+    return {
+        "Regime": regime, "Band_Low": round(lo, 2), "Band_High": round(hi, 2),
+        "Band_Width_Pct": round(width_pct, 2), "Current_Price": round(last, 2),
+        "Pos_In_Band_Pct": round(pos, 1), "Drift_Pct": round(drift, 1),
+        "Inside_Band_Pct": round(inside_pct, 1), "Note": note,
+    }
+
+
+def run_regime_check(project_id: str, lookback: int = REGIME_LOOKBACK_DAYS) -> pd.DataFrame:
+    """
+    Classifies every active holding's regime and writes a timestamped row per
+    ticker to data_options.regime_check (append-only, same pattern as
+    position_momentum_check -- so "what regime was this in when I bought"
+    stays answerable later).
+
+    Deliberately separate from check_position_momentum: that answers "is the
+    momentum rule's exit triggered", this answers "is the momentum rule even
+    the right rule for this stock right now".
+    """
+    client = bigquery.Client(project=project_id)
+    holdings = list(client.query(
+        f"SELECT Ticker, Entry_Price, Quantity FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+    ).result())
+    if not holdings:
+        print("No active holdings in data_options.holdings.")
+        return pd.DataFrame()
+
+    yf = swings.load_yfinance()
+    checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    rows = []
+    for h in holdings:
+        ticker = h["Ticker"]
+        closes = None
+        for candidate_ticker in (ticker, _bse_fallback(ticker)):
+            if candidate_ticker is None:
+                continue
+            try:
+                raw = yf.download(candidate_ticker, period="6mo", interval="1d",
+                                  progress=False, auto_adjust=True, threads=False)
+                data = swings.normalize_single_ticker_columns(raw)
+                if not data.empty:
+                    closes = data["Close"].to_numpy()
+                    break
+            except Exception:
+                continue
+
+        profile = classify_regime(closes, lookback) if closes is not None else None
+        if profile is None:
+            rows.append({"Ticker": ticker, "Regime": "NO_DATA", "Checked_At": checked_at,
+                         "Entry_Price": float(h["Entry_Price"]), "Quantity": float(h["Quantity"]),
+                         "Note": "not enough price history to classify"})
+            continue
+
+        entry = float(h["Entry_Price"])
+        profile.update({
+            "Ticker": ticker, "Checked_At": checked_at, "Entry_Price": entry,
+            "Quantity": float(h["Quantity"]),
+            "PnL_Pct": round((profile["Current_Price"] - entry) / entry * 100, 2),
+        })
+        rows.append(profile)
+
+    df = pd.DataFrame(rows)
+    order = {"OSCILLATING": 0, "BREAKOUT_UP": 1, "TRENDING_UP": 2,
+             "TRENDING_DOWN": 3, "BREAKDOWN": 4, "NO_DATA": 5}
+    df = df.sort_values("Regime", key=lambda s: s.map(order).fillna(9)).reset_index(drop=True)
+
+    print(f"\n{'Ticker':<14}{'Regime':<15}{'band':>17}{'now':>9}{'pos':>7}{'drift':>8}{'PnL%':>8}")
+    for _, r in df.iterrows():
+        if r.get("Regime") == "NO_DATA":
+            print(f"{r['Ticker']:<14}{'NO_DATA':<15}  {r.get('Note','')}")
+            continue
+        print(f"{r['Ticker']:<14}{r['Regime']:<15}{r['Band_Low']:>8.0f}-{r['Band_High']:<8.0f}"
+              f"{r['Current_Price']:>9.0f}{r['Pos_In_Band_Pct']:>6.0f}%{r['Drift_Pct']:>8.1f}{r['PnL_Pct']:>7.1f}%")
+
+    try:
+        client.load_table_from_dataframe(
+            df, f"{project_id}.data_options.regime_check",
+            job_config=bigquery.LoadJobConfig(
+                write_disposition="WRITE_APPEND",
+                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            ),
+        ).result()
+        print(f"\nWrote {len(df)} rows to {project_id}.data_options.regime_check")
+    except Exception as exc:
+        print(f"\nregime_check write skipped/failed: {exc}")
+
+    return df
+
+
 def run_position_check(project_id: str, config: Optional[swings.ScannerConfig] = None) -> pd.DataFrame:
     """
     Reads active rows from data_options.holdings, runs check_position_momentum
@@ -820,6 +1055,16 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         no_telegram = args.no_telegram
 
     results_df = run_position_check(project_id)
+
+    # Regime check runs alongside, not instead of, the momentum check: the
+    # momentum rule answers "is the exit triggered", the regime answers
+    # "is the momentum rule even the right rule for this stock". A failure
+    # here must not take down the momentum check or the Telegram summary
+    # that already succeeded.
+    try:
+        run_regime_check(project_id)
+    except Exception as exc:
+        print(f"\nRegime check skipped/failed: {exc}")
 
     if not no_telegram:
         import os
