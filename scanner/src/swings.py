@@ -60,7 +60,7 @@ class ScannerConfig:
 
     # Universe (hard filters)
     min_price: float =350.0
-    max_price: float = 1100.0
+    max_price: float = 1400.0
     min_avg_traded_value_cr: float = 10.0
 
     # Volatility identity (what makes a stock "volatile")
@@ -281,7 +281,6 @@ def normalize_single_ticker_columns(data: pd.DataFrame) -> pd.DataFrame:
     # applied), which silently corrupted avg_volume20 / traded value / volume spike.
     return data.dropna(subset=[c for c in REQUIRED_COLUMNS if c in data.columns])
 
-
 def download_batch(yf: Any, tickers: list[str], config: ScannerConfig) -> pd.DataFrame:
     return yf.download(
         tickers=tickers,
@@ -293,7 +292,6 @@ def download_batch(yf: Any, tickers: list[str], config: ScannerConfig) -> pd.Dat
         threads=True,
     )
 
-
 def get_ticker_frame(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if not isinstance(batch_data.columns, pd.MultiIndex):
         return normalize_single_ticker_columns(batch_data)
@@ -301,11 +299,8 @@ def get_ticker_frame(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
     return normalize_single_ticker_columns(batch_data[ticker].dropna(how="all"))
 
-
 def has_enough_data(data: pd.DataFrame, config: ScannerConfig) -> bool:
     return not data.empty and len(data) >= config.min_days and REQUIRED_COLUMNS.issubset(data.columns)
-
-
 # =========================================================
 # INDICATORS
 # =========================================================
@@ -576,28 +571,29 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     if pd.isna(ema20) or pd.isna(high_20_prev) or pd.isna(pullback):
         return "WATCH", "no_data", "Indicators not ready"
 
-    # pullback_bounce is the ONLY BUY trigger. breakout and reclaim still get
-    # detected and reported (so the setup history and lifecycle transitions
-    # stay intact) but as WATCH, not actionable.
+    # breakout and pullback_bounce both BUY. reclaim stays WATCH-only.
     #
-    # Deliberate choice, and NOT a win-rate claim -- across three independent
-    # 400-500 stock samples the three setups were statistically
+    # No win-rate claim is being made by that split -- across three
+    # independent 400-500 stock samples the three setups were statistically
     # indistinguishable (breakout 22.2%/27.3%, pullback_bounce 25.8%/21.7%,
-    # reclaim 13.3%/26.7% -- the ranking flipped between samples, so the gaps
-    # are sampling noise at n=15-46 per setup). The reasons are structural:
-    #   - breakout fires a median +6.35% AFTER the move (measured over 979
-    #     real trigger days; 87% of them closed >3% up). The 2.3x volume
-    #     requirement guarantees that lateness -- a stock can't trade 2.3x
-    #     normal volume without having already moved. Chasing a 6% pop for a
-    #     3% target is a bad entry price even when the win rate is the same.
-    #   - pullback_bounce buys a dip inside an uptrend instead: entering
-    #     weakness that's expected to resume, not strength that already ran.
-    #   - restricting to one trigger cuts candidate count ~60%, which cuts
-    #     per-trade STT/DP drag (real money at this frequency -- charges
-    #     roughly matched the entire realized loss for Jul-Sep) and pushes
-    #     toward fewer, larger positions.
+    # reclaim 13.3%/26.7%). The ranking FLIPPED between samples, so at
+    # n=15-46 per setup those gaps are sampling noise, and no ordering of
+    # the three survives a second sample.
+    #
+    # What IS measured, and worth keeping in view when acting on a breakout:
+    # it fires a median +6.35% AFTER the move (979 real trigger days; 87%
+    # of them closed >3% up, 62% >5%). The 2.3x volume requirement
+    # guarantees that lateness -- a stock cannot trade 2.3x normal volume
+    # without having already moved. That is a worse entry PRICE for a 3%
+    # target, though note the backtest already enters at the next day's open
+    # and so already prices it in; it is not an extra unmeasured penalty.
+    #
+    # Cost note: two BUY triggers instead of one roughly restores the
+    # candidate count (~60% more than pullback-only), and per-trade STT/DP
+    # drag is real at this frequency -- charges roughly matched the entire
+    # realized P&L for Jul-Sep. More signals is not free.
     if close > high_20_prev and volume_spike >= config.breakout_volume_mult and bullish:
-        return "WATCH", "breakout", f"Broke 20D high on {volume_spike:.1f}x volume - already moved, not chased"
+        return "BUY", "breakout", f"Broke 20D high on {volume_spike:.1f}x volume"
 
     if (config.pullback_min <= pullback <= config.pullback_max
             and close > ema20 and bullish and closed_above_prev_high):
@@ -1192,11 +1188,11 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     # 5-second phone read, not the full record.
     lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
-        # No per-setup tagging: pullback_bounce is the only setup that reaches
-        # BUY now (see get_entry_trigger), so every line here is the same type.
-        # The old "[act fast]" breakout tag became dead code the moment
-        # breakout went WATCH-only -- fresh_buys filters Action == "BUY", so
-        # it could never render.
+        # breakout is a BUY again (see get_entry_trigger), so the setup name
+        # is doing real work here -- a breakout line means the move has
+        # already happened (median +6.35% on the signal day), a
+        # pullback_bounce means you're buying a dip. Same win rate as far as
+        # anything measured, different entry price.
         lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- win rate {r['Persistence_Rate']:.0f}%")
     lines.append("")
     lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
