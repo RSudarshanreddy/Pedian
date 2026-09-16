@@ -170,6 +170,112 @@ def import_holdings_csv(csv_path: str, project_id: str) -> None:
     print(f"Imported {len(new_rows)} active holdings from {csv_path}")
 
 
+def import_holdings_from_pnl_csv(csv_path: str, project_id: str) -> None:
+    """
+    Syncs data_options.holdings from a Zerodha Console **P&L statement**
+    export, which is a different shape from the holdings export that
+    import_holdings_csv reads. Kept as a separate function rather than
+    widening that one, because reading this file with the holdings-export
+    column rules gets it silently and badly wrong:
+
+      - "Quantity" in a P&L statement is the quantity TRADED in the period
+        (AEGISLOG 191), not the quantity HELD (40). import_holdings_csv
+        would take the traded figure as the position size.
+      - There is no average-cost column at all. Cost basis has to be
+        derived as Open Value / Open Quantity.
+
+    Rights entitlements are kept as DISTINCT tickers. "AGOL-RE" is a
+    separate instrument from "AGOL" -- feeding it through
+    _strip_series_suffix would turn it into AGOL and collide with (here,
+    resurrect) an equity position that was fully sold. Same for
+    "IBUL-RE-BE", which that regex would mangle to "IBUL-RE". Note these
+    won't resolve on Yahoo, so the regime/momentum checks will report
+    NO_DATA for them -- correct behaviour, they have no meaningful price
+    history to trace.
+
+    Rows with Open Quantity 0 are positions closed during the period: any
+    such ticker currently Active=TRUE is flipped to Active=FALSE with its
+    Entry_Price/Date/Notes preserved, same as import_holdings_csv does.
+    """
+    df = pd.read_csv(csv_path)
+    required = {"Symbol", "Open Quantity", "Open Value"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{csv_path} does not look like a Zerodha P&L statement export -- "
+            f"missing {sorted(missing)}. Found: {list(df.columns)}"
+        )
+
+    client = bigquery.Client(project=project_id)
+    existing = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    today = dt.date.today().isoformat()
+    new_rows, csv_tickers, skipped = [], set(), []
+    for _, row in df.iterrows():
+        raw = str(row["Symbol"]).strip()
+        if not raw or raw.lower() == "nan":
+            continue
+        qty = float(str(row["Open Quantity"]).replace(",", "") or 0)
+        if qty <= 0:
+            continue                      # closed in the period -- handled below
+
+        # Rights entitlements stay whole; only settlement/series markers strip.
+        symbol = raw.upper()
+        ticker = (swings.to_yahoo_nse_ticker(symbol) if "-RE" in symbol
+                  else swings.to_yahoo_nse_ticker(_strip_series_suffix(symbol)))
+
+        open_value = float(str(row["Open Value"]).replace(",", "") or 0)
+        if open_value <= 0:
+            # IBUL-RE-BE arrives with Open Value 0 -- a rights entitlement
+            # credited at no cost. Dividing would raise; a 0 cost basis would
+            # make every P&L percentage meaningless. Skip and report it
+            # rather than write a number that looks real.
+            skipped.append(f"{ticker} (qty {qty:.0f}, no cost basis in export)")
+            continue
+        avg_cost = open_value / qty
+
+        csv_tickers.add(ticker)
+        entry_date = str(existing[ticker]["Entry_Date"]) if ticker in existing else today
+        if ticker not in existing:
+            print(f"NEW position: {ticker} -- {qty:.0f} @ {avg_cost:.2f}, Entry_Date set to "
+                  f"{today}. Correct it if not bought today (the momentum trace needs the real date).")
+
+        new_rows.append({"Ticker": ticker, "Entry_Price": round(avg_cost, 4),
+                         "Entry_Date": entry_date, "Quantity": qty,
+                         "Active": True, "Notes": None})
+
+    closed = set(existing) - csv_tickers
+    closed_rows = [{
+        "Ticker": t, "Entry_Price": existing[t]["Entry_Price"],
+        "Entry_Date": str(existing[t]["Entry_Date"]), "Quantity": existing[t]["Quantity"],
+        "Active": False, "Notes": existing[t]["Notes"],
+    } for t in closed]
+
+    touched = csv_tickers | closed
+    if touched:
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@t)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("t", "STRING", list(touched))]),
+        ).result()
+        client.load_table_from_dataframe(
+            pd.DataFrame(new_rows + closed_rows), f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    if closed:
+        print(f"Marked closed (Open Quantity 0): {', '.join(sorted(closed))}")
+    if skipped:
+        print("Skipped (no usable cost basis): " + "; ".join(skipped))
+    print(f"Synced {len(new_rows)} open positions from {csv_path}")
+
+
 def load_account_ledger(csv_path: str, project_id: str) -> None:
     """
     Loads a Zerodha Console fund ledger export (deposits, withdrawals,
