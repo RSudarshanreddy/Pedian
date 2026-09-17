@@ -165,22 +165,24 @@ class ScannerConfig:
 
     # Quality gate -- rejects candidates outright rather than just ranking them lower.
     #
-    # NOT COMPARABLE TO THE PRE-REBUDGET VALUE OF 40. calculate_score no longer
-    # awards the 38 points that used to come from volatility measures already
-    # enforced as hard gates below, so every score dropped by ~27 on average
-    # (live 86-candidate run: mean 44.9 -> 29.3). Leaving this at 40 would have
-    # rejected 81 of those 86, including AEGISLOG.
+    # NOT COMPARABLE TO ANY EARLIER VALUE. calculate_score has been rescaled
+    # twice: it dropped the 38 points that duplicated hard gates, then anchored
+    # every component between its minimum admissible value and an excellent one
+    # (see the ANCHORS block). The scale now genuinely runs 0-100 rather than
+    # bunching: across 529 post-rework candidates it spans 2.4-76.0 with sd
+    # 13.4, against 21.2-63.6 and sd 5.7 before.
     #
-    # 20 is set to be deliberately close to non-binding on the current
-    # population (lowest live score was 19.4), because min_persistence_rate is
-    # what actually does the expectancy filtering -- this gate only trims the
-    # bottom tail. That makes the rebudget a change to the ORDER of the list
-    # rather than to its membership, which is the one thing that needed fixing.
+    # 5 keeps this near non-binding (99% of that population clears it), on
+    # purpose: min_persistence_rate does the expectancy filtering, and each
+    # rescale should change the ORDER and SPREAD of the list, not silently
+    # change which stocks appear. Leaving it at 20 would now cut 25%.
     #
-    # To tighten, raise it against a real run and read the count: on the live
-    # sample 25 kept 77%, 30 kept 38%, 35 kept 20%. Do not raise it past ~40
-    # without re-reading the distribution -- the new scale tops out near 42.
-    min_score: float = 20.0
+    # This is the lever for "fewer but better", and it is finally meaningful
+    # because the scale is spread out. Measured survivor counts on that
+    # population: 10 keeps 95%, 15 keeps 87%, 20 keeps 75%, 25 keeps 50%,
+    # 30 keeps 40%. Nothing scored above 76 in three weeks, so a threshold
+    # above ~55 will return almost nothing.
+    min_score: float = 5.0
 
     # Processing
     chunk_size: int = 100
@@ -791,6 +793,50 @@ VOLUME_PTS = 8
 SETUP_PTS = 12
 SUPPORT_PENALTY_PTS = 10
 
+# ANCHORS -- what counts as 0 and what counts as full marks for each component.
+#
+# The rebudget above fixed WHICH components are scored. This fixes the scale
+# they are scored on, which was the same mistake one level down: each component
+# was a fraction of a theoretical maximum that cannot occur, so the score could
+# never approach 100 and never approached 0 either.
+#
+# Persistence was the worst case. It is worth PERSISTENCE_PTS at a 100% win
+# rate, but min_persistence_rate already guarantees >=25% and the real ceiling
+# across 529 post-rework candidates is 46.1%. So it could only ever return
+# 12.5-23 of its 50 points -- and the first 12.5 were handed free to every
+# candidate that cleared the gate, exactly the "scoring a filter you already
+# applied" error that removed the volatility block.
+#
+# Volume had the same flaw in miniature: scoring from 0 meant a stock trading
+# its NORMAL volume collected a third of the budget for being unremarkable.
+# 1.0x is average by definition, so that is where the scale starts.
+#
+# The persistence floor is read from config.min_persistence_rate rather than
+# hardcoded, so raising the gate re-anchors the scale automatically instead of
+# silently re-introducing the dead zone.
+#
+# Measured effect on those 529 candidates: spread 21.2-63.6 -> 2.4-76.0, sd
+# 5.65 -> 13.38, and every one of the six components reaches full budget at
+# least once instead of none of them doing so.
+#
+# 100 is now attainable but demanding: it needs >=45% win rate AND >=target_pct
+# expected move AND stability under the threshold AND a 3x volume spike AND a
+# breakout, together. Nothing scored above 76 in three weeks, which is the
+# intended behaviour of an absolute scale -- a high score should be rare rather
+# than rescaled into existence each day. The median sits near 25 because most
+# candidates genuinely are marginal: 67% are passive setups at below-average
+# volume.
+EXCELLENT_PERSISTENCE_RATE = 45.0   # observed practical ceiling is 46.1%
+NORMAL_VOLUME_RATIO = 1.0           # 1x IS the average -- no credit for it
+EXCELLENT_VOLUME_RATIO = 3.0
+
+
+def _span(value: float, low: float, high: float) -> float:
+    """Fraction of the way from `low` to `high`, clamped to 0-1."""
+    if high <= low:
+        return 0.0
+    return min(max((value - low) / (high - low), 0.0), 1.0)
+
 # Relative weight of each trigger within SETUP_PTS. The ordering carries no
 # win-rate claim -- across three independent 400-500 stock samples the three
 # setups were statistically indistinguishable and their ranking FLIPPED
@@ -808,16 +854,19 @@ def calculate_score(
     distance_from_support: float,
     config: ScannerConfig,
 ) -> float:
-    persistence_score = min(persistence_rate / 100 * PERSISTENCE_PTS, PERSISTENCE_PTS)
-    # expected_move is the barrier backtest's mean realized P&L per trade (see
-    # run_barrier_backtest) -- with the floor+extension rule this can exceed
-    # target_pct (extension captured more) as well as be negative (gave it
-    # back to a stop after reaching the floor). Scored relative to target_pct
-    # so it stays meaningful if target_pct is retuned; the cap handles
-    # anything that runs well past the floor.
-    expected_move_score = min(
-        max(expected_move, 0) / config.target_pct * EXPECTED_MOVE_PTS, EXPECTED_MOVE_PTS
-    )
+    # Scored from the GATE, not from zero -- clearing min_persistence_rate is
+    # the price of admission, not an achievement. See the ANCHORS block.
+    persistence_score = _span(
+        persistence_rate, config.min_persistence_rate, EXCELLENT_PERSISTENCE_RATE
+    ) * PERSISTENCE_PTS
+    # expected_move is the barrier backtest's mean realized P&L per trade, NET
+    # of round_trip_cost_pct (see run_barrier_backtest). Under the
+    # floor+extension rule it can exceed target_pct (extension captured more)
+    # or go negative (given back to a stop, or eaten by costs). Scored from 0
+    # rather than from the gate because there is no gate on it -- a negative
+    # expectancy candidate can still reach the report, and should score zero
+    # here rather than going unremarked.
+    expected_move_score = _span(expected_move, 0.0, config.target_pct) * EXPECTED_MOVE_PTS
 
     if persistence_stability < config.persistence_stability_threshold:
         stability_bonus = STABILITY_PTS
@@ -826,7 +875,9 @@ def calculate_score(
     else:
         stability_bonus = 0.0
 
-    volume_bonus = min(volume_spike / 3 * VOLUME_PTS, VOLUME_PTS)
+    # From 1.0x, not from 0 -- trading your own average volume is the null
+    # result, and used to collect a third of this budget for it.
+    volume_bonus = _span(volume_spike, NORMAL_VOLUME_RATIO, EXCELLENT_VOLUME_RATIO) * VOLUME_PTS
 
     # Keyed on setup_type, NOT on action. reclaim is WATCH (see
     # get_entry_trigger) but it's still a real trigger that fired, and scoring
@@ -1625,14 +1676,18 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         print(f"\n{message}")
         # Hints must be LOWER than the current defaults to actually relax
         # anything -- the old block suggested --min-persistence 55 and
-        # --min-score 55, both ABOVE today's defaults (25 / 20), which would
+        # --min-score 55, both ABOVE the defaults of that time, which would
         # have tightened the scan while claiming to loosen it. --min-rr is
         # not listed: raising it tightens the stop and rr_floor_stop already
         # guarantees the ratio, so it can't surface more candidates.
+        #
+        # --min-score is also not listed: at 5.0 it is already near-zero on a
+        # 0-100 scale (see the field comment), so there is no lower value left
+        # that means anything as a relaxation hint. min_persistence_rate is
+        # what actually gates candidates now.
         print(f"  --min-persistence 15         (lower win-rate bar, now {config.min_persistence_rate:.0f})")
         print(f"  --min-avg-volatility 3.0     (lower volatility bar, now {config.min_avg_volatility})")
         print(f"  --min-persistence-sample 30  (allow smaller sample, now {config.min_persistence_sample})")
-        print(f"  --min-score 10               (relax the quality gate, now {config.min_score:.0f})")
         print(f"  --max-price 2000             (widen the universe, now {config.max_price:.0f})")
         return (message, 200) if request is not None else None
 
