@@ -136,22 +136,33 @@ class ScannerConfig:
                                         # on top of this, only once the floor is hit
 
     # Quality gate -- rejects candidates outright rather than just ranking them lower.
-    # This is the main lever for "fewer but better": raise it to cut junk,
-    # lower it if legitimate setups are getting excluded.
-    # NOTE: persistence_score (max 30) and expected_move_score (max 10) now
-    # come from the barrier backtest's honest win rate / P&L-per-trade (see
-    # calculate_score), which structurally score lower than the old inflated
-    # proxy metrics did (~95% "persistence" / 5-7% "expected move" vs. real
-    # win rates of 40-60% and per-trade P&L of 0-1.5%). 65 rejected every
-    # single candidate tested, including known-profitable ones -- 40 is where
-    # AEGISLOG/ANTELOPUS actually score. min_persistence_rate is what does
-    # the expectancy filtering now; this gate mainly separates BUY-timed,
-    # low-noise setups from the rest. Retune after a real backtest run.
-    min_score: float = 40.0
+    #
+    # NOT COMPARABLE TO THE PRE-REBUDGET VALUE OF 40. calculate_score no longer
+    # awards the 38 points that used to come from volatility measures already
+    # enforced as hard gates below, so every score dropped by ~27 on average
+    # (live 86-candidate run: mean 44.9 -> 29.3). Leaving this at 40 would have
+    # rejected 81 of those 86, including AEGISLOG.
+    #
+    # 20 is set to be deliberately close to non-binding on the current
+    # population (lowest live score was 19.4), because min_persistence_rate is
+    # what actually does the expectancy filtering -- this gate only trims the
+    # bottom tail. That makes the rebudget a change to the ORDER of the list
+    # rather than to its membership, which is the one thing that needed fixing.
+    #
+    # To tighten, raise it against a real run and read the count: on the live
+    # sample 25 kept 77%, 30 kept 38%, 35 kept 20%. Do not raise it past ~40
+    # without re-reading the distribution -- the new scale tops out near 42.
+    min_score: float = 20.0
 
     # Processing
     chunk_size: int = 100
     max_batch_retries: int = 2
+    # Fraction of downloaded tickers that may raise INSIDE scan_ticker_data
+    # before scan_tickers treats it as a code fault and raises instead of
+    # returning an empty result. Legitimate thin-history tickers return None
+    # rather than raising, so a healthy run sits near zero here. 0.25 is well
+    # clear of that while still catching the total-failure case.
+    max_ticker_error_rate: float = 0.25
     top_n: int = 200                   # high ceiling -- min_score does the real filtering
     verbose: bool = False
 
@@ -681,57 +692,97 @@ def calculate_risk_reward(data: pd.DataFrame, config: ScannerConfig) -> Optional
 # =========================================================
 # SCORING
 # =========================================================
+# Score point budget. The positive weights sum to 100 so the number reads as
+# a percentage-like figure; SUPPORT_PENALTY_PTS is subtracted on top.
+#
+# WHY THESE AND NOT THE OLD ONES: the previous budget spent 38 of its 100
+# points on avg_volatility (15), median_volatility (10), volatility_ratio (5)
+# and today_range (8) -- every one of which is ALREADY a hard gate in
+# build_candidate (min_avg_volatility, min_median_volatility,
+# min_volatility_ratio). Scoring a filter you have already applied cannot
+# rank the survivors, because they all passed it. Measured on a live
+# 84-candidate run: those four averaged 27.2 points, 60% of a typical score
+# of 45, while spanning only 6.6-11.7 of 15, 5.2-9.1 of 10, 2.3-4.6 of 5 and
+# 3.3-8.0 of 8. They set the score's LEVEL and barely touched its ORDER, and
+# that is the whole reason every score landed between 40 and 60 (mean 44.97,
+# sd 4.01, full range 40.1-55.4 on a 100-point scale).
+#
+# Dropping them and re-budgeting widened the spread to 22.2 points with sd
+# 5.49 on the same candidates -- 37% more discrimination -- and reordered the
+# list materially (rank correlation +0.47 against the old score, 3/10 overlap
+# in the top ten).
+#
+# Persistence takes half the budget because it IS the barrier backtest's
+# measured win rate for that stock, the most direct expectancy estimate
+# available here. Stability is deliberately small: it returns only 0, half or
+# full (a 3-step flag, not a measurement), yet under the old budget it drove
+# 37.8% of all ranking variance -- more than persistence, expected_move and
+# volume combined.
+#
+# NOT A PREDICTIVE CLAIM. Score correlated -0.153 with realized outcome
+# before this change, i.e. mildly ANTI-predictive, and rebudgeting the
+# components does not create signal that was never measured. What it fixes is
+# a score that could not discriminate and did not match the sort order. Treat
+# the ranking as "which of these best fits the rule we backtested", not as a
+# forecast.
+PERSISTENCE_PTS = 50
+EXPECTED_MOVE_PTS = 20
+STABILITY_PTS = 10
+VOLUME_PTS = 8
+SETUP_PTS = 12
+SUPPORT_PENALTY_PTS = 10
+
+# Relative weight of each trigger within SETUP_PTS. The ordering carries no
+# win-rate claim -- across three independent 400-500 stock samples the three
+# setups were statistically indistinguishable and their ranking FLIPPED
+# between samples (see get_entry_trigger). It exists so that a row which
+# actually triggered outranks a passive state, nothing more.
+SETUP_WEIGHTS = {"breakout": 1.0, "pullback_bounce": 6 / 7, "reclaim": 5 / 7}
+
+
 def calculate_score(
-    avg_volatility: float,
-    median_volatility: float,
-    volatility_ratio: float,
     persistence_rate: float,
     persistence_stability: float,
     expected_move: float,
-    today_range: float,
     volume_spike: float,
-    action: str,
     setup_type: str,
     distance_from_support: float,
     config: ScannerConfig,
 ) -> float:
-    persistence_score = min(persistence_rate / 100 * 30, 30)
+    persistence_score = min(persistence_rate / 100 * PERSISTENCE_PTS, PERSISTENCE_PTS)
     # expected_move is the barrier backtest's mean realized P&L per trade (see
     # run_barrier_backtest) -- with the floor+extension rule this can exceed
     # target_pct (extension captured more) as well as be negative (gave it
     # back to a stop after reaching the floor). Scored relative to target_pct
-    # so it stays meaningful if target_pct is retuned; the min(...,10) cap
-    # handles anything that runs well past the floor.
-    expected_move_score = min(max(expected_move, 0) / config.target_pct * 10, 10)
+    # so it stays meaningful if target_pct is retuned; the cap handles
+    # anything that runs well past the floor.
+    expected_move_score = min(
+        max(expected_move, 0) / config.target_pct * EXPECTED_MOVE_PTS, EXPECTED_MOVE_PTS
+    )
 
     if persistence_stability < config.persistence_stability_threshold:
-        stability_bonus = 10
+        stability_bonus = STABILITY_PTS
     elif persistence_stability < config.persistence_stability_threshold * 1.5:
-        stability_bonus = 5
+        stability_bonus = STABILITY_PTS / 2
     else:
-        stability_bonus = 0
+        stability_bonus = 0.0
 
-    avg_vol_score = min(avg_volatility / 8 * 15, 15)
-    median_score = min(median_volatility / 6 * 10, 10)
-    frequency_score = min(volatility_ratio * 5, 5)
+    volume_bonus = min(volume_spike / 3 * VOLUME_PTS, VOLUME_PTS)
 
-    today_bonus = min(today_range / 6 * 8, 8)
-    volume_bonus = min(volume_spike / 3 * 5, 5)
+    # Keyed on setup_type, NOT on action. reclaim is WATCH (see
+    # get_entry_trigger) but it's still a real trigger that fired, and scoring
+    # it 0 here would drop rows below min_score and delete them from the
+    # report entirely -- losing visibility rather than just not buying.
+    # Passive states (coiling, extended, below_trend, ...) still get 0.
+    setup_bonus = SETUP_WEIGHTS.get(setup_type, 0.0) * SETUP_PTS
 
-    # Keyed on setup_type, NOT on action. breakout/reclaim are WATCH now (see
-    # get_entry_trigger) but they're still real triggers that fired, and
-    # scoring them 0 here would drop several below min_score and delete them
-    # from the report entirely -- losing visibility on breakouts rather than
-    # just not buying them. Passive states (coiling, extended, ...) still get
-    # 0, exactly as before.
-    setup_bonus = {"breakout": 7, "pullback_bounce": 6, "reclaim": 5}.get(setup_type, 0)
-
-    support_penalty = min(max(distance_from_support - config.support_distance, 0) * 0.3, 5)
+    support_penalty = min(
+        max(distance_from_support - config.support_distance, 0) * 0.6, SUPPORT_PENALTY_PTS
+    )
 
     score = (
         persistence_score + expected_move_score + stability_bonus
-        + avg_vol_score + median_score + frequency_score
-        + today_bonus + volume_bonus + setup_bonus
+        + volume_bonus + setup_bonus
         - support_penalty
     )
     return round(max(min(score, 100), 0), 2)
@@ -806,9 +857,8 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     volume_spike = float(latest["Volume"]) / avg_volume20
 
     score = calculate_score(
-        avg_volatility, median_volatility, volatility_ratio,
-        persistence_rate, persistence_stability, expected_move, today_range, volume_spike,
-        action, setup_type, distance_from_support, config,
+        persistence_rate, persistence_stability, expected_move, volume_spike,
+        setup_type, distance_from_support, config,
     )
 
     if score < config.min_score:
@@ -865,9 +915,17 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     lets a top_n truncation be visible instead of silently hiding real results."""
     yf = load_yfinance()
     results: list[dict[str, Any]] = []
-    failures: list[str] = []
+    batch_failures: list[str] = []
+    # ticker -> exception repr. Kept separate from batch_failures because the
+    # two mean completely different things: a failed batch download is a
+    # network/API problem, while an exception raised INSIDE scan_ticker_data
+    # on data that downloaded fine is almost always a bug in this file.
+    # has_enough_data already returns None (not an exception) for thin or
+    # missing history, so these are not "no data" tickers.
+    ticker_errors: dict[str, str] = {}
     batches = chunks(tickers, config.chunk_size)
     total = len(batches)
+    attempted = 0
 
     for bn, batch in enumerate(batches, start=1):
         batch_data = None
@@ -882,32 +940,67 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
                 batch_data = None
 
         if batch_data is None:
-            failures.extend(batch)
+            batch_failures.extend(batch)
         else:
             for ticker in batch:
+                attempted += 1
                 try:
                     candidate = scan_ticker_data(ticker, get_ticker_frame(batch_data, ticker), config, run_date, run_timestamp)
                     if candidate:
                         results.append(candidate)
                 except Exception as exc:
-                    failures.append(ticker)
+                    ticker_errors[ticker] = f"{type(exc).__name__}: {exc}"
                     if config.verbose:
                         print(f"\nSkipped {ticker}: {exc}")
 
         print(f"\rProgress: {int(bn/total*100)}% ({bn}/{total}) | {len(results)} found", end="", flush=True)
     print()
 
+    # A near-total per-ticker failure rate is not a data condition, it is a
+    # broken build, and it must not be allowed to read as "0 candidates found".
+    # This is exactly how a field rename (support_distance_threshold ->
+    # support_distance) took the scanner down: every one of 2,574 tickers
+    # raised AttributeError inside calculate_score, the broad except below
+    # swallowed all of them, and five consecutive scheduled runs reported zero
+    # results with nothing worse than a warning in the log.
+    if attempted and len(ticker_errors) / attempted > config.max_ticker_error_rate:
+        counts: dict[str, int] = {}
+        for msg in ticker_errors.values():
+            counts[msg.split(":")[0]] = counts.get(msg.split(":")[0], 0) + 1
+        top_kind = max(counts, key=counts.get)
+        sample = next(m for m in ticker_errors.values() if m.startswith(top_kind))
+        raise RuntimeError(
+            f"{len(ticker_errors)}/{attempted} tickers raised inside scan_ticker_data "
+            f"({len(ticker_errors) / attempted:.0%} > max_ticker_error_rate "
+            f"{config.max_ticker_error_rate:.0%}) -- this is a code fault, not missing "
+            f"data. Most common: {top_kind} x{counts[top_kind]}. Example: {sample}"
+        )
+
+    failures = batch_failures + list(ticker_errors)
     if failures:
-        LOGGER.warning("%d/%d tickers failed or returned no data", len(failures), len(tickers))
+        LOGGER.warning(
+            "%d/%d tickers unusable (%d failed batch download, %d raised while scanning)",
+            len(failures), len(tickers), len(batch_failures), len(ticker_errors),
+        )
 
     if not results:
         return pd.DataFrame(), failures, 0
 
     df = pd.DataFrame(results)
+    # Score is the ranker, so it must also be the sort key. It previously sat
+    # FOURTH, behind Persistence_Rate and Persistence_Stability, which meant it
+    # almost never affected the order at all: on a live 84-candidate run only
+    # 6 rows shared an (Action, Persistence_Rate, Persistence_Stability) tuple
+    # for Score to break, the displayed position correlated -0.366 with Score,
+    # and the top 8 shown shared just 3 names with the top 8 by Score. The
+    # report therefore ranked by one number while printing another beside it.
+    # Persistence_Rate is still in the output as a column, and is now 50 of
+    # Score's 100 points, so it keeps most of its influence -- explicitly
+    # rather than accidentally.
     df["_action_rank"] = df["Action"].map({"BUY": 0, "WATCH": 1}).fillna(2)
     df = df.sort_values(
-        ["_action_rank", "Persistence_Rate", "Persistence_Stability", "Score"],
-        ascending=[True, False, True, False],
+        ["_action_rank", "Score", "Persistence_Rate"],
+        ascending=[True, False, False],
     ).drop(columns=["_action_rank"])
 
     total_quality_candidates = len(df)
@@ -1420,14 +1513,14 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         print(f"\n{message}")
         # Hints must be LOWER than the current defaults to actually relax
         # anything -- the old block suggested --min-persistence 55 and
-        # --min-score 55, both ABOVE today's defaults (25 / 40), which would
+        # --min-score 55, both ABOVE today's defaults (25 / 20), which would
         # have tightened the scan while claiming to loosen it. --min-rr is
         # not listed: raising it tightens the stop and rr_floor_stop already
         # guarantees the ratio, so it can't surface more candidates.
         print(f"  --min-persistence 15         (lower win-rate bar, now {config.min_persistence_rate:.0f})")
         print(f"  --min-avg-volatility 3.0     (lower volatility bar, now {config.min_avg_volatility})")
         print(f"  --min-persistence-sample 30  (allow smaller sample, now {config.min_persistence_sample})")
-        print(f"  --min-score 30               (relax the quality gate, now {config.min_score:.0f})")
+        print(f"  --min-score 10               (relax the quality gate, now {config.min_score:.0f})")
         print(f"  --max-price 2000             (widen the universe, now {config.max_price:.0f})")
         return (message, 200) if request is not None else None
 
