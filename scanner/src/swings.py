@@ -59,7 +59,13 @@ class ScannerConfig:
     min_days: int = 220
 
     # Universe (hard filters)
-    min_price: float =350.0
+    # The band is an affordability/position-sizing preference, not a predictor:
+    # realized outcome correlated -0.030 with entry price across the tested
+    # sample, i.e. nothing. Widening it changes how many names you see, not
+    # their quality. Liquidity is policed separately by
+    # min_avg_traded_value_cr, so lowering the floor does not admit thin
+    # stocks -- a 250-rupee name still has to trade 10 Cr/day.
+    min_price: float = 250.0
     max_price: float = 1400.0
     min_avg_traded_value_cr: float = 10.0
 
