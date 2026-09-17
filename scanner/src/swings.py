@@ -141,6 +141,28 @@ class ScannerConfig:
                                         # extension (max_extension_days) is additional time
                                         # on top of this, only once the floor is hit
 
+    # Round-trip transaction cost, deducted from every simulated trial so the
+    # backtest reports NET expectancy instead of gross. Without this the whole
+    # model overstates every result, and at a 3% target the drag is not a
+    # rounding error -- it is ~8% of the entire objective.
+    #
+    # Built up from Zerodha NSE delivery equity, not guessed:
+    #   STT           0.1% buy + 0.1% sell        = 0.2000%
+    #   exchange txn  0.00297% each side          = 0.0059%
+    #   SEBI turnover 0.0001% each side           = 0.0002%
+    #   stamp duty    0.015% on buy only          = 0.0150%
+    #   GST 18% on (txn + SEBI)                   = 0.0011%
+    #   brokerage     nil on delivery             = 0
+    #                                        total  0.2222%
+    # Plus a FLAT DP charge of ~Rs.15.93 per scrip per sell day, which is why
+    # the percentage depends on position size: it is 0.06% on a Rs.25,000
+    # position but 0.16% on Rs.10,000. 0.25% corresponds to roughly Rs.25,000
+    # per trade. Size smaller than that and this figure is too kind.
+    #
+    # Corroborated by the live account: charges over Jul-Sep roughly equalled
+    # the entire realized P&L for that period.
+    round_trip_cost_pct: float = 0.25
+
     # Quality gate -- rejects candidates outright rather than just ranking them lower.
     #
     # NOT COMPARABLE TO THE PRE-REBUDGET VALUE OF 40. calculate_score no longer
@@ -343,6 +365,19 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
     data["pullback_pct"] = ((data["high_20"] - data["Close"]) / data["high_20"]) * 100
 
     data["avg_volume20"] = data["Volume"].rolling(20).mean()
+    # Baseline for the volume SPIKE: the 20 sessions BEFORE today, excluding
+    # today. avg_volume20 above includes today, so using it as the denominator
+    # lets a spike dilute its own baseline and understate itself -- worst
+    # exactly on the days that matter most. For a true V = k * A spike the
+    # included-today ratio computes as 20k/(19+k), so 2.3x reads as 2.16x and
+    # 5x reads as 4.17x. That silently made the breakout gate
+    # (breakout_volume_mult = 2.3) behave as 2.47x, ~7% stricter than written,
+    # and cost real points off VOLUME_PTS in calculate_score.
+    # Same .shift(1).rolling(...) idiom as high_20_prev above.
+    data["avg_volume20_prior"] = data["Volume"].shift(1).rolling(20).mean()
+    # Liquidity deliberately still uses the inclusive average -- it is a
+    # "is this tradeable" measure, not a deviation-from-normal one, and
+    # including today is the more current answer.
     data["avg_traded_value20_cr"] = (
         data["Close"].rolling(20).mean() * data["Volume"].rolling(20).mean()
     ) / 10_000_000
@@ -405,7 +440,8 @@ def _stop_fill(stop: float, day_open: float) -> float:
     return min(stop, day_open) if np.isfinite(day_open) else stop
 
 
-def _simulate_floor_extension_trade(entry, stop, floor, close, low, open_, i, hold, ext_days, n):
+def _simulate_floor_extension_trade(entry, stop, floor, close, low, open_, i, hold, ext_days, n,
+                                     cost_pct=0.0):
     """
     One trial starting the day after day i. Phase 1: walk forward up to `hold`
     days looking for the stop (Low <= stop) or the floor (Close >= floor) --
@@ -420,21 +456,30 @@ def _simulate_floor_extension_trade(entry, stop, floor, close, low, open_, i, ho
 
     Stop exits fill at _stop_fill (gap-aware), not at `stop` itself.
 
-    Returns (exit_pct, reached_floor). Always a float exit_pct -- callers
-    compare it numerically, so None is never returned.
+    `cost_pct` is the round-trip transaction cost, subtracted from EVERY
+    exit path -- stop-outs, timeouts and winners alike, since you pay STT
+    and DP charges on a loss exactly as you do on a gain. The floor and stop
+    comparisons themselves stay on GROSS prices, because that is what a real
+    order sees: a limit at entry*(1+target_pct/100) triggers on the quoted
+    price, not on a cost-adjusted one. The consequence is deliberate and is
+    the entire point -- a trade that exits exactly at a 3% floor returns
+    2.75% net, so it no longer counts as having made 3%.
+
+    Returns (exit_pct, reached_floor) with exit_pct NET of cost. Always a
+    float -- callers compare it numerically, so None is never returned.
     """
     floor_day = None
     for j in range(i + 1, min(i + 1 + hold, n)):
         if low[j] <= stop:
             fill = _stop_fill(stop, open_[j])
-            return (fill - entry) / entry * 100, False
+            return (fill - entry) / entry * 100 - cost_pct, False
         if close[j] >= floor:
             floor_day = j
             break
 
     if floor_day is None:
         last_idx = min(i + hold, n - 1)
-        return (close[last_idx] - entry) / entry * 100, False
+        return (close[last_idx] - entry) / entry * 100 - cost_pct, False
 
     # Phase 2: extension -- hold while still closing higher than the prior close.
     exit_price = close[floor_day]
@@ -442,13 +487,13 @@ def _simulate_floor_extension_trade(entry, stop, floor, close, low, open_, i, ho
     for k in range(floor_day + 1, min(floor_day + 1 + ext_days, n)):
         if low[k] <= stop:
             fill = _stop_fill(stop, open_[k])
-            return (fill - entry) / entry * 100, True
+            return (fill - entry) / entry * 100 - cost_pct, True
         if close[k] <= prev_close:
-            return (close[k] - entry) / entry * 100, True
+            return (close[k] - entry) / entry * 100 - cost_pct, True
         prev_close = close[k]
         exit_price = close[k]
 
-    return (exit_price - entry) / entry * 100, True
+    return (exit_price - entry) / entry * 100 - cost_pct, True
 
 
 def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int, float, float]:
@@ -527,7 +572,10 @@ def run_barrier_backtest(data: pd.DataFrame, config: ScannerConfig) -> tuple[flo
                 continue
 
             exit_pct, _ = _simulate_floor_extension_trade(
-                entry, stop, floor, close, low, open_, i, hold, ext_days, n)
+                entry, stop, floor, close, low, open_, i, hold, ext_days, n,
+                config.round_trip_cost_pct)
+            # exit_pct is already NET of round_trip_cost_pct, so a "win" now
+            # means target_pct actually KEPT, not merely quoted.
             won = exit_pct >= config.target_pct
             if won:
                 hits += 1
@@ -579,8 +627,13 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     ema20 = float(latest["EMA20"])
     pullback = float(latest["pullback_pct"])
     high_20_prev = float(latest["high_20_prev"])
-    avg_volume = float(latest["avg_volume20"])
-    volume_spike = float(latest["Volume"]) / avg_volume if avg_volume > 0 else 0
+    # Prior-window baseline, not the inclusive one -- see avg_volume20_prior
+    # in add_indicators for why the inclusive average understates a spike.
+    avg_volume = float(latest["avg_volume20_prior"])
+    volume_spike = (
+        float(latest["Volume"]) / avg_volume
+        if np.isfinite(avg_volume) and avg_volume > 0 else 0
+    )
 
     bullish = close > float(latest["Open"])
     closed_above_prev_high = close > float(prev["High"])
@@ -809,11 +862,13 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     recent_low = float(latest["recent_low"])
     high_20 = float(latest["high_20"])
     avg_volume20 = float(latest["avg_volume20"])
+    avg_volume20_prior = float(latest["avg_volume20_prior"])
     avg_traded_value20_cr = float(latest["avg_traded_value20_cr"])
 
     if (pd.isna(ma20) or pd.isna(recent_low) or pd.isna(high_20)
             or pd.isna(avg_volume20) or pd.isna(avg_traded_value20_cr)
-            or last_close <= 0 or avg_volume20 <= 0):
+            or pd.isna(avg_volume20_prior)
+            or last_close <= 0 or avg_volume20 <= 0 or avg_volume20_prior <= 0):
         return None
 
     if not (config.min_price < last_close < config.max_price):
@@ -860,7 +915,9 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
 
     distance_from_support = ((last_close - recent_low) / last_close) * 100
     distance_from_ma20 = ((last_close - ma20) / last_close) * 100
-    volume_spike = float(latest["Volume"]) / avg_volume20
+    # Must match get_entry_trigger's denominator, or the Volume_Spike column
+    # and the breakout gate that consumed it would disagree.
+    volume_spike = float(latest["Volume"]) / avg_volume20_prior
 
     score = calculate_score(
         persistence_rate, persistence_stability, expected_move, volume_spike,
@@ -1077,9 +1134,10 @@ def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.Sch
 
 
 def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_id: str) -> int:
-    """Idempotent write: deletes any existing rows sharing (Ticker, Bar_Date)
-    with the incoming data before appending, so re-running the scanner for
-    the same trading day doesn't produce duplicate rows."""
+    """Appends this run's rows, first deleting anything already stored under
+    the same Run_Timestamp so a retried load can't double-write. Each scan is
+    kept as its own observation rather than overwriting earlier runs of the
+    same day -- see the de-duplication comment below for why that changed."""
     if df.empty:
         return 0
 
@@ -1121,7 +1179,49 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
                 lambda value: Decimal(str(value)) if pd.notna(value) else None
             )
 
-    if table_exists:
+    # De-duplication key.
+    #
+    # It used to be (Ticker, Bar_Date), which silently destroyed the intraday
+    # history that Run_Timestamp was added to capture. With four-plus scheduled
+    # runs a day, each run DELETEd the earlier runs' rows for any ticker it also
+    # found, so for a given ticker on a given bar only the LAST run that
+    # surfaced it survived. Confirmed against the live table: 0 (Ticker,
+    # Bar_Date) pairs ever appeared twice, even on days with 6 retained
+    # Run_Timestamps -- those 6 came from two different Bar_Dates (the 09:07
+    # pre-open run stamps the previous session's bar), not from intraday
+    # sequence. The result was that "appeared at 11:00, gone by 15:00" was
+    # unanswerable from BigQuery, which is exactly the question a 1:30pm run
+    # was added to answer.
+    #
+    # Now keyed on Run_Timestamp, and since a whole scan shares one timestamp
+    # the predicate is a single equality rather than a chain of ORs per ticker.
+    # Re-running produces a new timestamp and therefore a new row, which is
+    # correct: that IS a second observation. The DELETE still protects the one
+    # case that matters -- a partially-failed load retried with the SAME
+    # timestamp cleans up after itself instead of double-writing.
+    timestamp_field = field_map.get("Run_Timestamp", "Run_Timestamp")
+    has_timestamp = (
+        "Run_Timestamp" in output.columns
+        and any(f.name == timestamp_field for f in table.schema)
+    )
+    if table_exists and has_timestamp:
+        run_ts = pd.to_datetime(output["Run_Timestamp"]).max().to_pydatetime()
+        client.query(
+            f"DELETE FROM `{table_ref}` WHERE `{timestamp_field}` = @ts",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("ts", "TIMESTAMP", run_ts)
+            ]),
+        ).result()
+    elif table_exists:
+        # Legacy table with no Run_Timestamp column: fall back to the old
+        # (Ticker, date) key. This collapses intraday runs, but it is the only
+        # key such a table can express, and the load below adds the column so
+        # subsequent runs take the branch above.
+        LOGGER.warning(
+            "%s has no %s column; falling back to (%s, %s) de-duplication, which "
+            "keeps only the last run per ticker per bar",
+            table_ref, timestamp_field, ticker_field, dedupe_date_field,
+        )
         pairs = output[[ticker_field, dedupe_date_field]].drop_duplicates()
         conditions = " OR ".join(
             f"(`{ticker_field}` = '{getattr(row, ticker_field).replace(chr(39), chr(39) * 2)}' "
@@ -1373,6 +1473,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-extension-days", default=ScannerConfig.max_extension_days, type=int,
                     help="After the floor is hit, keep holding this many more sessions "
                          "while still closing higher; exit on the first non-higher close")
+    p.add_argument("--round-trip-cost-pct", default=ScannerConfig.round_trip_cost_pct, type=float,
+                    help="Round-trip transaction cost %% charged to every backtest trial. "
+                         "Raise it if you trade smaller than ~Rs.25,000 a position, since the "
+                         "flat DP charge is a bigger share of a smaller trade")
     p.add_argument("--min-rr", default=ScannerConfig.min_rr, type=float)
     p.add_argument("--max-risk-pct", default=ScannerConfig.max_risk_pct, type=float)
     p.add_argument("--max-hold-days", default=ScannerConfig.max_hold_days, type=int)
@@ -1435,6 +1539,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_avg_traded_value_cr=float(body.get("min_traded_value_cr", ScannerConfig.min_avg_traded_value_cr)),
             target_pct=float(body.get("target_pct", ScannerConfig.target_pct)),
             max_extension_days=int(body.get("max_extension_days", ScannerConfig.max_extension_days)),
+            round_trip_cost_pct=float(body.get("round_trip_cost_pct", ScannerConfig.round_trip_cost_pct)),
             min_rr=float(body.get("min_rr", ScannerConfig.min_rr)),
             max_risk_pct=float(body.get("max_risk_pct", ScannerConfig.max_risk_pct)),
             max_hold_days=int(body.get("max_hold_days", ScannerConfig.max_hold_days)),
@@ -1470,6 +1575,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_avg_traded_value_cr=args.min_traded_value_cr,
             target_pct=args.target_pct,
             max_extension_days=args.max_extension_days,
+            round_trip_cost_pct=args.round_trip_cost_pct,
             min_rr=args.min_rr,
             max_risk_pct=args.max_risk_pct,
             max_hold_days=args.max_hold_days,
