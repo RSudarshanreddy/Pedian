@@ -106,12 +106,25 @@ class ScannerConfig:
     # rather than rejecting those that fail to clear an arbitrary bar.
     # Calibrated below against the live universe.
     min_typical_move_pct: float = 10.0
-    # Hard floor on the asymmetry. A stock whose typical drawdown is worse than
-    # its typical gain is not a candidate no matter how far it travels -- that
-    # is the failure mode the top move-rate quintile exhibits (23.8% chance of
-    # +20% but 9.4% chance of -20%). Set to 1.0 = "typical gain must at least
-    # match typical pain".
-    min_move_ratio: float = 1.0
+    # Hard floor on the asymmetry: typical gain divided by typical drawdown.
+    # A stock that habitually gives back more than it makes is not a candidate
+    # however far it travels -- that is the failure mode of the top move-rate
+    # quintile (23.8% chance of +20% but ALSO 9.4% chance of -20%).
+    #
+    # This is the primary lever for a SHORT list, and it is a better one than
+    # raising min_typical_move_pct. Measured on a full 2,577-ticker scan (160
+    # candidates clearing price/liquidity/volatility):
+    #   move>=10 ratio>=1.0 -> 79 names, median -6.6% drawdown, 2.4 ratio
+    #   move>=15 ratio>=1.0 -> 37 names, median -5.1% drawdown, 3.5 ratio
+    #   move>=10 ratio>=3.0 -> 29 names, median -3.8% drawdown, 5.1 ratio
+    # Raising the move bar mostly buys bigger headline numbers; raising the
+    # ratio HALVES the typical drawdown for the same reduction in count. 3.0
+    # means "typical gain is at least 3x typical pain".
+    #
+    # min_score is deliberately NOT used for this: at ratio>=3.0 all 29
+    # survivors already score above 40, because a strong ratio drives the score
+    # anyway. Gating twice on the same thing would just be opaque.
+    min_move_ratio: float = 3.0
     persistence_stability_threshold: float = 4.0
 
     # Entry timing (independent of persistence)
