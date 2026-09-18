@@ -41,6 +41,22 @@ CSV_AVG_COST_COLUMNS = ["avg. cost", "avg cost", "average price", "avg_cost"]
 # lot, "-BE"/"-BZ"/"-BL" etc. for trade-to-trade restricted series. It's a
 # settlement/series marker, not part of the real ticker (confirmed:
 # BLISSGVS-T, BLISSGVS-BE, E2E-T all fail on Yahoo; BLISSGVS/E2E don't).
+# Constants for the legacy floor+extension verdict in
+# check_position_momentum. These USED to live on swings.ScannerConfig as
+# target_pct / max_hold_days / max_extension_days, and were deleted there
+# when the scanner stopped measuring a 3% floor at all (see
+# swings.run_move_profile). They are kept here, local and clearly named as
+# legacy, because this file still replays that rule.
+#
+# That rule is itself due for replacement: run against the real book it
+# returns an exit verdict for 19 of 19 holdings, including one at +41%,
+# and a signal that fires on everything carries no information. Sudarshan
+# has also been explicit that exits are a human decision. Do not tune
+# these -- replace the logic.
+LEGACY_FLOOR_PCT = 3.0
+LEGACY_MAX_HOLD_DAYS = 5
+LEGACY_MAX_EXTENSION_DAYS = 3
+
 _SERIES_SUFFIX_RE = re.compile(r"-[A-Z]{1,3}$")
 
 
@@ -520,13 +536,13 @@ def check_position_momentum(
     floor+extension part, the full two-phase rule with both backstops:
 
     Phase 1 (before the floor is reached): walks forward up to
-    config.max_hold_days sessions looking for the stop or the floor,
+    LEGACY_MAX_HOLD_DAYS sessions looking for the stop or the floor,
     whichever comes first. A position that never reaches the floor within
     that window is a TIME STOP -- capital that isn't working doesn't get
     to sit indefinitely just because it hasn't technically lost yet.
 
     Phase 2 (after the floor is reached): same floor+extension logic as
-    before -- hold up to config.max_extension_days more sessions while
+    before -- hold up to LEGACY_MAX_EXTENSION_DAYS more sessions while
     still closing higher, exit on the first non-higher close -- but the
     stop stays active as a hard backstop throughout, same as phase 1.
 
@@ -582,7 +598,7 @@ def check_position_momentum(
     n = len(closes)
     current_price = float(closes[-1])
     pnl_pct = (current_price - entry_price) / entry_price * 100
-    floor = entry_price * (1 + config.target_pct / 100)
+    floor = entry_price * (1 + LEGACY_FLOOR_PCT / 100)
 
     stop_raw = post_entry["trade_stop"].iloc[0]
     stop = float(stop_raw) if pd.notna(stop_raw) else None
@@ -614,7 +630,7 @@ def check_position_momentum(
     # frozen into a timeout verdict it already grew out of (a position that
     # crossed the floor on day 6 instead of day 5 is not still "stuck").
     # max_hold_days is only used below to judge "stuck as of today."
-    hold = config.max_hold_days
+    hold = LEGACY_MAX_HOLD_DAYS
     floor_day_idx = None
     for j in range(1, n):
         if stop is not None and lows[j] <= stop:
@@ -627,7 +643,7 @@ def check_position_momentum(
         if n - 1 >= hold:
             base["Verdict"] = (
                 f"TIME STOP -- {hold}+ sessions since entry, never reached the "
-                f"{config.target_pct}% floor -- exit, capital isn't converting"
+                f"{LEGACY_FLOOR_PCT}% floor -- exit, capital isn't converting"
             )
             base["Still_In_Momentum"] = False
         elif pnl_pct <= -config.max_risk_pct:
@@ -649,7 +665,7 @@ def check_position_momentum(
 
     # Phase 2: extension window, stop still active throughout.
     base["Floor_Crossed_On"] = str(dates[floor_day_idx].date())
-    ext_end = min(floor_day_idx + 1 + config.max_extension_days, n)
+    ext_end = min(floor_day_idx + 1 + LEGACY_MAX_EXTENSION_DAYS, n)
     prev_close = closes[floor_day_idx]
     for k in range(floor_day_idx + 1, ext_end):
         if stop is not None and lows[k] <= stop:
@@ -666,8 +682,8 @@ def check_position_momentum(
             return base
         prev_close = closes[k]
 
-    if ext_end - floor_day_idx - 1 >= config.max_extension_days:
-        base["Verdict"] = f"EXTENSION WINDOW EXPIRED ({config.max_extension_days} days past floor) -- rule says exit now"
+    if ext_end - floor_day_idx - 1 >= LEGACY_MAX_EXTENSION_DAYS:
+        base["Verdict"] = f"EXTENSION WINDOW EXPIRED ({LEGACY_MAX_EXTENSION_DAYS} days past floor) -- rule says exit now"
         base["Still_In_Momentum"] = False
     else:
         base["Verdict"] = "STILL IN MOMENTUM -- hold"

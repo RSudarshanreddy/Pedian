@@ -89,7 +89,8 @@ class ScannerConfig:
     # was actively deselecting the trades that made money.
     #
     # Confirmed on 2,073 forward windows across 536 tickers: the old
-    # Persistence_Rate correlated -0.080 with the 30-session forward peak,
+    # the old Persistence_Rate (now retired) correlated -0.080 with the
+    # 30-session forward peak,
     # while a stock's own history of large moves correlated +0.158 and produced
     # a monotonic gradient (bottom quintile 7.6% hit rate, top 23.8%). It also
     # survived a control for volatility -- within a FIXED volatility band the
@@ -103,29 +104,23 @@ class ScannerConfig:
     move_horizon_days: int = 30
     # Gate on typical move SIZE, not on a pass/fail rate. This is the
     # "capture great ones" filter: it selects stocks that habitually travel,
-    # rather than rejecting those that fail to clear an arbitrary bar.
+    # rather than rejecting those that fail to clear an arbittailrary bar.
     # Calibrated below against the live universe.
     min_typical_move_pct: float = 10.0
-    # Hard floor on the asymmetry: typical gain divided by typical drawdown.
-    # A stock that habitually gives back more than it makes is not a candidate
-    # however far it travels -- that is the failure mode of the top move-rate
-    # quintile (23.8% chance of +20% but ALSO 9.4% chance of -20%).
+    # Gain/pain and tail drawdown are NOT gates. They are scored (see
+    # calculate_score), so a stock with an ugly tail ranks low instead of
+    # disappearing.
     #
-    # This is the primary lever for a SHORT list, and it is a better one than
-    # raising min_typical_move_pct. Measured on a full 2,577-ticker scan (160
-    # candidates clearing price/liquidity/volatility):
-    #   move>=10 ratio>=1.0 -> 79 names, median -6.6% drawdown, 2.4 ratio
-    #   move>=15 ratio>=1.0 -> 37 names, median -5.1% drawdown, 3.5 ratio
-    #   move>=10 ratio>=3.0 -> 29 names, median -3.8% drawdown, 5.1 ratio
-    # Raising the move bar mostly buys bigger headline numbers; raising the
-    # ratio HALVES the typical drawdown for the same reduction in count. 3.0
-    # means "typical gain is at least 3x typical pain".
+    # They were gates briefly and it was a mistake: min_move_ratio at 3.0
+    # excluded ANTELOPUS (2.50) and a -12% tail floor excluded SHILPAMED
+    # (-15.8%) -- the two trades held up as the target pattern, each killed by
+    # a different gate. A filter that removes the thing you are looking for is
+    # miscalibrated, and tightening it further only hides more.
     #
-    # min_score is deliberately NOT used for this: at ratio>=3.0 all 29
-    # survivors already score above 40, because a strong ratio drives the score
-    # anyway. Gating twice on the same thing would just be opaque.
-    min_move_ratio: float = 3.0
-    persistence_stability_threshold: float = 4.0
+    # The scanner's job is the simple one it started with: find good stocks
+    # that can move. Whether a mover is worth YOUR money is a ranking question,
+    # and the risk side belongs in the ranking rather than in a silent veto.
+    move_stability_threshold: float = 4.0
 
     # Entry timing (independent of persistence)
     breakout_lookback: int = 20
@@ -139,33 +134,20 @@ class ScannerConfig:
     atr_period: int = 14
     stop_atr_mult: float = 1.5
     recent_low_buffer: float = 0.975   # stop can't be looser than this * recent_low
-    target_pct: float = 3.0            # MINIMUM profit floor, not a fixed exit point:
-                                        # floor = entry * (1 + target_pct/100). Once hit,
-                                        # the trade extends (see max_extension_days) rather
-                                        # than exiting immediately.
-    max_extension_days: int = 3        # after the floor is reached, keep holding up to this
-                                        # many more sessions as long as each day closes higher
-                                        # than the previous close; exit on the first non-higher
-                                        # close (or sooner if the stop is hit). This is what
-                                        # lets a trade capture more than target_pct% when a
-                                        # stock is genuinely still moving -- see
-                                        # run_barrier_backtest for the exact simulation.
-    max_risk_pct: float = 8.0          # safety-net hard filter; rarely binds since
-                                        # add_indicators' trade_stop already caps risk
-                                        # near target_pct/min_rr
-    min_rr: float = 1.0                # risk is capped at target_pct/min_rr (~3% here)
-                                        # in add_indicators, so this is a guaranteed floor
-                                        # AT THE MINIMUM TARGET, not a post-hoc filter --
-                                        # actual realized R:R is often higher once extension
-                                        # captures more upside. 1.0 was chosen empirically:
-                                        # it's roughly where a 3% floor's stop distance stops
-                                        # being tighter than these stocks' own daily noise (see
-                                        # min_persistence_rate comment above) -- pushing min_rr
-                                        # higher tightens the stop below that noise floor and
-                                        # the win rate collapses for everything.
-    max_hold_days: int = 5             # window to reach the floor in the first place; the
-                                        # extension (max_extension_days) is additional time
-                                        # on top of this, only once the floor is hit
+    # Hard ceiling on how far the stop can sit below entry. This is a LIVE
+    # guard: it was inert while rr_floor_stop pinned every stop at exactly 3%
+    # risk (384 of 384 stored rows had Risk_Pct == 3.00), but the stop is now
+    # ATR/structural only and risk genuinely varies (3.3-7.9% on a live scan).
+    # It is what stops a wide-ATR stock arriving with an unbounded stop.
+    max_risk_pct: float = 8.0
+
+    # target_pct / max_extension_days / max_hold_days / min_rr were deleted
+    # here. They defined the retired rule -- buy, never sell below a +3%
+    # floor, extend while still closing higher, give up after 5 sessions --
+    # which the scanner no longer models at all. It measures how far a stock
+    # travels over move_horizon_days and leaves the exit to a human.
+    # position_check.py still replays that rule and now carries its own
+    # LEGACY_* constants for it.
 
     # Round-trip transaction cost, deducted from every simulated trial so the
     # backtest reports NET expectancy instead of gross. Without this the whole
@@ -199,9 +181,9 @@ class ScannerConfig:
     # 13.4, against 21.2-63.6 and sd 5.7 before.
     #
     # 5 keeps this near non-binding (99% of that population clears it), on
-    # purpose: min_persistence_rate does the expectancy filtering, and each
+    # purpose: min_typical_move_pct is the gate that decides membership, and a
     # rescale should change the ORDER and SPREAD of the list, not silently
-    # change which stocks appear. Leaving it at 20 would now cut 25%.
+    # change which stocks appear.
     #
     # This is the lever for "fewer but better", and it is finally meaningful
     # because the scale is spread out. Measured survivor counts on that
@@ -223,14 +205,15 @@ class ScannerConfig:
     verbose: bool = False
 
     def __post_init__(self) -> None:
-        # min_rr divides target_pct in add_indicators' rr_floor_stop and in
-        # main's risk_cap_pct print. It's exposed via --min-rr, so 0 is
-        # reachable from the CLI and would blow up mid-scan with a bare
-        # ZeroDivisionError. Fail loudly here instead.
-        if self.min_rr <= 0:
-            raise ValueError(f"min_rr must be > 0 (got {self.min_rr}) -- it divides target_pct")
-        if self.target_pct <= 0:
-            raise ValueError(f"target_pct must be > 0 (got {self.target_pct})")
+        if self.min_typical_move_pct <= 0:
+            raise ValueError(
+                f"min_typical_move_pct must be > 0 (got {self.min_typical_move_pct})"
+            )
+        if self.move_horizon_days < 5:
+            raise ValueError(
+                f"move_horizon_days must be >= 5 (got {self.move_horizon_days}) -- "
+                "shorter windows cannot contain a move worth holding for"
+            )
         if self.min_price >= self.max_price:
             raise ValueError(f"min_price ({self.min_price}) must be < max_price ({self.max_price})")
 
@@ -422,7 +405,7 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
     ).max(axis=1)
     data["ATR"] = tr.rolling(config.atr_period).mean()
 
-    # Precomputed for run_barrier_backtest: was this stock already "volatile"
+    # Precomputed for run_move_profile: was this stock already "volatile"
     # (trailing average, no lookahead) as of each day.
     data["past_vol_mean"] = (
         data["volatility_measure"].rolling(config.volatility_lookback, min_periods=20).mean().shift(1)
@@ -494,19 +477,28 @@ def run_move_profile(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, 
     persistence_lookback days), not index 0, so a stock whose behaviour changed
     recently isn't judged on stale history.
 
-    Returns: (typical_move_pct, sample_size, typical_drawdown_pct, move_stability)
+    Returns: (typical_move_pct, sample_size, typical_drawdown_pct, move_stability,
+              tail_drawdown_pct)
       - typical_move_pct: MEDIAN best gain reached within the horizon. Median,
         not mean, because one 300% window would otherwise define a stock.
       - typical_drawdown_pct: MEDIAN worst loss within the same windows
         (negative). What you would have had to sit through.
       - move_stability: std of typical_move_pct across the 4 sub-periods. Low
         means the stock behaves consistently; high means it had one good spell.
+      - tail_drawdown_pct: the 10th-percentile trough -- a bad window, not a
+        typical one. This exists because typical_drawdown_pct is a MEDIAN and a
+        collapse does not live in the median. Measured on the 29 candidates the
+        live gates produce, median drawdown was -3.5% while the p10 tail was
+        -12.2% and the worst single candidate reached -30.7%. GANDHAR showed a
+        -1.4% median against a -23.2% worst; E2E a -5.1% median against -30.7%.
+        On a 50,000 INR position that is the difference between losing 1,700
+        and losing 15,300.
     """
     lookback = config.persistence_lookback
     horizon = config.move_horizon_days
     cost = config.round_trip_cost_pct
     if len(data) < lookback + horizon:
-        return 0.0, 0, 0.0, 999.0
+        return 0.0, 0, 0.0, 999.0, 0.0
 
     end_base = len(data) - horizon
     start_base = max(0, end_base - lookback)
@@ -548,13 +540,14 @@ def run_move_profile(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, 
             move_by_period.append(float(np.median(period_peaks)))
 
     if not peaks:
-        return 0.0, 0, 0.0, 999.0
+        return 0.0, 0, 0.0, 999.0, 0.0
 
     typical_move = round(float(np.median(peaks)), 2)
     typical_drawdown = round(float(np.median(troughs)), 2)
+    tail_drawdown = round(float(np.percentile(troughs, 10)), 2)
     stability = round(float(np.std(move_by_period)), 1) if len(move_by_period) > 1 else 0.0
 
-    return typical_move, len(peaks), typical_drawdown, stability
+    return typical_move, len(peaks), typical_drawdown, stability, tail_drawdown
 
 
 def upside_rate(data: pd.DataFrame, config: ScannerConfig) -> float:
@@ -567,6 +560,14 @@ def upside_rate(data: pd.DataFrame, config: ScannerConfig) -> float:
     downside in that window, not that a trade would have been exited there.
     Exits are a human decision (see position_check), so nothing here simulates
     one.
+
+    Costs are charged on the same convention as run_move_profile -- deducted
+    from BOTH ends. Because the trough is negative, subtracting the cost widens
+    the loss while shrinking the gain, so the comparison becomes
+    peak > |trough| + 2*cost. Leaving costs out here (as this originally did)
+    made the measure quietly more optimistic than the move profile it sits
+    beside, which is exactly the kind of inconsistency that makes two numbers
+    in the same row disagree.
     """
     lookback = config.persistence_lookback
     horizon = config.move_horizon_days
@@ -589,8 +590,9 @@ def upside_rate(data: pd.DataFrame, config: ScannerConfig) -> float:
         window = window[np.isfinite(window)]
         if len(window) < horizon // 2:
             continue
-        peak = (window.max() - entry) / entry * 100
-        trough = (window.min() - entry) / entry * 100
+        cost = config.round_trip_cost_pct
+        peak = (window.max() - entry) / entry * 100 - cost
+        trough = (window.min() - entry) / entry * 100 - cost
         total += 1
         wins += peak > abs(trough)
     return round(wins / total * 100, 1) if total else 0.0
@@ -790,47 +792,44 @@ def calculate_risk_reward(data: pd.DataFrame, config: ScannerConfig,
 # a score that could not discriminate and did not match the sort order. Treat
 # the ranking as "which of these best fits the rule we backtested", not as a
 # forecast.
-PERSISTENCE_PTS = 50
-EXPECTED_MOVE_PTS = 20
-STABILITY_PTS = 10
-VOLUME_PTS = 8
+MOVE_PTS = 40
+UPSIDE_PTS = 15
+TAIL_PTS = 20
+STABILITY_PTS = 8
+VOLUME_PTS = 5
 SETUP_PTS = 12
 SUPPORT_PENALTY_PTS = 10
 
 # ANCHORS -- what counts as 0 and what counts as full marks for each component.
 #
-# The rebudget above fixed WHICH components are scored. This fixes the scale
-# they are scored on, which was the same mistake one level down: each component
-# was a fraction of a theoretical maximum that cannot occur, so the score could
-# never approach 100 and never approached 0 either.
+# Each component is scored between the MINIMUM ADMISSIBLE value and a genuinely
+# excellent one, never between 0 and a theoretical ideal that cannot occur. The
+# earlier version scored persistence from a 100% win rate that no real stock
+# reached, so half the budget was unreachable while the first quarter of it was
+# handed free to anything that cleared the gate. Measured consequence: every
+# score landed between 40 and 60 (mean 44.97, sd 4.01 on a 100-point scale).
 #
-# Persistence was the worst case. It is worth PERSISTENCE_PTS at a 100% win
-# rate, but min_persistence_rate already guarantees >=25% and the real ceiling
-# across 529 post-rework candidates is 46.1%. So it could only ever return
-# 12.5-23 of its 50 points -- and the first 12.5 were handed free to every
-# candidate that cleared the gate, exactly the "scoring a filter you already
-# applied" error that removed the volatility block.
+# Move size anchors from min_typical_move_pct, the gate, because clearing the
+# gate is the price of admission rather than an achievement. Volume anchors
+# from 1.0x for the same reason: 1x IS the average, and scoring it from zero
+# paid a third of that budget to a stock for being unremarkable.
 #
-# Volume had the same flaw in miniature: scoring from 0 meant a stock trading
-# its NORMAL volume collected a third of the budget for being unremarkable.
-# 1.0x is average by definition, so that is where the scale starts.
+# The budget itself: move 40, tail 20, upside 15, setup 12, stability 8,
+# volume 5. Tail carries real weight deliberately -- it is the only term that
+# expresses risk, and it replaced a hard gate that was excluding good stocks
+# outright (a -12% tail floor removed SHILPAMED at -15.8%). Ranking a risky
+# mover below a clean one keeps it visible; gating it out did not.
 #
-# The persistence floor is read from config.min_persistence_rate rather than
-# hardcoded, so raising the gate re-anchors the scale automatically instead of
-# silently re-introducing the dead zone.
-#
-# Measured effect on those 529 candidates: spread 21.2-63.6 -> 2.4-76.0, sd
-# 5.65 -> 13.38, and every one of the six components reaches full budget at
-# least once instead of none of them doing so.
-#
-# 100 is now attainable but demanding: it needs >=45% win rate AND >=target_pct
-# expected move AND stability under the threshold AND a 3x volume spike AND a
-# breakout, together. Nothing scored above 76 in three weeks, which is the
-# intended behaviour of an absolute scale -- a high score should be rare rather
-# than rescaled into existence each day. The median sits near 25 because most
-# candidates genuinely are marginal: 67% are passive setups at below-average
-# volume.
-EXCELLENT_MOVE_PCT = 20.0           # a stock that typically travels 20% in 30 sessions
+# NOT A PREDICTIVE CLAIM. The score orders candidates by how well they fit what
+# was measured; it is not a forecast, and no version of it has been shown to
+# predict forward returns. That test needs a signal-history table, which does
+# not exist yet.
+EXCELLENT_MOVE_PCT = 20.0
+# Tail anchors. -20% scores nothing: a stock whose bad windows run that deep
+# is a different animal from one that dips 5%, even if both travel 20% up.
+# Range observed across live candidates was -23.0% to -5.9%.
+WORST_TAIL_PCT = -20.0
+EXCELLENT_TAIL_PCT = -5.0           # a stock that typically travels 20% in 30 sessions
 EXCELLENT_UPSIDE_RATE = 65.0        # upside beat downside in ~2 of 3 windows
 NORMAL_VOLUME_RATIO = 1.0           # 1x IS the average -- no credit for it
 EXCELLENT_VOLUME_RATIO = 3.0
@@ -854,6 +853,7 @@ def calculate_score(
     typical_move: float,
     move_stability: float,
     upside_pct: float,
+    tail_drawdown: float,
     volume_spike: float,
     setup_type: str,
     distance_from_support: float,
@@ -864,15 +864,20 @@ def calculate_score(
     # typical_move is this stock's MEDIAN best gain over move_horizon_days.
     move_score = _span(
         typical_move, config.min_typical_move_pct, EXCELLENT_MOVE_PCT
-    ) * PERSISTENCE_PTS
+    ) * MOVE_PTS
     # How often the upside actually dominated the downside over the horizon.
     # Anchored from 50% -- below that the stock fell further than it rose in
     # most windows, which deserves nothing, not partial credit.
-    upside_score = _span(upside_pct, 50.0, EXCELLENT_UPSIDE_RATE) * EXPECTED_MOVE_PTS
+    upside_score = _span(upside_pct, 50.0, EXCELLENT_UPSIDE_RATE) * UPSIDE_PTS
+    # Risk, as a ranking term rather than a veto. tail_drawdown is the
+    # 10th-percentile forward trough -- a bad window, not a typical one -- so
+    # this is what separates "moves 20% and dips 5%" from "moves 20% and dips
+    # 20%". Both are volatile; only one of them is comfortable to hold.
+    tail_score = _span(tail_drawdown, WORST_TAIL_PCT, EXCELLENT_TAIL_PCT) * TAIL_PTS
 
-    if move_stability < config.persistence_stability_threshold:
+    if move_stability < config.move_stability_threshold:
         stability_bonus = STABILITY_PTS
-    elif move_stability < config.persistence_stability_threshold * 1.5:
+    elif move_stability < config.move_stability_threshold * 1.5:
         stability_bonus = STABILITY_PTS / 2
     else:
         stability_bonus = 0.0
@@ -893,7 +898,7 @@ def calculate_score(
     )
 
     score = (
-        move_score + upside_score + stability_bonus
+        move_score + upside_score + tail_score + stability_bonus
         + volume_bonus + setup_bonus
         - support_penalty
     )
@@ -938,18 +943,14 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if volatility_ratio < config.min_volatility_ratio:
         return None
 
-    typical_move, sample_size, typical_drawdown, move_stability = run_move_profile(data, config)
+    typical_move, sample_size, typical_drawdown, move_stability, tail_drawdown = run_move_profile(data, config)
     if sample_size < config.min_persistence_sample:
         return None
-    # Gate on how far the stock TRAVELS, not on whether it cleared a bar.
+    # The one gate here: does it actually travel? Asymmetry and tail drawdown
+    # are scored, not gated -- see the config comment above.
     if typical_move < config.min_typical_move_pct:
         return None
-    # ...and on the asymmetry. A stock that habitually gives back more than it
-    # gains is not a candidate however far it moves; this is what stops the
-    # "high move rate" filter from simply selecting the most violent stocks.
-    if abs(typical_drawdown) > 0 and typical_move / abs(typical_drawdown) < config.min_move_ratio:
-        return None
-    persistence_rate = upside_rate(data, config)
+    upside_dominance = upside_rate(data, config)
     # move_stability is scoring-only (see calculate_score) -- not a hard reject.
 
     action, setup_type, reason = get_entry_trigger(data, config)
@@ -974,7 +975,7 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     volume_spike = float(latest["Volume"]) / avg_volume20_prior
 
     score = calculate_score(
-        typical_move, move_stability, persistence_rate, volume_spike,
+        typical_move, move_stability, upside_dominance, tail_drawdown, volume_spike,
         setup_type, distance_from_support, config,
     )
 
@@ -997,13 +998,17 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Volatile_Days": volatile_days,
         "Volatility_Ratio": round(volatility_ratio, 4),
         "Today_Range": round(today_range, 2),
-        # Column names kept so the Dataform views keep compiling without a
-        # manual workspace pull; the MEANINGS changed with the move profile.
-        "Persistence_Rate": persistence_rate,      # % of windows upside beat downside
-        "Persistence_Sample": sample_size,
+        # Renamed to say what they now hold. The old Persistence_* names were
+        # carried over from the retired 3%-floor backtest and had stopped
+        # describing their contents. NOTE: renaming these requires a manual
+        # Dataform workspace pull before the views pick them up -- see
+        # trigger_dataform_run for why that sync is manual.
+        "Upside_Dominance_Pct": upside_dominance,  # % of windows upside beat downside
+        "Upside_Dominance_Sample": sample_size,
         "Expected_Move": typical_move,             # median 30-session peak gain %
-        "Persistence_Stability": move_stability,   # variability of that gain
+        "Move_Stability": move_stability,          # variability of that gain
         "Typical_Drawdown_Pct": typical_drawdown,  # median worst loss in the same windows
+        "Tail_Drawdown_Pct": tail_drawdown,        # 10th-percentile (bad) window
         "Traded_Value_Cr": round(avg_traded_value20_cr, 2),
         "Volume_Spike": round(volume_spike, 2),
         "Pullback_Pct": round(float(latest["pullback_pct"]), 2),
@@ -1011,12 +1016,12 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Dist_MA20_Pct": round(distance_from_ma20, 2),
         "Entry": risk["entry"],
         "Stop_Loss": risk["stop_loss"],
-        "Target": risk["target"],
+        "Typical_Move_Price": risk["target"],
         "Risk_Per_Share": risk["risk_per_share"],
         "Risk_Pct": risk["risk_pct"],
         "RR_Ratio": risk["rr_ratio"],
         "ATR": risk["atr"],
-        "Max_Hold_Days": config.move_horizon_days,
+        "Move_Horizon_Days": config.move_horizon_days,
     }
 # =========================================================
 # SCANNER
@@ -1083,17 +1088,40 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     # raised AttributeError inside calculate_score, the broad except below
     # swallowed all of them, and five consecutive scheduled runs reported zero
     # results with nothing worse than a warning in the log.
-    if attempted and len(ticker_errors) / attempted > config.max_ticker_error_rate:
-        counts: dict[str, int] = {}
-        for msg in ticker_errors.values():
-            counts[msg.split(":")[0]] = counts.get(msg.split(":")[0], 0) + 1
-        top_kind = max(counts, key=counts.get)
+    # Two independent triggers, because a code fault does not always show up as
+    # a HIGH failure rate.
+    #
+    # The rate trigger catches a total failure -- the support_distance_threshold
+    # rename made all 2,574 tickers raise, which surfaced as "0 candidates
+    # found" and a warning.
+    #
+    # The type trigger catches a PARTIAL one, which the rate alone misses.
+    # Deleting max_risk_pct broke only the tickers that got far enough to reach
+    # the risk check: 16 of 400, just 4%, silently under the 25% threshold, and
+    # the run reported zero candidates as though that were a market condition.
+    # AttributeError/NameError/TypeError essentially never come from bad market
+    # data -- they mean the code referenced something that does not exist -- so
+    # a handful of them is already proof of a broken build.
+    CODE_FAULT_TYPES = ("AttributeError", "NameError", "TypeError")
+    CODE_FAULT_MIN_COUNT = 5
+    kind_counts: dict[str, int] = {}
+    for msg in ticker_errors.values():
+        kind_counts[msg.split(":")[0]] = kind_counts.get(msg.split(":")[0], 0) + 1
+    code_faults = {k: v for k, v in kind_counts.items()
+                   if k in CODE_FAULT_TYPES and v >= CODE_FAULT_MIN_COUNT}
+    rate_exceeded = bool(attempted) and len(ticker_errors) / attempted > config.max_ticker_error_rate
+
+    if code_faults or rate_exceeded:
+        top_kind = max(code_faults or kind_counts, key=(code_faults or kind_counts).get)
         sample = next(m for m in ticker_errors.values() if m.startswith(top_kind))
+        why = (f"{top_kind} raised {kind_counts[top_kind]}x -- that exception type comes "
+               f"from code, not from market data"
+               if code_faults else
+               f"{len(ticker_errors) / attempted:.0%} of tickers raised, over the "
+               f"{config.max_ticker_error_rate:.0%} limit")
         raise RuntimeError(
-            f"{len(ticker_errors)}/{attempted} tickers raised inside scan_ticker_data "
-            f"({len(ticker_errors) / attempted:.0%} > max_ticker_error_rate "
-            f"{config.max_ticker_error_rate:.0%}) -- this is a code fault, not missing "
-            f"data. Most common: {top_kind} x{counts[top_kind]}. Example: {sample}"
+            f"{len(ticker_errors)}/{attempted} tickers raised inside scan_ticker_data. "
+            f"{why}. This is a code fault, not missing data. Example: {sample}"
         )
 
     failures = batch_failures + list(ticker_errors)
@@ -1108,24 +1136,24 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
 
     df = pd.DataFrame(results)
     # Score is the ranker, so it must also be the sort key. It previously sat
-    # FOURTH, behind Persistence_Rate and Persistence_Stability, which meant it
+    # FOURTH, behind what were then Persistence_Rate and Persistence_Stability
+    # (now Upside_Dominance_Pct / Move_Stability), which meant it
     # almost never affected the order at all: on a live 84-candidate run only
-    # 6 rows shared an (Action, Persistence_Rate, Persistence_Stability) tuple
+    # 6 rows shared an (Action, win-rate, stability) tuple
     # for Score to break, the displayed position correlated -0.366 with Score,
     # and the top 8 shown shared just 3 names with the top 8 by Score. The
     # report therefore ranked by one number while printing another beside it.
-    # Persistence_Rate is still in the output as a column, and is now 50 of
+    # The expectancy measure is still an output column and still drives 50 of
     # Score's 100 points, so it keeps most of its influence -- explicitly
     # rather than accidentally.
     df["_action_rank"] = df["Action"].map({"BUY": 0, "WATCH": 1}).fillna(2)
     df = df.sort_values(
-        ["_action_rank", "Score", "Persistence_Rate"],
+        ["_action_rank", "Score", "Upside_Dominance_Pct"],
         ascending=[True, False, False],
     ).drop(columns=["_action_rank"])
 
     total_quality_candidates = len(df)
     return df.head(config.top_n).reset_index(drop=True), failures, total_quality_candidates
-
 
 # =========================================================
 # BIGQUERY
@@ -1146,11 +1174,12 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Volatile_Days", "INT64"),
     bigquery.SchemaField("Volatility_Ratio", "FLOAT64"),
     bigquery.SchemaField("Today_Range", "FLOAT64"),
-    bigquery.SchemaField("Persistence_Rate", "FLOAT64"),
-    bigquery.SchemaField("Persistence_Sample", "INT64"),
+    bigquery.SchemaField("Upside_Dominance_Pct", "FLOAT64"),
+    bigquery.SchemaField("Upside_Dominance_Sample", "INT64"),
     bigquery.SchemaField("Expected_Move", "FLOAT64"),
-    bigquery.SchemaField("Persistence_Stability", "FLOAT64"),
+    bigquery.SchemaField("Move_Stability", "FLOAT64"),
     bigquery.SchemaField("Typical_Drawdown_Pct", "FLOAT64"),
+    bigquery.SchemaField("Tail_Drawdown_Pct", "FLOAT64"),
     bigquery.SchemaField("Traded_Value_Cr", "FLOAT64"),
     bigquery.SchemaField("Volume_Spike", "FLOAT64"),
     bigquery.SchemaField("Pullback_Pct", "FLOAT64"),
@@ -1158,14 +1187,13 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Dist_MA20_Pct", "FLOAT64"),
     bigquery.SchemaField("Entry", "FLOAT64"),
     bigquery.SchemaField("Stop_Loss", "FLOAT64"),
-    bigquery.SchemaField("Target", "FLOAT64"),
+    bigquery.SchemaField("Typical_Move_Price", "FLOAT64"),
     bigquery.SchemaField("Risk_Per_Share", "FLOAT64"),
     bigquery.SchemaField("Risk_Pct", "FLOAT64"),
     bigquery.SchemaField("RR_Ratio", "FLOAT64"),
     bigquery.SchemaField("ATR", "FLOAT64"),
-    bigquery.SchemaField("Max_Hold_Days", "INT64"),
+    bigquery.SchemaField("Move_Horizon_Days", "INT64"),
 ]
-
 
 def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
     """Preserve legacy field names/types while adding fields from BQ_SCHEMA.
@@ -1323,7 +1351,6 @@ DATAFORM_REPOSITORY_ID = "sudarshan_repo"
 DATAFORM_WORKSPACE_ID = "worker1"
 DATAFORM_SERVICE_ACCOUNT = "347050126858-compute@developer.gserviceaccount.com"
 
-
 DATAFORM_COMPILE_RETRIES = 3
 DATAFORM_COMPILE_RETRY_DELAY_SEC = 8
 
@@ -1412,7 +1439,6 @@ def trigger_dataform_run(
 
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 
-
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[str]:
     """
     Builds the notification text: only same-day-fresh BUY signals
@@ -1445,12 +1471,12 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     # 5-second phone read, not the full record.
     lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
     for _, r in fresh_buys.iterrows():
-        # breakout is a BUY again (see get_entry_trigger), so the setup name
-        # is doing real work here -- a breakout line means the move has
-        # already happened (median +6.35% on the signal day), a
-        # pullback_bounce means you're buying a dip. Same win rate as far as
-        # anything measured, different entry price.
-        lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- win rate {r['Persistence_Rate']:.0f}%")
+        # "upside dominance", NOT "win rate" -- it is the share of forward
+        # windows in which the gain exceeded the loss, not a probability that
+        # a trade makes money. The old label was inherited from the retired
+        # 3%-floor backtest and overstated what the number means.
+        lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- upside dominance "
+                     f"{r['Upside_Dominance_Pct']:.0f}%, typical move {r['Expected_Move']:.0f}%")
     lines.append("")
     lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
     return "\n".join(lines)
@@ -1499,7 +1525,6 @@ def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list
             LOGGER.warning("Telegram send failed for chat_id %s: %s", cid, exc)
     return failures
 
-
 # =========================================================
 # ARGS
 # =========================================================
@@ -1528,18 +1553,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-price", default=ScannerConfig.max_price, type=float)
     p.add_argument("--min-traded-value-cr", default=ScannerConfig.min_avg_traded_value_cr, type=float)
 
-    p.add_argument("--target-pct", default=ScannerConfig.target_pct, type=float,
-                    help="Minimum profit floor %% above entry -- never exit below this")
-    p.add_argument("--max-extension-days", default=ScannerConfig.max_extension_days, type=int,
-                    help="After the floor is hit, keep holding this many more sessions "
-                         "while still closing higher; exit on the first non-higher close")
     p.add_argument("--round-trip-cost-pct", default=ScannerConfig.round_trip_cost_pct, type=float,
                     help="Round-trip transaction cost %% charged to every backtest trial. "
                          "Raise it if you trade smaller than ~Rs.25,000 a position, since the "
                          "flat DP charge is a bigger share of a smaller trade")
-    p.add_argument("--min-rr", default=ScannerConfig.min_rr, type=float)
     p.add_argument("--max-risk-pct", default=ScannerConfig.max_risk_pct, type=float)
-    p.add_argument("--max-hold-days", default=ScannerConfig.max_hold_days, type=int)
     p.add_argument("--min-score", default=ScannerConfig.min_score, type=float,
                     help="Hard quality gate (0-100); candidates scoring below this are rejected outright")
 
@@ -1577,9 +1595,11 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     the CONTAINER was launched with (e.g. functions-framework's own
     "--target=main --source=swings.py --port=8080"), not anything about
     this request -- parse_args() must never run in that path. It used to,
-    and argparse's prefix-matching silently mapped "--target=main" onto this
-    file's own --target-pct flag, then crashed trying to parse "main" as a
-    float -- which failed every single HTTP request. Config here comes from
+    and argparse's prefix-matching silently mapped "--target=main" onto a
+    --target-pct flag this file defined at the time, then crashed trying to
+    parse "main" as a float, failing every single HTTP request. That specific
+    flag is gone, but the guard must stay: any future flag whose name prefixes
+    one of functions-framework's own would reintroduce it. Config here comes from
     the request's JSON body (if any) or plain defaults instead.
     """
     if request is not None:
@@ -1598,12 +1618,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_price=float(body.get("min_price", ScannerConfig.min_price)),
             max_price=float(body.get("max_price", ScannerConfig.max_price)),
             min_avg_traded_value_cr=float(body.get("min_traded_value_cr", ScannerConfig.min_avg_traded_value_cr)),
-            target_pct=float(body.get("target_pct", ScannerConfig.target_pct)),
-            max_extension_days=int(body.get("max_extension_days", ScannerConfig.max_extension_days)),
             round_trip_cost_pct=float(body.get("round_trip_cost_pct", ScannerConfig.round_trip_cost_pct)),
-            min_rr=float(body.get("min_rr", ScannerConfig.min_rr)),
             max_risk_pct=float(body.get("max_risk_pct", ScannerConfig.max_risk_pct)),
-            max_hold_days=int(body.get("max_hold_days", ScannerConfig.max_hold_days)),
             min_score=float(body.get("min_score", ScannerConfig.min_score)),
             top_n=int(body.get("top_n", ScannerConfig.top_n)),
             verbose=bool(body.get("verbose", False)),
@@ -1635,12 +1651,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_price=args.min_price,
             max_price=args.max_price,
             min_avg_traded_value_cr=args.min_traded_value_cr,
-            target_pct=args.target_pct,
-            max_extension_days=args.max_extension_days,
             round_trip_cost_pct=args.round_trip_cost_pct,
-            min_rr=args.min_rr,
             max_risk_pct=args.max_risk_pct,
-            max_hold_days=args.max_hold_days,
             min_score=args.min_score,
             top_n=args.top_n,
             verbose=args.verbose,
@@ -1665,7 +1677,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     print(f"Stop: ATR/structure only, risk capped at {config.max_risk_pct}% "
           f"(no fixed profit floor -- exits are a human decision)")
     print(f"Move profile: typical gain >= {config.min_typical_move_pct}% over "
-          f"{config.move_horizon_days} sessions, gain/pain >= {config.min_move_ratio} "
+          f"{config.move_horizon_days} sessions "
           f"({config.min_persistence_sample}+ eligible days in last {config.persistence_lookback})")
     print(f"Scanning {len(tickers)} tickers...")
     print("-" * 80)
@@ -1687,13 +1699,12 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         # anything -- the old block suggested --min-persistence 55 and
         # --min-score 55, both ABOVE the defaults of that time, which would
         # have tightened the scan while claiming to loosen it. --min-rr is
-        # not listed: raising it tightens the stop and rr_floor_stop already
-        # guarantees the ratio, so it can't surface more candidates.
+        # not listed: it no longer exists, and the stop is ATR/structural.
         #
         # --min-score is also not listed: at 5.0 it is already near-zero on a
         # 0-100 scale (see the field comment), so there is no lower value left
-        # that means anything as a relaxation hint. min_persistence_rate is
-        # what actually gates candidates now.
+        # that means anything as a relaxation hint. min_typical_move_pct is
+        # what actually decides membership now.
         print(f"  --min-typical-move 5         (lower move bar, now {config.min_typical_move_pct:.0f})")
         print(f"  --min-avg-volatility 3.0     (lower volatility bar, now {config.min_avg_volatility})")
         print(f"  --min-persistence-sample 30  (allow smaller sample, now {config.min_persistence_sample})")
@@ -1708,21 +1719,21 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             display = candidates.head(15)
 
     print("\n" + "-" * 100)
-    print("RESULTS (sorted: BUY first, then by persistence, stability, score)")
+    print("RESULTS (sorted: BUY first, then by score)")
     print("Age = consecutive days this Setup has held. BUY only trust Age==1 as a fresh")
     print("trigger -- most BUY setups are single-day; re-run before acting on an old report.")
     print("-" * 100)
     header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
-              f"{'Persist%':>9} {'Stabil':>7} {'ExpMove':>8} {'Today%':>7} {'RR':>5} "
-              f"{'Entry':>9} {'SL':>9} {'Target':>9}")
+              f"{'Upside%':>9} {'Stabil':>7} {'Move%':>8} {'TailDD':>8} {'RR':>5} "
+              f"{'Entry':>9} {'SL':>9} {'MovePx':>9}")
     print(header)
     print("-" * 100)
     for _, r in display.iterrows():
         print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} {r['Setup_Age_Days']:>4} "
               f"{r['Score']:>6.1f} {r['Avg_Volatility']:>5.1f}% "
-              f"{r['Persistence_Rate']:>8.0f}% {r['Persistence_Stability']:>6.1f} "
-              f"{r['Expected_Move']:>7.1f}% {r['Today_Range']:>6.1f}% {r['RR_Ratio']:>5.1f} "
-              f"{r['Entry']:>9.2f} {r['Stop_Loss']:>9.2f} {r['Target']:>9.2f}")
+              f"{r['Upside_Dominance_Pct']:>8.0f}% {r['Move_Stability']:>6.1f} "
+              f"{r['Expected_Move']:>7.1f}% {r['Tail_Drawdown_Pct']:>7.1f}% {r['RR_Ratio']:>5.1f} "
+              f"{r['Entry']:>9.2f} {r['Stop_Loss']:>9.2f} {r['Typical_Move_Price']:>9.2f}")
 
     if output_path:
         candidates.to_csv(output_path, index=False)
