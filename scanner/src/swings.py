@@ -134,12 +134,33 @@ class ScannerConfig:
     atr_period: int = 14
     stop_atr_mult: float = 1.5
     recent_low_buffer: float = 0.975   # stop can't be looser than this * recent_low
-    # Hard ceiling on how far the stop can sit below entry. This is a LIVE
-    # guard: it was inert while rr_floor_stop pinned every stop at exactly 3%
-    # risk (384 of 384 stored rows had Risk_Pct == 3.00), but the stop is now
-    # ATR/structural only and risk genuinely varies (3.3-7.9% on a live scan).
-    # It is what stops a wide-ATR stock arriving with an unbounded stop.
-    max_risk_pct: float = 8.0
+    # Absolute ceiling on stop distance -- a backstop against an absurd stop,
+    # NOT a risk preference.
+    #
+    # It must be loose, because stop distance and volatility are the SAME
+    # variable: the stop is 1.5x ATR below entry, so a volatile stock
+    # necessarily needs a wide one. Set too tight, this gate rejects stocks for
+    # being volatile in a scanner whose entire purpose is finding volatile
+    # stocks.
+    #
+    # That is not hypothetical. At 8.0 it rejected 7 of the 8 most volatile
+    # stocks in the universe, and for most of them it was the ONLY failing
+    # gate: STLTECH (typical move 48.9%, risk 9.1%), DEEDEV (28.8%, 8.2% --
+    # over by two tenths of a point), AEROFLEX (27.9%, 8.8%), INDSWFTLAB
+    # (27.1%, 8.8%), ANTELOPUS (22.9%, 13.9%). Candidates clustered in the
+    # SECOND volatility decile rather than the first.
+    #
+    # 8.0 was never a considered choice for this role. It sat inert for the
+    # scanner's whole life because rr_floor_stop pinned every stop at exactly
+    # target_pct/min_rr = 3% (384 of 384 stored rows had Risk_Pct == 3.00).
+    # Removing rr_floor_stop made it live for the first time, at a value chosen
+    # when it could never bind.
+    #
+    # 15.0 admits the whole volatile cohort while still catching a genuinely
+    # broken stop. Per-trade risk is controlled by POSITION SIZE, not by
+    # refusing the stock: a 14% stop on Rs.50,000 risks Rs.7,000, or Rs.3,500
+    # on a Rs.25,000 position. Risk_Pct is in the output for exactly that.
+    max_risk_pct: float = 15.0
 
     # target_pct / max_extension_days / max_hold_days / min_rr were deleted
     # here. They defined the retired rule -- buy, never sell below a +3%
