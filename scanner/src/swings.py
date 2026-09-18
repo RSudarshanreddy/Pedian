@@ -222,7 +222,26 @@ class ScannerConfig:
     # rather than raising, so a healthy run sits near zero here. 0.25 is well
     # clear of that while still catching the total-failure case.
     max_ticker_error_rate: float = 0.25
-    top_n: int = 200                   # high ceiling -- min_score does the real filtering
+    # STORAGE cap -- how many rows reach BigQuery. Deliberately high: the
+    # stored history is the raw material for the signal-history test (does a
+    # BUY at score 60+ actually beat one at 30-40?), and that test needs the
+    # LOW scores too. Truncating storage would permanently destroy the ability
+    # to answer it.
+    top_n: int = 200
+    # DISPLAY cap -- how many rows are printed and pushed to Telegram.
+    #
+    # This is the attention knob, and it is deliberately NOT a filter. A live
+    # scan returns ~100 candidates; that is a list you skim, not one you act
+    # on. Cutting the list with min_score or the price band would also cut the
+    # stored history, and cutting by price is actively wrong -- it is
+    # orthogonal to quality (entry price correlated -0.030 with outcome), so a
+    # 400-1500 band would have deleted GANDHAR at score 71.1, PFOCUS at 64.7,
+    # INDSWFTLAB at 64.2 and CUPID at 64.2 purely for being cheap, while still
+    # leaving 76 names to read.
+    #
+    # Capping by RANK keeps the best N whatever they cost. On the live scan the
+    # top 15 spanned scores 60.0-71.4 and prices Rs.275-1,169.
+    display_top_n: int = 10
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -1171,6 +1190,9 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     ).drop(columns=["_action_rank"])
 
     total_quality_candidates = len(df)
+    # top_n caps STORAGE only; the display cap is applied by the caller. These
+    # were the same number until the list grew past what one person can read,
+    # at which point shortening the report also started shortening the history.
     return df.head(config.top_n).reset_index(drop=True), failures, total_quality_candidates
 
 # =========================================================
@@ -1457,7 +1479,8 @@ def trigger_dataform_run(
 
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 
-def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[str]:
+def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
+                           limit: int = 10) -> Optional[str]:
     """
     Builds the notification text: only same-day-fresh BUY signals
     (Setup_Age_Days == 1) -- the whole point of pushing this immediately is
@@ -1481,13 +1504,22 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str) -> Optional[
     if fresh_buys.empty:
         return None
 
+    # Same attention cap as the console. A live scan produced 19 fresh BUYs in
+    # one run; nineteen lines is not a phone alert, it is a spreadsheet. The
+    # count is still reported so a long tail is never silently hidden.
+    total_fresh = len(fresh_buys)
+    fresh_buys = fresh_buys.head(limit)
+
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
 
     # Plain text, deliberately -- see send_telegram_notification for why.
     # Kept to one line per ticker on purpose -- score/entry/SL/target are all
     # in BigQuery (vw_daily_digest) for whoever wants to dig in; this is the
     # 5-second phone read, not the full record.
-    lines = [f"Swing scan -- {run_time_ist}", f"{len(fresh_buys)} fresh BUY signal(s):", ""]
+    header_count = (f"top {len(fresh_buys)} of {total_fresh} fresh BUY signals"
+                    if total_fresh > len(fresh_buys)
+                    else f"{total_fresh} fresh BUY signal(s)")
+    lines = [f"Swing scan -- {run_time_ist}", f"{header_count}:", ""]
     for _, r in fresh_buys.iterrows():
         # "upside dominance", NOT "win rate" -- it is the share of forward
         # windows in which the gain exceeded the loss, not a probability that
@@ -1579,7 +1611,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-score", default=ScannerConfig.min_score, type=float,
                     help="Hard quality gate (0-100); candidates scoring below this are rejected outright")
 
-    p.add_argument("--top-n", default=ScannerConfig.top_n, type=int)
+    p.add_argument("--top-n", default=ScannerConfig.top_n, type=int,
+                    help="Max rows written to BigQuery. Keep high -- stored history feeds "
+                         "the signal-history test, which needs low scores too")
+    p.add_argument("--display-top-n", default=ScannerConfig.display_top_n, type=int,
+                    help="How many rows to print and send to Telegram. Attention knob, "
+                         "not a filter -- storage is unaffected")
     p.add_argument("--output", default="", help="CSV output path")
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
     p.add_argument("--no-dataform-trigger", action="store_true",
@@ -1640,6 +1677,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             max_risk_pct=float(body.get("max_risk_pct", ScannerConfig.max_risk_pct)),
             min_score=float(body.get("min_score", ScannerConfig.min_score)),
             top_n=int(body.get("top_n", ScannerConfig.top_n)),
+            display_top_n=int(body.get("display_top_n", ScannerConfig.display_top_n)),
             verbose=bool(body.get("verbose", False)),
         )
         raw_tickers = body.get("tickers")
@@ -1673,6 +1711,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             max_risk_pct=args.max_risk_pct,
             min_score=args.min_score,
             top_n=args.top_n,
+            display_top_n=args.display_top_n,
             verbose=args.verbose,
         )
 
@@ -1734,7 +1773,9 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         display = candidates[candidates["Action"] == "BUY"]
         if display.empty:
             print("\nNo BUY signals today. Showing top WATCH candidates instead:")
-            display = candidates.head(15)
+            display = candidates
+    shown = len(display)
+    display = display.head(config.display_top_n)
 
     print("\n" + "-" * 100)
     print("RESULTS (sorted: BUY first, then by score)")
@@ -1757,11 +1798,14 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         candidates.to_csv(output_path, index=False)
         print(f"\nSaved {len(candidates)} rows to {output_path}")
 
-    if total_quality > len(candidates):
-        print(f"\nNote: {total_quality} total quality candidates found, only top {config.top_n} shown/saved. "
-              f"Raise --top-n to see the rest.")
+    if shown > len(display):
+        print(f"\nShowing the top {len(display)} of {shown} by score. "
+              f"All {len(candidates)} are written to BigQuery -- raise --display-top-n to see more.")
     else:
         print(f"\nTotal quality candidates: {total_quality}")
+    if total_quality > len(candidates):
+        print(f"WARNING: {total_quality} candidates found but only {len(candidates)} stored "
+              f"(top_n={config.top_n}). Raise --top-n or history is being lost.")
 
     if not no_telegram:
         try:
@@ -1770,7 +1814,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(candidates, run_date)
+                digest_text = format_telegram_digest(candidates, run_date, config.display_top_n)
                 if digest_text is None:
                     print("\nNo fresh (Age==1) BUY signals -- Telegram notification skipped.")
                 else:

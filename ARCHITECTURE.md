@@ -169,17 +169,33 @@ membership; this only trims the bottom tail.
 
 | I want… | turn this | direction |
 |---|---|---|
-| fewer candidates | `min_typical_move_pct` | up (10 → 12 → 15) |
+| **a shorter list to read** | **`display_top_n`** | **down (10 → 5)** |
+| fewer candidates stored | `min_typical_move_pct` | up (10 → 12 → 15) |
 | bigger movers only | `min_typical_move_pct` | up |
 | safer candidates ranked higher | `TAIL_PTS` | up (takes from `MOVE_PTS`) |
 | cheaper stocks included | `min_price` | down |
-| a shorter shortlist without hiding anything | `min_score` | up (5 → 25 → 40) |
+| a stricter quality bar | `min_score` | up (5 → 25 → 40) — **but see below** |
 | newly-volatile stocks visible | `volatility_lookback` | down — **but see blind spot above** |
 | more BUY signals | `breakout_volume_mult` | down (2.3 → 2.0) |
 
-**Rule of thumb:** to change *what you see*, move a Stage 1–3 knob. To change
-*what you look at first*, move a score weight. Never use a filter to fix an
-ordering problem.
+**Rule of thumb:** to change *what you see*, move `display_top_n`. To change
+*what exists*, move a Stage 1–3 knob. To change *what ranks first*, move a score
+weight. Never use a filter to fix an attention problem.
+
+> **`display_top_n` caps the report, not the data.** A live scan returns ~100
+> candidates — a list you skim, not one you act on. It prints and Telegrams the
+> top N by score while BigQuery still receives everything.
+>
+> This matters more than it looks. The signal-history test asks whether score
+> buckets 0–20 … 60+ perform differently. If the scanner only *stored* the high
+> scores, the low buckets would not exist and the question becomes permanently
+> unanswerable. **Never shorten the list by shortening storage.**
+>
+> And never shorten it by price. Entry price correlates **−0.030** with outcome,
+> so a 400–1500 band cuts orthogonally to quality: on a live scan it would have
+> deleted GANDHAR (score 71.1, #2 overall), PFOCUS (64.7), INDSWFTLAB (64.2) and
+> CUPID (64.2) for being cheap — while still leaving 76 names to read. The top 10
+> by score spanned ₹275 to ₹1,169.
 
 ---
 
