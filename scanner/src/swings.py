@@ -104,7 +104,7 @@ class ScannerConfig:
     move_horizon_days: int = 30
     # Gate on typical move SIZE, not on a pass/fail rate. This is the
     # "capture great ones" filter: it selects stocks that habitually travel,
-    # rather than rejecting those that fail to clear an arbittailrary bar.
+    # rather than rejecting those that fail to clear an arbitrary bar.
     # Calibrated below against the live universe.
     min_typical_move_pct: float = 10.0
     # Gain/pain and tail drawdown are NOT gates. They are scored (see
@@ -468,7 +468,9 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
 # longer the goal, and nothing calls them. position_check.check_position_momentum
 # still carries its own inline copy of that rule -- that is a separate change.
 # =========================================================
-def run_move_profile(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int, float, float]:
+def run_move_profile(
+    data: pd.DataFrame, config: ScannerConfig
+) -> tuple[float, int, float, float, float]:
     """
     Measures HOW FAR this stock typically moves, rather than whether it cleared
     an arbitrary bar.
@@ -780,39 +782,34 @@ def calculate_risk_reward(data: pd.DataFrame, config: ScannerConfig,
 # =========================================================
 # SCORING
 # =========================================================
-# Score point budget. The positive weights sum to 100 so the number reads as
-# a percentage-like figure; SUPPORT_PENALTY_PTS is subtracted on top.
+# Score point budget. The positive weights sum to 100 so the number reads as a
+# percentage-like figure; SUPPORT_PENALTY_PTS is subtracted on top.
 #
-# WHY THESE AND NOT THE OLD ONES: the previous budget spent 38 of its 100
-# points on avg_volatility (15), median_volatility (10), volatility_ratio (5)
-# and today_range (8) -- every one of which is ALREADY a hard gate in
-# build_candidate (min_avg_volatility, min_median_volatility,
-# min_volatility_ratio). Scoring a filter you have already applied cannot
-# rank the survivors, because they all passed it. Measured on a live
-# 84-candidate run: those four averaged 27.2 points, 60% of a typical score
-# of 45, while spanning only 6.6-11.7 of 15, 5.2-9.1 of 10, 2.3-4.6 of 5 and
-# 3.3-8.0 of 8. They set the score's LEVEL and barely touched its ORDER, and
-# that is the whole reason every score landed between 40 and 60 (mean 44.97,
-# sd 4.01, full range 40.1-55.4 on a 100-point scale).
+# Two rules produced these, both learned the hard way:
 #
-# Dropping them and re-budgeting widened the spread to 22.2 points with sd
-# 5.49 on the same candidates -- 37% more discrimination -- and reordered the
-# list materially (rank correlation +0.47 against the old score, 3/10 overlap
-# in the top ten).
+# 1. NEVER SCORE SOMETHING THE GATES ALREADY ENFORCE. An earlier budget spent
+#    38 of its 100 points on avg_volatility, median_volatility,
+#    volatility_ratio and today_range -- all four already hard gates. Scoring a
+#    filter you have applied cannot rank the survivors, because every one of
+#    them passed it. Measured: those four averaged 27.2 points, 60% of a
+#    typical score of 45, while barely varying. That alone is why every score
+#    used to land between 40 and 60 (mean 44.97, sd 4.01).
 #
-# Persistence takes half the budget because it IS the barrier backtest's
-# measured win rate for that stock, the most direct expectancy estimate
-# available here. Stability is deliberately small: it returns only 0, half or
-# full (a 3-step flag, not a measurement), yet under the old budget it drove
-# 37.8% of all ranking variance -- more than persistence, expected_move and
-# volume combined.
+# 2. RISK BELONGS IN THE RANKING, NOT IN A VETO. TAIL_PTS is large on purpose.
+#    It replaced hard gates that were removing good stocks outright -- a -12%
+#    tail floor excluded SHILPAMED at -15.8%, a 3.0 gain/pain floor excluded
+#    ANTELOPUS at 2.50. Ranking a risky mover below a clean one keeps it
+#    visible; gating it out did not.
 #
-# NOT A PREDICTIVE CLAIM. Score correlated -0.153 with realized outcome
-# before this change, i.e. mildly ANTI-predictive, and rebudgeting the
-# components does not create signal that was never measured. What it fixes is
-# a score that could not discriminate and did not match the sort order. Treat
-# the ranking as "which of these best fits the rule we backtested", not as a
-# forecast.
+# Move size takes the largest share because it is the thing actually being
+# looked for. Stability is deliberately small: it returns only 0, half or full
+# (a 3-step flag, not a measurement), yet under an older budget that coarse
+# flag drove 37.8% of all ranking variance.
+#
+# NOT A PREDICTIVE CLAIM. The score orders candidates by how well they fit what
+# was measured. No version of it has been shown to predict forward returns --
+# the previous one correlated -0.153 with realized outcome. That test needs a
+# signal-history table, which does not exist yet.
 MOVE_PTS = 40
 UPSIDE_PTS = 15
 TAIL_PTS = 20
@@ -845,12 +842,12 @@ SUPPORT_PENALTY_PTS = 10
 # was measured; it is not a forecast, and no version of it has been shown to
 # predict forward returns. That test needs a signal-history table, which does
 # not exist yet.
-EXCELLENT_MOVE_PCT = 20.0
-# Tail anchors. -20% scores nothing: a stock whose bad windows run that deep
-# is a different animal from one that dips 5%, even if both travel 20% up.
-# Range observed across live candidates was -23.0% to -5.9%.
+EXCELLENT_MOVE_PCT = 20.0           # travels 20% in 30 sessions = full marks
+# Tail anchors. -20% scores nothing: a stock whose bad windows run that deep is
+# a different animal from one that dips 5%, even if both travel 20% up. Range
+# observed across live candidates was -23.0% to -5.9%.
 WORST_TAIL_PCT = -20.0
-EXCELLENT_TAIL_PCT = -5.0           # a stock that typically travels 20% in 30 sessions
+EXCELLENT_TAIL_PCT = -5.0
 EXCELLENT_UPSIDE_RATE = 65.0        # upside beat downside in ~2 of 3 windows
 NORMAL_VOLUME_RATIO = 1.0           # 1x IS the average -- no credit for it
 EXCELLENT_VOLUME_RATIO = 3.0
@@ -1551,9 +1548,9 @@ def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list
 # =========================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Volatility persistence swing scanner - buys volatile setups and "
-                    "backtests never exiting below a minimum profit floor, extending "
-                    "while the move keeps closing higher."
+        description="Volatility swing scanner - finds stocks that genuinely move, "
+                    "measures how far they travel over a 30-session window in both "
+                    "directions, and ranks them. It does not model an exit."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
