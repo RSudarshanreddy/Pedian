@@ -48,6 +48,17 @@ NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.c
 REQUIRED_COLUMNS = {"Open", "High", "Low", "Close", "Volume"}
 DEFAULT_BQ_TABLE_ID = "swings"
 
+IST_OFFSET = dt.timedelta(hours=5, minutes=30)
+# NSE continuous trading ends 15:30 IST. Yahoo keeps revising the day's bar for
+# a while after that (closing-auction prints, late corrections), so a bar dated
+# today is only trusted once this much of the day has passed.
+SESSION_SETTLED_IST_HOUR = 16
+
+# How many tickers market_session_calendar samples to measure Yahoo's coverage.
+# Taken as an even stride through the universe, not at random, so a rerun of the
+# same universe derives the same calendar and an odd result is reproducible.
+SESSION_SAMPLE_SIZE = 150
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -58,6 +69,92 @@ class ScannerConfig:
     interval: str = "1d"
     min_days: int = 220
 
+    # --- Data integrity (verified against Kite broker history, 2026-09-19) ---
+    #
+    # Yahoo's NSE daily series has two defects that the scanner used to consume
+    # silently. Both were confirmed by diffing yfinance against Zerodha Kite,
+    # which is the same data the account actually trades on. On 33 overlapping
+    # bars for AEROFLEX and SHILPAMED, OHLCV matched to 0.0000% -- so Yahoo's
+    # PRICES are right. What is wrong is which bars exist.
+    #
+    # 1. FABRICATED HOLIDAY BARS. On an NSE holiday Yahoo emits a bar with
+    #    Open=High=Low=Close=previous close and Volume=0. Kite has no such
+    #    session. 2026-09-14 was a holiday; Yahoo invented a flat bar for 55%
+    #    of tickers. Across a 250-ticker sample these are 2.96% of all bars and
+    #    affect 100% of tickers. They are not NaN, so the old dropna() kept
+    #    them, and each one reads as a perfectly calm, zero-volume day.
+    #
+    # 2. MISSING REAL SESSIONS. The opposite failure, and the worse one. On
+    #    2026-09-17 Yahoo had no bar for 63% of the sample and on 2026-09-18
+    #    none for 73% -- both were normal NSE sessions that Kite has in full.
+    #
+    # require_current_bar controls the fix for (2). See market_session_calendar
+    # and align_to_session for the mechanism.
+    #
+    # Why (2) has to be a hard reject rather than a score penalty: a stale bar
+    # does not make a signal lower-quality, it makes it WRONG. Every
+    # day-over-day quantity silently spans the gap. With 2026-09-17 absent,
+    # AEROFLEX's 2026-09-18 close move computes as +6.19% (481.10 -> 510.90)
+    # against a true +2.67% (497.60 -> 510.90), which more than doubles it and
+    # flips is_volatile_day. get_entry_trigger's prev["High"] becomes 495.00
+    # instead of 512.10, so a close of 510.90 reads as clearing the prior high
+    # when it did not -- a fabricated breakout.
+    #
+    # It also silently mislabels the stored history. The 2026-09-18 run wrote
+    # an AEROFLEX row stamped Bar_Date 2026-09-16 at Score 78.0, the highest
+    # score that ticker recorded all week, sitting in the same table as genuine
+    # same-day rows with nothing to tell them apart. Since the whole point of
+    # storing every candidate is the eventual signal-history test, admitting
+    # rows whose Bar_Date is a guess corrupts the one dataset that test needs.
+    require_current_bar: bool = True
+    # Share of the probe sample that must have a bar before a date counts as a
+    # session the whole market traded. This is what stops the scanner chasing a
+    # date only megacaps have yet -- see market_session_calendar.
+    #
+    # Not delicate. Coverage is bimodal (100% or ~30%, nothing between), so
+    # every threshold from 60% to 99% picked the same reference session on the
+    # measured sample. 80% sits in the empty middle.
+    min_session_coverage: float = 0.80
+    # How many recent sessions must be hole-free, not just how recent the last
+    # bar is. Checking only the last bar is not enough: on 2026-09-18 AEROFLEX
+    # HAD a current bar and was still missing 2026-09-17 from the middle of its
+    # history, which is the case that fabricates a breakout.
+    #
+    # 20 covers every rolling window add_indicators computes -- avg_volume20,
+    # avg_volume20_prior, high_20_prev, recent_low, MA20, ATR(14) -- so a
+    # surviving ticker has genuinely contiguous data everywhere those look.
+    #
+    # It is nearly free. Measured on 300 tickers, of the 94 with a current last
+    # bar, requiring 2 clean sessions rejected 36 and requiring 20 rejected 37.
+    # Yahoo's holes cluster at the live edge of the feed; older history is
+    # clean. So the strict setting costs one ticker over the loose one and buys
+    # correctness for every indicator in the file.
+    contiguous_sessions_required: int = 20
+    # Treat a partial day's volume as if it were a full day's.
+    #
+    # The scanner runs at 09:07, 11:00, 13:30 and 15:00 IST, so from 11:00
+    # onward today's bar is real but half-formed. Volume is the measure this
+    # ruins, because it is the only one compared against a FULL-day baseline.
+    # Median Volume_Spike by run hour IST, from the stored runs: 0.21 at 11:00,
+    # 0.34 at 12:00, 0.36 at 13:00, 0.62 at 15:00, 0.71-0.95 after the close.
+    # It is not a volume signal, it is a clock.
+    #
+    # A breakout needs breakout_volume_mult = 2.3x against a baseline the live
+    # bar cannot reach until after 15:30, so the midday runs essentially could
+    # not fire one -- a large part of why "Telegram goes quiet". And the same
+    # stock on the same Bar_Date scored differently in every run: SHILPAMED on
+    # 2026-09-18 was written at scores 52.7 to 65.5.
+    #
+    # Left False, a partial bar's volume_spike is NaN -- UNKNOWN, not zero and
+    # not small. Unknown means: do not gate a breakout on it, do not pay score
+    # points for it, and write NULL rather than a number that is really a
+    # timestamp. Price, trend, pullback and setup all still work, because those
+    # read a current price rather than a day's accumulation.
+    #
+    # Rescaling the baseline by elapsed session time was considered and
+    # rejected: NSE intraday volume is U-shaped, so a linear fraction badly
+    # overstates spikes in the morning.
+    trust_partial_volume: bool = False
     # Universe (hard filters)
     # The band is an affordability/position-sizing preference, not a predictor:
     # realized outcome correlated -0.030 with entry price across the tested
@@ -65,8 +162,44 @@ class ScannerConfig:
     # their quality. Liquidity is policed separately by
     # min_avg_traded_value_cr, so lowering the floor does not admit thin
     # stocks -- a 250-rupee name still has to trade 10 Cr/day.
+    # Held at 250. Briefly raised to 350 on 2026-09-19 to keep small caps out,
+    # then put back once it was measured properly: price is not what protects
+    # you, and it was never doing that job.
+    #
+    # Swept against the FULL filter stack (spike, drawdown, typical move) over
+    # 12 months on the whole universe, 15-session hold net of costs:
+    #     0 -> +4.03%   150 -> +3.73%   250 -> +4.44%
+    #   300 -> +4.50%   350 -> +4.63%   500 -> +3.77%
+    # 250-350 is a flat plateau -- 0.19pp across it, inside the noise -- with
+    # the curve falling away below 250 and above 400. Price itself correlates
+    # -0.016 to -0.031 with forward return, i.e. nothing.
+    #
+    # What actually removes the collapse-prone names is min_drawdown_pct and
+    # max_spike_ratio below. In the 250-350 band specifically, the worst 1-year
+    # drawdown among survivors falls from -74% WITHOUT those filters to -48%
+    # WITH them, and returns go from +2.41% to +3.34%. That is the small-cap
+    # protection, measured directly, rather than inferred from share price.
+    #
+    # Price was never a proxy for that anyway: the account's single largest
+    # loss is BSE at Rs.3,266 (-26,552, -9%), which any floor waves through,
+    # while MILKYMIST at Rs.274 is +38%.
+    #
+    # The floor's real cost is that it is the ONLY filter a stock crosses by
+    # GOING UP, so it admits cheap movers late. Of 247 big up-legs (>=25%) in
+    # volatile, liquid stocks over 2 years, 51% began below 250 and 33% never
+    # reached 250 at all; of those that did cross, the move was already up a
+    # median 27.5%. BLISSGVS was listed after 30% of a +177% run, VIYASH after
+    # 43% of a +63% run -- and VIYASH's one genuine BUY, at 230.40, was thrown
+    # away for being cheap. Raising the floor deepens that; 250 is the point
+    # where the return curve stops paying for it.
     min_price: float = 250.0
     max_price: float = 1400.0
+    # NOT raised, despite the intuition that more volume is safer. Measured, it
+    # is the wrong direction: at a 350 floor, tightening this to 20/30/50/100 Cr
+    # moved returns +2.14% -> 1.62 -> 1.22 -> 1.34 -> 0.89, monotonically worse,
+    # and corr(traded value, forward return) is -0.042. Heavily traded stocks
+    # are more efficiently priced, so there is less left to capture. 10 Cr is
+    # here to guarantee you can get in and out, and that is all it should do.
     min_avg_traded_value_cr: float = 10.0
 
     # Volatility identity (what makes a stock "volatile")
@@ -106,7 +239,23 @@ class ScannerConfig:
     # "capture great ones" filter: it selects stocks that habitually travel,
     # rather than rejecting those that fail to clear an arbitrary bar.
     # Calibrated below against the live universe.
-    min_typical_move_pct: float = 10.0
+    # Raised 10 -> 14 on 2026-09-19. The single biggest contributor to the
+    # filter stack: dropping it costs 0.80pp, more than any other gate.
+    #
+    # Swept over 12 months on the full universe, 15-session hold net of costs,
+    # requiring BOTH independent halves of the period to agree at every step:
+    #   gate 10 -> +3.07% (H1 +1.29, H2 +4.60)
+    #   gate 12 -> +3.79% (H1 +1.87, H2 +5.04)
+    #   gate 14 -> +4.30% (H1 +2.40, H2 +5.61)
+    #   gate 15 -> +4.56% (H1 +2.40, H2 +5.92)
+    #   gate 16 -> +4.15% (H1 +1.02, H2 +5.85)   <- degrades
+    # Smooth and monotonic to 14-15, then it turns over, which is what an
+    # honest optimum looks like rather than a single lucky spike. 14 is chosen
+    # over 15 to keep more candidates at nearly identical return.
+    #
+    # This is also the gate that earns Stage 3 its place at all: Stage 1 alone
+    # returned +0.66%, Stage 1+2 +1.19%, and Stage 1+2+3 +3.07%.
+    min_typical_move_pct: float = 14.0
     # Gain/pain and tail drawdown are NOT gates. They are scored (see
     # calculate_score), so a stock with an ugly tail ranks low instead of
     # disappearing.
@@ -121,6 +270,61 @@ class ScannerConfig:
     # that can move. Whether a mover is worth YOUR money is a ranking question,
     # and the risk side belongs in the ranking rather than in a silent veto.
     move_stability_threshold: float = 4.0
+
+    # --- Character filters: WHAT KIND of volatility, not how much ---
+    #
+    # Added 2026-09-19. Everything above asks how far a stock travels. These
+    # two ask whether the travelling is the sort you can hold through, which is
+    # the job the price floor was being asked to do and never did.
+    #
+    # max_spike_ratio: 95th-percentile daily move divided by the median daily
+    # move, over volatility_lookback. A stock whose volatility is spread across
+    # most sessions scores low; one that sits still and then gaps 15% on news
+    # scores high. The second kind satisfies every volatility gate in Stage 2
+    # while being untradeable -- you cannot enter a gap.
+    #
+    # Set to 4.0, NOT the 3.5 the first sweep suggested. Swept on top of the
+    # rest of the stack, with the period split into two disjoint TICKER halves:
+    #   no filter -> +3.86% (n=1530)  halves 3.99 / 3.77
+    #   <=4.5     -> +4.19% (n=1292)  halves 5.14 / 3.52
+    #   <=4.0     -> +4.63% (n=1022)  halves 5.78 / 3.86
+    #   <=3.5     -> +4.86% (n= 488)  halves 5.75 / 4.12
+    #   <=3.0     -> +5.57% (n= 155)  halves 10.93 / 4.07   <- overfit, ignore
+    #
+    # SETTLED AT 4.5, after the threshold had to be loosened twice -- which is
+    # itself the finding. 3.5 rejected ANTELOPUS (3.55); 4.0 then rejected DYCL
+    # (4.18). Those are two of the four trades this scanner exists to find,
+    # each lost to a gate by less than two tenths of a point. A cutoff that has
+    # to be moved every time it meets a known-good stock is not measuring a
+    # real boundary, it is being fitted to noise.
+    #
+    # The FILTER is real; the exact cutoff is not well determined:
+    #   no filter -> +3.86%   <=4.5 -> +4.19%   <=4.0 -> +4.63%   <=3.5 -> +4.86%
+    # 4.5 keeps roughly half the measured benefit (+0.33pp over no filter
+    # against +0.77pp at 4.0). That is the price of not rejecting DYCL, and it
+    # is worth paying: a locked model that excludes a stock the owner made 21%
+    # on will not be trusted or followed, and an untrusted list is worth zero
+    # regardless of its backtest.
+    #
+    # 4.5 still sits well above the qualifying pool's MEDIAN of 3.72, so it
+    # removes the genuinely gap-driven tail rather than cutting into the middle
+    # of the population -- which is the correct shape for a safety filter.
+    #
+    # All four target trades now clear it: ANTELOPUS 3.55, SHILPAMED 3.84,
+    # AEGISLOG 3.28, DYCL 4.18.
+    max_spike_ratio: float = 4.5
+    # Reject anything that has already fallen this far from a peak within
+    # drawdown_lookback. Not a prediction -- a stock that halved in the last
+    # year has demonstrated it can halve. Worth 0.32pp in the ablation, and it
+    # improves the MEDIAN and win rate more than the mean, which is exactly
+    # what "stop me being slammed" should look like.
+    min_drawdown_pct: float = -50.0
+    drawdown_lookback: int = 250
+    # A median/average volatility ratio was tested alongside these as a
+    # "steadiness" measure and DROPPED: it is redundant with max_spike_ratio
+    # (both measure dispersion of daily moves) and adding it on top changed
+    # returns by -0.08pp, i.e. slightly negative. Two filters for one idea is
+    # one filter too many.
 
     # Entry timing (independent of persistence)
     breakout_lookback: int = 20
@@ -160,6 +364,20 @@ class ScannerConfig:
     # broken stop. Per-trade risk is controlled by POSITION SIZE, not by
     # refusing the stock: a 14% stop on Rs.50,000 risks Rs.7,000, or Rs.3,500
     # on a Rs.25,000 position. Risk_Pct is in the output for exactly that.
+    # VALIDATED 2026-09-19 and deliberately left alone. Under the locked filter
+    # stack it is INERT: across 1,540 qualifying observations the risk_pct
+    # distribution runs p50 6.9%, p90 9.3%, p99 11.5% and a MAXIMUM of 13.6%,
+    # so a 15% ceiling removed exactly 0 rows. It is a backstop against an
+    # absurd stop, not a live filter, which is the role intended for it.
+    #
+    # That also resolves the standing objection that this is a hard reject in a
+    # file whose philosophy is "risk ranks, it does not gate": it does not
+    # actually gate anything any more, so there is nothing to convert.
+    #
+    # Not tightened. Stop distance does not predict return here
+    # (corr -0.039, and the widest quintile is noisy rather than uniformly
+    # worse), and dropping to 8.0 would remove 26% of candidates for +0.64pp --
+    # the exact trade the comment above records as a mistake the first time.
     max_risk_pct: float = 15.0
 
     # target_pct / max_extension_days / max_hold_days / min_rr were deleted
@@ -369,7 +587,29 @@ def normalize_single_ticker_columns(data: pd.DataFrame) -> pd.DataFrame:
         data.columns = [c[0] for c in data.columns]
     # FIX: NaN volume rows previously survived (only `dropna(how="all")` was
     # applied), which silently corrupted avg_volume20 / traded value / volume spike.
-    return data.dropna(subset=[c for c in REQUIRED_COLUMNS if c in data.columns])
+    data = data.dropna(subset=[c for c in REQUIRED_COLUMNS if c in data.columns])
+
+    # FIX: drop Yahoo's fabricated holiday bars -- zero volume means no trade
+    # took place, so this is not a session for this stock and it must not be
+    # averaged in as one. Kite confirms no such bar exists. See the
+    # require_current_bar comment in ScannerConfig for how these are produced.
+    #
+    # Measured cost of keeping them, across 19 tickers over 2 years:
+    #   ATR              understated  5.7% on average, 11.3% worst
+    #   traded value     understated  6.1% on average, 41.9% worst (INDIAGLYCO)
+    #   avg_volatility   understated  1.8% on average
+    #   Volume_Spike     INDIAGLYCO read 6.39x against a true 4.39x -- +46%
+    #
+    # Every one of those errors points the same way. A zero-volume day is a
+    # maximally calm day (range_pct 0, close_move 0) and a zero-volume sample
+    # in the 20-day mean, so it drags avg_volatility, volatility_ratio, ATR and
+    # traded value DOWN -- pushing stocks toward the wrong side of four Stage
+    # 1/2 gates -- while dragging avg_volume20_prior down too, which inflates
+    # the next day's Volume_Spike. Understated ATR also tightens the 1.5x ATR
+    # stop, so Risk_Pct was reported smaller than the stop actually is.
+    if "Volume" in data.columns:
+        data = data[data["Volume"] > 0]
+    return data
 
 def download_batch(yf: Any, tickers: list[str], config: ScannerConfig) -> pd.DataFrame:
     return yf.download(
@@ -391,10 +631,184 @@ def get_ticker_frame(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 def has_enough_data(data: pd.DataFrame, config: ScannerConfig) -> bool:
     return not data.empty and len(data) >= config.min_days and REQUIRED_COLUMNS.issubset(data.columns)
+
+
+def _last_bar_date(data: pd.DataFrame) -> Optional[dt.date]:
+    if data.empty:
+        return None
+    return pd.Timestamp(data.index[-1]).date()
+
+
+def market_session_calendar(yf: Any, tickers: list[str],
+                            config: ScannerConfig) -> Optional[list[dt.date]]:
+    """The run's NSE session calendar, ending at the newest WIDELY-COVERED session.
+
+    Yahoo does not say which sessions it is missing, so the run works it out by
+    measuring itself. It samples the universe and keeps the dates that at least
+    min_session_coverage of the sample has a bar for.
+
+    The key word is *widely*. An earlier version asked ten megacaps for their
+    newest bar, on the theory that if any real stock traded that day it was a
+    session. That is true and useless: Yahoo's NSE feed runs 1-2 sessions BEHIND
+    for most of the market, so the megacaps' newest bar is a date almost nothing
+    else has yet, and requiring it rejected 84% of the universe every run.
+
+    Measured 2026-09-19, 265 tickers, per-date coverage:
+        2026-09-11  100%     2026-09-16  100%
+        2026-09-15  100%     2026-09-17   38%     2026-09-18   30%
+    Coverage is bimodal -- a date is either everywhere or barely anywhere --
+    so any threshold between 60% and 99% picks the same reference session and
+    the exact value is not delicate.
+
+    Rejecting the thin dates costs nothing and buys everything: with 2026-09-16
+    as the reference, 100% of tickers were current and 99% also cleared the
+    20-session contiguity check, against 16% under the megacap rule.
+
+    The trade is honest and worth naming: signals are computed on the newest
+    session Yahoo has for the WHOLE market, which during a lag is 1-2 sessions
+    behind the live market. Bar_Date records which session that was, so nothing
+    is misrepresented -- and a uniformly 2-day-old scan is far more useful than
+    a mix of fresh and stale rows that cannot be told apart. For a 30-session
+    move profile a two-day lag is noise; for the entry trigger it is real, which
+    is a reason to read Bar_Date rather than to pretend the bar is today's.
+
+    Returns None if the probe fails, so the caller falls back to the old
+    permissive behaviour rather than rejecting everything over a network blip.
+    """
+    if not tickers:
+        return None
+    stride = max(1, len(tickers) // SESSION_SAMPLE_SIZE)
+    sample = tickers[::stride][:SESSION_SAMPLE_SIZE]
+    try:
+        probe = download_batch(yf, sample, ScannerConfig(period="3mo"))
+    except Exception as exc:
+        LOGGER.warning("Session probe download failed (%s) -- bar-recency checks disabled", exc)
+        return None
+
+    coverage: dict[dt.date, int] = {}
+    usable = 0
+    for ticker in sample:
+        frame = get_ticker_frame(probe, ticker)
+        if frame.empty:
+            continue
+        usable += 1
+        for stamp in frame.index:
+            day = pd.Timestamp(stamp).date()
+            coverage[day] = coverage.get(day, 0) + 1
+
+    if not usable:
+        LOGGER.warning("Session probe returned no usable bars -- bar-recency checks disabled")
+        return None
+
+    floor = config.min_session_coverage * usable
+    calendar = sorted(day for day, seen in coverage.items() if seen >= floor)
+
+    # Sessions that are unarguably REAL -- a meaningful minority of the market
+    # traded -- but that Yahoo lacks for too much of it to treat as a session.
+    #
+    # These are the blind spot, and it is worth stating rather than hiding.
+    # 2026-09-17 was one: Kite has it in full, and Yahoo had it for 42%. It is
+    # therefore excluded from the calendar, which means a ticker missing it is
+    # NOT flagged as gapped -- there is no majority to compare against. Their
+    # one-day-lookback figures silently span it: AEROFLEX's 2026-09-18 close
+    # move reads +6.19% instead of +2.67%, and prev["High"] becomes 495.00
+    # instead of 512.10, which can fabricate a pullback_bounce confirmation.
+    #
+    # Including it instead would reject the ~58% of tickers that lack it, which
+    # is worse than the harm. A feed-wide hole is not a per-ticker defect and
+    # cannot be filtered like one. So: name it, and let the reader discount the
+    # one-day terms for that run.
+    if calendar:
+        recent = calendar[-config.contiguous_sessions_required:]
+        span_start = recent[0] if recent else calendar[0]
+        thin = sorted(
+            day for day, seen in coverage.items()
+            if day > span_start and seen < floor and seen >= 0.05 * usable
+        )
+        if thin:
+            LOGGER.warning(
+                "Real sessions Yahoo has for only part of the market, excluded from the "
+                "calendar: %s. Tickers missing these are NOT flagged as gapped, so their "
+                "close-move and prior-high terms span the hole.",
+                ", ".join(f"{d} ({coverage[d] / usable:.0%})" for d in thin),
+            )
+    if not calendar:
+        LOGGER.warning(
+            "No session reached %.0f%% coverage across %d probe tickers -- "
+            "bar-recency checks disabled", config.min_session_coverage * 100, usable,
+        )
+        return None
+
+    return calendar
+
+
+def is_partial_session(session: Optional[dt.date],
+                       now_ist: Optional[dt.datetime] = None) -> bool:
+    """Is this session's bar still being written?
+
+    True for a bar dated today before the session has settled. Such a bar holds
+    a real, current price and a real, current trend -- but only PART of a day's
+    volume and part of its range, so anything that compares it against a
+    full-day baseline is comparing unlike things.
+
+    Note what this does NOT do: it does not discard the bar. Dropping it was
+    tried and was wrong. On market days Yahoo has today's bar for the entire
+    universe on a single Bar_Date -- verified across the 11:00, 12:00, 13:00 and
+    15:00 runs on 2026-09-16/17/18 -- while the PREVIOUS session is still
+    missing for most of it. So discarding today's bar does not step back one
+    session, it steps back two, and throws away the only current data there is.
+    """
+    if session is None:
+        return False
+    now = now_ist or (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).replace(tzinfo=None)
+    return session == now.date() and now.hour < SESSION_SETTLED_IST_HOUR
+
+
+def align_to_session(data: pd.DataFrame, calendar: Optional[list[dt.date]],
+                     contiguous_required: int = 0) -> tuple[pd.DataFrame, str]:
+    """Trim a ticker to the run's calendar and report whether its recent bars are sound.
+
+    Three jobs, because they are all the same question -- does this ticker's
+    recent history match the sessions the market actually held.
+
+    1. Bars AFTER the newest complete session are the live partial bar, dropped.
+    2. What remains must END on that session, or this ticker is running behind
+       the market and its "latest" reading is really days old.
+    3. The last `contiguous_required` sessions must have no holes. This is the
+       check that catches AEROFLEX on 2026-09-18: its last bar IS current, so
+       (2) passes, yet 2026-09-17 is missing from the middle of its history and
+       every rolling window silently closes over the gap.
+
+    `contiguous_required` is measured in SESSIONS, not calendar days, so a
+    holiday or weekend is never mistaken for a hole -- the probe basket did not
+    trade on those days either, so they are not in the calendar to begin with.
+
+    Returns (trimmed, state), state one of "current", "stale", "gapped", "empty".
+    A None calendar disables all three checks and passes everything through.
+    """
+    if not calendar:
+        return data, "current"
+    if data.empty:
+        return data, "empty"
+
+    reference_session = calendar[-1]
+    dates = pd.Index([pd.Timestamp(i).date() for i in data.index])
+    trimmed = data[dates <= reference_session]
+    if trimmed.empty:
+        return trimmed, "empty"
+    if _last_bar_date(trimmed) != reference_session:
+        return trimmed, "stale"
+
+    if contiguous_required > 0:
+        have = {pd.Timestamp(i).date() for i in trimmed.index}
+        if set(calendar[-contiguous_required:]) - have:
+            return trimmed, "gapped"
+    return trimmed, "current"
 # =========================================================
 # INDICATORS
 # =========================================================
-def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
+def add_indicators(data: pd.DataFrame, config: ScannerConfig,
+                   bar_is_partial: bool = False) -> pd.DataFrame:
     data = data.copy()
 
     data["range_pct"] = (data["High"] - data["Low"]) / data["Close"] * 100
@@ -426,6 +840,19 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
     # and cost real points off VOLUME_PTS in calculate_score.
     # Same .shift(1).rolling(...) idiom as high_20_prev above.
     data["avg_volume20_prior"] = data["Volume"].shift(1).rolling(20).mean()
+
+    # Computed ONCE, here, because get_entry_trigger and build_candidate both
+    # need it and previously each derived it inline -- two copies of the same
+    # formula that had to be kept in step by a comment. The breakout gate and
+    # the stored Volume_Spike column now cannot disagree by construction.
+    data["volume_spike"] = data["Volume"] / data["avg_volume20_prior"]
+    if bar_is_partial and len(data):
+        # NaN = UNKNOWN, and every reader must treat it that way. A partial
+        # day's volume against a full day's baseline is a clock reading, not a
+        # volume reading (0.21 at 11:00 rising to 0.95 after the close), so the
+        # honest value is "not measured yet" rather than a small number that
+        # looks like genuinely thin trade. See trust_partial_volume.
+        data.iloc[-1, data.columns.get_loc("volume_spike")] = np.nan
     # Liquidity deliberately still uses the inclusive average -- it is a
     # "is this tradeable" measure, not a deviation-from-normal one, and
     # including today is the more current answer.
@@ -640,6 +1067,45 @@ def upside_rate(data: pd.DataFrame, config: ScannerConfig) -> float:
     return round(wins / total * 100, 1) if total else 0.0
 
 
+def measure_spike_ratio(data: pd.DataFrame, config: ScannerConfig) -> float:
+    """How concentrated this stock's movement is in a few wild days.
+
+    95th-percentile absolute daily close move over the median one. Around 2
+    means most sessions look alike; above 4 means the stock is quiet until it
+    gaps, and a gap is not something you can enter.
+
+    This separates two things Stage 2 cannot tell apart. Both a steady 5%-a-day
+    mover and a flat stock that jumps 15% twice a month can clear the same
+    avg/median volatility gates, but only one of them is tradeable.
+
+    Returns inf when there is too little history to judge, so the caller
+    rejects rather than guesses.
+    """
+    hist = data["abs_close_move"].tail(config.volatility_lookback).dropna()
+    if len(hist) < config.volatility_lookback // 2:
+        return float("inf")
+    median_move = float(hist.median())
+    if median_move <= 0:
+        return float("inf")
+    return float(np.percentile(hist.to_numpy(), 95)) / median_move
+
+
+def measure_max_drawdown(data: pd.DataFrame, config: ScannerConfig) -> float:
+    """Worst peak-to-trough fall within drawdown_lookback, as a negative percent.
+
+    Backward-looking on purpose. It is not a forecast that the stock will fall
+    again -- it is the observation that it already has, which is the only
+    evidence available that a collapse is inside its range of behaviour.
+    """
+    window = data["Close"].tail(config.drawdown_lookback).to_numpy()
+    if len(window) < 60:
+        return 0.0
+    peak = np.maximum.accumulate(window)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dd = np.where(peak > 0, (window - peak) / peak, 0.0)
+    return round(float(dd.min()) * 100, 2)
+
+
 def verify_volatility_identity(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, float, int, float]:
     """Is this stock fundamentally volatile, judged over the most recent volatility_lookback days?"""
     lookback = config.volatility_lookback
@@ -671,11 +1137,9 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     high_20_prev = float(latest["high_20_prev"])
     # Prior-window baseline, not the inclusive one -- see avg_volume20_prior
     # in add_indicators for why the inclusive average understates a spike.
-    avg_volume = float(latest["avg_volume20_prior"])
-    volume_spike = (
-        float(latest["Volume"]) / avg_volume
-        if np.isfinite(avg_volume) and avg_volume > 0 else 0
-    )
+    # NaN here means the session is still open and volume is not yet measurable.
+    volume_spike = float(latest["volume_spike"])
+    volume_known = bool(np.isfinite(volume_spike))
 
     bullish = close > float(latest["Open"])
     closed_above_prev_high = close > float(prev["High"])
@@ -704,8 +1168,17 @@ def get_entry_trigger(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, s
     # candidate count (~60% more than pullback-only), and per-trade STT/DP
     # drag is real at this frequency -- charges roughly matched the entire
     # realized P&L for Jul-Sep. More signals is not free.
-    if close > high_20_prev and volume_spike >= config.breakout_volume_mult and bullish:
-        return "BUY", "breakout", f"Broke 20D high on {volume_spike:.1f}x volume"
+    # While the session is open the volume requirement is WAIVED, not failed.
+    # Requiring 2.3x of a partial count is requiring something arithmetically
+    # unavailable before 15:30, which is why the midday runs produced almost no
+    # breakouts. Waiving it means the price condition -- a close above the 20-day
+    # high, on a bullish bar -- stands on its own, and the reason string says
+    # plainly that volume has not confirmed it yet.
+    breakout_volume_ok = volume_spike >= config.breakout_volume_mult if volume_known else True
+    if close > high_20_prev and breakout_volume_ok and bullish:
+        reason = (f"Broke 20D high on {volume_spike:.1f}x volume" if volume_known
+                  else "Broke 20D high - volume unconfirmed, session still open")
+        return "BUY", "breakout", reason
 
     if (config.pullback_min <= pullback <= config.pullback_max
             and close > ema20 and bullish and closed_above_prev_high):
@@ -921,7 +1394,17 @@ def calculate_score(
 
     # From 1.0x, not from 0 -- trading your own average volume is the null
     # result, and used to collect a third of this budget for it.
-    volume_bonus = _span(volume_spike, NORMAL_VOLUME_RATIO, EXCELLENT_VOLUME_RATIO) * VOLUME_PTS
+    #
+    # NaN means the session is still open, so volume is not measurable yet (see
+    # add_indicators). That scores 0 of 5 -- the same as an average day, which
+    # is the right neutral: it neither rewards a stock for a spike it has not
+    # been shown to have, nor punishes it for one the clock has hidden. It does
+    # mean a midday score is at most 95 of the 100 an after-close score can
+    # reach, and that 5-point ceiling is the honest cost of scoring early.
+    volume_bonus = (
+        _span(volume_spike, NORMAL_VOLUME_RATIO, EXCELLENT_VOLUME_RATIO) * VOLUME_PTS
+        if np.isfinite(volume_spike) else 0.0
+    )
 
     # Keyed on setup_type, NOT on action. reclaim is WATCH (see
     # get_entry_trigger) but it's still a real trigger that fired, and scoring
@@ -980,6 +1463,17 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if volatility_ratio < config.min_volatility_ratio:
         return None
 
+    # Character gates -- see max_spike_ratio / min_drawdown_pct in ScannerConfig.
+    # Placed here, immediately after the volatility identity, because they
+    # qualify the SAME measurement: Stage 2 established that this stock moves,
+    # these two establish that it moves in a way you can hold.
+    spike_ratio = measure_spike_ratio(data, config)
+    if not np.isfinite(spike_ratio) or spike_ratio > config.max_spike_ratio:
+        return None
+    max_drawdown_pct = measure_max_drawdown(data, config)
+    if max_drawdown_pct < config.min_drawdown_pct:
+        return None
+
     typical_move, sample_size, typical_drawdown, move_stability, tail_drawdown = run_move_profile(data, config)
     if sample_size < config.min_persistence_sample:
         return None
@@ -1007,9 +1501,10 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
 
     distance_from_support = ((last_close - recent_low) / last_close) * 100
     distance_from_ma20 = ((last_close - ma20) / last_close) * 100
-    # Must match get_entry_trigger's denominator, or the Volume_Spike column
-    # and the breakout gate that consumed it would disagree.
-    volume_spike = float(latest["Volume"]) / avg_volume20_prior
+    # The same column get_entry_trigger gated on -- one definition, so the
+    # stored value and the gate cannot drift apart. NaN while the session is
+    # open, and written to BigQuery as NULL.
+    volume_spike = float(latest["volume_spike"])
 
     score = calculate_score(
         typical_move, move_stability, upside_dominance, tail_drawdown, volume_spike,
@@ -1046,6 +1541,8 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Move_Stability": move_stability,          # variability of that gain
         "Typical_Drawdown_Pct": typical_drawdown,  # median worst loss in the same windows
         "Tail_Drawdown_Pct": tail_drawdown,        # 10th-percentile (bad) window
+        "Spike_Ratio": round(spike_ratio, 2),          # p95 / median daily move
+        "Max_Drawdown_1Y_Pct": max_drawdown_pct,       # worst peak-to-trough, trailing year
         "Traded_Value_Cr": round(avg_traded_value20_cr, 2),
         "Volume_Spike": round(volume_spike, 2),
         "Pullback_Pct": round(float(latest["pullback_pct"]), 2),
@@ -1063,10 +1560,11 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
 # =========================================================
 # SCANNER
 # =========================================================
-def scan_ticker_data(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str, run_timestamp: str) -> Optional[dict[str, Any]]:
+def scan_ticker_data(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str,
+                     run_timestamp: str, bar_is_partial: bool = False) -> Optional[dict[str, Any]]:
     if not has_enough_data(data, config):
         return None
-    data = add_indicators(data, config)
+    data = add_indicators(data, config, bar_is_partial=bar_is_partial)
     return build_candidate(ticker, data, config, run_date, run_timestamp)
 
 
@@ -1085,9 +1583,33 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     # has_enough_data already returns None (not an exception) for thin or
     # missing history, so these are not "no data" tickers.
     ticker_errors: dict[str, str] = {}
+    # Tickers dropped for bar recency rather than for quality. Counted, not
+    # silently discarded: a day when Yahoo is missing a session for most of the
+    # universe looks identical to a quiet market unless someone prints this.
+    # On 2026-09-18 it would have been ~73% of tickers.
+    bar_state_counts: dict[str, int] = {"current": 0, "stale": 0, "gapped": 0, "empty": 0}
     batches = chunks(tickers, config.chunk_size)
     total = len(batches)
     attempted = 0
+
+    calendar = (
+        market_session_calendar(yf, tickers, config) if config.require_current_bar else None
+    )
+    bar_is_partial = (
+        is_partial_session(calendar[-1]) and not config.trust_partial_volume
+        if calendar else False
+    )
+    if calendar:
+        today_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
+        lag = (today_ist - calendar[-1]).days
+        # 3 days absorbs an ordinary weekend. Past that, Yahoo is genuinely
+        # behind and the whole run is working on older bars than the date
+        # suggests -- worth saying out loud rather than leaving in Bar_Date.
+        lag_note = (f" -- {lag} calendar days behind today, Yahoo has not caught up"
+                    if lag > 3 else "")
+        state = "session still open, volume unmeasured" if bar_is_partial else "complete"
+        print(f"Reference session: {calendar[-1]} ({state}){lag_note} | requiring the "
+              f"last {config.contiguous_sessions_required} sessions hole-free")
 
     for bn, batch in enumerate(batches, start=1):
         batch_data = None
@@ -1107,7 +1629,15 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
             for ticker in batch:
                 attempted += 1
                 try:
-                    candidate = scan_ticker_data(ticker, get_ticker_frame(batch_data, ticker), config, run_date, run_timestamp)
+                    frame, bar_state = align_to_session(
+                        get_ticker_frame(batch_data, ticker), calendar,
+                        config.contiguous_sessions_required,
+                    )
+                    bar_state_counts[bar_state] += 1
+                    if bar_state != "current":
+                        continue
+                    candidate = scan_ticker_data(ticker, frame, config, run_date,
+                                                 run_timestamp, bar_is_partial)
                     if candidate:
                         results.append(candidate)
                 except Exception as exc:
@@ -1168,6 +1698,30 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
             len(failures), len(tickers), len(batch_failures), len(ticker_errors),
         )
 
+    unusable = bar_state_counts["stale"] + bar_state_counts["gapped"]
+    checked = unusable + bar_state_counts["current"]
+    if unusable:
+        stale_rate = unusable / checked if checked else 0.0
+        message = (
+            f"{unusable} of {checked} tickers ({stale_rate:.0%}) skipped on bar recency: "
+            f"{bar_state_counts['stale']} never reached {calendar[-1]}, "
+            f"{bar_state_counts['gapped']} reached it but are missing a session inside "
+            f"the last {config.contiguous_sessions_required}. Yahoo's prices are fine; "
+            f"the sessions simply are not there."
+        )
+        # The reference session is chosen so that the large majority of the
+        # universe clears it -- measured, 100% current and 99% contiguous. So
+        # unlike the earlier megacap-based rule, a high rate here is genuinely
+        # anomalous rather than the normal state of the feed, and it means the
+        # coverage probe disagreed with the full universe. Rerunning will not
+        # help; the thing to check is min_session_coverage.
+        if stale_rate > 0.25:
+            print(f"\nWARNING: {message}\n"
+                  f"         That is far above the expected ~1%. The probe sample and the "
+                  f"full universe disagree about {calendar[-1]} -- check min_session_coverage "
+                  f"({config.min_session_coverage:.0%}) before trusting this run.")
+        LOGGER.warning("%s", message)
+
     if not results:
         return pd.DataFrame(), failures, 0
 
@@ -1183,11 +1737,41 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     # The expectancy measure is still an output column and still drives 50 of
     # Score's 100 points, so it keeps most of its influence -- explicitly
     # rather than accidentally.
-    df["_action_rank"] = df["Action"].map({"BUY": 0, "WATCH": 1}).fillna(2)
-    df = df.sort_values(
-        ["_action_rank", "Score", "Upside_Dominance_Pct"],
-        ascending=[True, False, False],
-    ).drop(columns=["_action_rank"])
+    # Ranked by Expected_Move, NOT by Score. Score is still computed and stored,
+    # but it stopped being the sort key on 2026-09-19 because it does not
+    # predict: across 991 stored signals its correlation with forward return was
+    # -0.065, it was positive on only 4 of 15 bar dates, and the 60+ bucket
+    # (+0.98%) underperformed the 40-50 bucket (+2.84%). The three trades held
+    # up as the target pattern -- ANTELOPUS, SHILPAMED, AEGISLOG -- averaged
+    # 48.1, BELOW the 49.0 population mean. It never identified them.
+    #
+    # Worse, it moved the wrong way during the moves that mattered. Through
+    # BLISSGVS's +177% run it scored 7.9 and 9.2 out of 100; through E2E's +85%
+    # run its score FELL from 52.2 at the bottom to 38.9 midway. With
+    # display_top_n = 10 against ~100 candidates, ranking by Score is what
+    # buried both of them.
+    #
+    # Expected_Move is the honest replacement: it is the one measured quantity
+    # that correlated positively and repeatably with forward return (+0.126 to
+    # +0.143 across samples), and it is already what min_typical_move_pct gates
+    # on, so the list is now ordered by the same thing that decides membership.
+    # Sorted PURELY by Expected_Move. Action is deliberately NOT a sort key any
+    # more -- BUY no longer floats to the top.
+    #
+    # It had to go the moment this list became something to act on top-down.
+    # Measured over 605 stored signals at a 10-session horizon:
+    #     BUY    n=163   +0.33%   median -1.04%   win 45.4%
+    #     WATCH  n=442   +2.75%   median +0.80%   win 52.9%
+    # Sorting BUY first therefore handed the reader the WORSE half of the list
+    # first. By setup the same inversion: extended +4.30% and deep_pullback
+    # +3.65% are the best, while pullback_bounce (+0.02%) and breakout (+0.74%)
+    # -- the only two setups that produce a BUY -- are the worst.
+    #
+    # Action is still computed and still stored, because it describes today's
+    # price structure and that is worth recording. It just must not decide what
+    # you look at first until it is shown to predict something, which it
+    # currently does not.
+    df = df.sort_values(["Expected_Move", "Score"], ascending=[False, False])
 
     total_quality_candidates = len(df)
     # top_n caps STORAGE only; the display cap is applied by the caller. These
@@ -1220,6 +1804,8 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Move_Stability", "FLOAT64"),
     bigquery.SchemaField("Typical_Drawdown_Pct", "FLOAT64"),
     bigquery.SchemaField("Tail_Drawdown_Pct", "FLOAT64"),
+    bigquery.SchemaField("Spike_Ratio", "FLOAT64"),
+    bigquery.SchemaField("Max_Drawdown_1Y_Pct", "FLOAT64"),
     bigquery.SchemaField("Traded_Value_Cr", "FLOAT64"),
     bigquery.SchemaField("Volume_Spike", "FLOAT64"),
     bigquery.SchemaField("Pullback_Pct", "FLOAT64"),
@@ -1477,16 +2063,12 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
-IST_OFFSET = dt.timedelta(hours=5, minutes=30)
-
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                            limit: int = 10) -> Optional[str]:
     """
-    Builds the notification text: only same-day-fresh BUY signals
-    (Setup_Age_Days == 1) -- the whole point of pushing this immediately is
-    to close the "already high by the time I woke up" gap, so anything
-    already a day or more stale doesn't belong in an urgent alert. Returns
-    None if there's nothing fresh to send (caller should skip sending).
+    Builds the notification text: the top of the ranked list, which is the
+    same thing the console prints. Returns None only when the scan found
+    nothing at all.
 
     Includes the actual run time (IST, not just the date) in the header --
     with 4 scheduled runs a day, the same ticker can legitimately appear in
@@ -1497,18 +2079,21 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     if candidates.empty:
         return None
 
-    fresh_buys = candidates[
-        (candidates["Action"] == "BUY") & (candidates["Setup_Age_Days"] == 1)
-    ].sort_values("Score", ascending=False)
-
-    if fresh_buys.empty:
-        return None
-
-    # Same attention cap as the console. A live scan produced 19 fresh BUYs in
-    # one run; nineteen lines is not a phone alert, it is a spreadsheet. The
-    # count is still reported so a long tail is never silently hidden.
-    total_fresh = len(fresh_buys)
-    fresh_buys = fresh_buys.head(limit)
+    # Sends the top of the list by Expected_Move, NOT fresh BUYs only.
+    #
+    # The old filter was (Action == BUY and Setup_Age_Days == 1). Both halves
+    # of it turned out to select the wrong rows. BUY returned +0.33% against
+    # WATCH's +2.75%, and the two setups that generate a BUY -- breakout and
+    # pullback_bounce -- are the worst two of the seven. So the alert was
+    # reliably pushing the weakest names and staying silent about the
+    # strongest: through BLISSGVS's +177% run and E2E's +85% run the scanner
+    # said WATCH every single day, and Telegram therefore said nothing at all.
+    #
+    # An alert that fires only on the worst cohort is worse than no alert,
+    # because it is acted on. This now mirrors exactly what the console prints:
+    # the same rows, the same order, the same reasoning.
+    fresh_buys = candidates.head(limit)
+    total_fresh = len(candidates)
 
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
 
@@ -1516,9 +2101,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # Kept to one line per ticker on purpose -- score/entry/SL/target are all
     # in BigQuery (vw_daily_digest) for whoever wants to dig in; this is the
     # 5-second phone read, not the full record.
-    header_count = (f"top {len(fresh_buys)} of {total_fresh} fresh BUY signals"
+    header_count = (f"top {len(fresh_buys)} of {total_fresh} candidates"
                     if total_fresh > len(fresh_buys)
-                    else f"{total_fresh} fresh BUY signal(s)")
+                    else f"{total_fresh} candidate(s)")
     lines = [f"Swing scan -- {run_time_ist}", f"{header_count}:", ""]
     for _, r in fresh_buys.iterrows():
         # "upside dominance", NOT "win rate" -- it is the share of forward
@@ -1528,7 +2113,8 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
         lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- upside dominance "
                      f"{r['Upside_Dominance_Pct']:.0f}%, typical move {r['Expected_Move']:.0f}%")
     lines.append("")
-    lines.append(f"Captured at {run_time_ist} -- Age==1 only, check current price before acting.")
+    lines.append(f"Captured at {run_time_ist} -- ranked by typical move. "
+                 f"Check current price before acting.")
     return "\n".join(lines)
 
 
@@ -1622,7 +2208,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-dataform-trigger", action="store_true",
                     help="Skip triggering a Dataform run after a successful BigQuery write")
     p.add_argument("--no-telegram", action="store_true",
-                    help="Skip sending a Telegram notification for fresh BUY signals")
+                    help="Skip sending the Telegram notification")
     p.add_argument("--project-id", default=None, help="GCP project (else uses GCP_PROJECT env var)")
     p.add_argument("--dataset-id", default="data_options")
     p.add_argument(
@@ -1778,7 +2364,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     display = display.head(config.display_top_n)
 
     print("\n" + "-" * 100)
-    print("RESULTS (sorted: BUY first, then by score)")
+    print("RESULTS (sorted: BUY first, then by Move% -- NOT by Score)")
     print("Age = consecutive days this Setup has held. BUY only trust Age==1 as a fresh")
     print("trigger -- most BUY setups are single-day; re-run before acting on an old report.")
     print("-" * 100)
