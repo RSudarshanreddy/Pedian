@@ -1,6 +1,8 @@
 # Dependencies for the Cloud Run / Cloud Functions deployment.
 functions-framework>=3.8,<4
 google-cloud-bigquery>=3.38
+# Required by forward_test.py: BigQuery -> pandas needs db-dtypes to map DATE columns.
+db-dtypes>=1.3
 numpy>=2.0
 pandas>=2.2
 pyarrow>=18
