@@ -2364,9 +2364,14 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     display = display.head(config.display_top_n)
 
     print("\n" + "-" * 100)
-    print("RESULTS (sorted: BUY first, then by Move% -- NOT by Score)")
-    print("Age = consecutive days this Setup has held. BUY only trust Age==1 as a fresh")
-    print("trigger -- most BUY setups are single-day; re-run before acting on an old report.")
+    # This label must keep matching the sort in scan_tickers. It has been wrong
+    # twice: it claimed "by score" after Score stopped being the key, then
+    # "BUY first" after Action stopped being one. A header that describes a
+    # different ordering than the rows below it is worse than no header, because
+    # it is believed.
+    print("RESULTS (ranked by Move% -- typical 30-session gain. Not by Score, not by Action)")
+    print("Age = consecutive days this Setup has held. Action/Setup describe today's price")
+    print("structure; they do NOT order the list and BUY has not been shown to beat WATCH.")
     print("-" * 100)
     header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
               f"{'Upside%':>9} {'Stabil':>7} {'Move%':>8} {'TailDD':>8} {'RR':>5} "
@@ -2385,7 +2390,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         print(f"\nSaved {len(candidates)} rows to {output_path}")
 
     if shown > len(display):
-        print(f"\nShowing the top {len(display)} of {shown} by score. "
+        print(f"\nShowing the top {len(display)} of {shown} by Move%. "
               f"All {len(candidates)} are written to BigQuery -- raise --display-top-n to see more.")
     else:
         print(f"\nTotal quality candidates: {total_quality}")
@@ -2402,7 +2407,11 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             else:
                 digest_text = format_telegram_digest(candidates, run_date, config.display_top_n)
                 if digest_text is None:
-                    print("\nNo fresh (Age==1) BUY signals -- Telegram notification skipped.")
+                    # Only reachable when the scan found nothing at all. It used
+                    # to say "no fresh Age==1 BUY signals", which stopped being
+                    # true when the digest switched to sending the top of the
+                    # ranked list rather than fresh BUYs.
+                    print("\nNo candidates -- Telegram notification skipped.")
                 else:
                     chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
                     # NOT `failures` -- that name already holds the failed
