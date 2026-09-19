@@ -1,0 +1,1218 @@
+"""
+POSITION MOMENTUM CHECK
+=======================
+Separate from swings.py on purpose -- this checks REAL holdings (your actual
+entry price/date from data_options.holdings) against the same floor+extension
+exit rule the scanner is built on, not scanner candidates. Different concern,
+different lifecycle: swings.py finds new trades; this tracks whether trades
+you're already in are still worth holding.
+
+Answers the question asked by hand, over and over, for BALUFORGE/HEG/DYCL
+this session: is this position still in its momentum window (worth keeping
+capital in), or did it already hit the rule's real exit trigger?
+
+Usage:
+    python position_check.py                    # check all active holdings
+    python position_check.py --project-id XYZ    # override default project
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import re
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
+from google.cloud import bigquery
+
+import swings
+
+# Zerodha Console's holdings CSV export uses these headers (case varies by
+# export version) -- matched case-insensitively, with a couple of common
+# aliases, rather than hardcoding one exact spelling.
+CSV_TICKER_COLUMNS = ["instrument", "symbol", "tradingsymbol"]
+CSV_QTY_COLUMNS = ["qty.", "qty", "quantity", "quantity available"]
+CSV_AVG_COST_COLUMNS = ["avg. cost", "avg cost", "average price", "avg_cost"]
+
+# Zerodha appends a trailing "-<SERIES>" marker to the tradingsymbol for
+# anything not on the default EQ series -- "-T" for a T1/not-yet-settled
+# lot, "-BE"/"-BZ"/"-BL" etc. for trade-to-trade restricted series. It's a
+# settlement/series marker, not part of the real ticker (confirmed:
+# BLISSGVS-T, BLISSGVS-BE, E2E-T all fail on Yahoo; BLISSGVS/E2E don't).
+# Constants for the legacy floor+extension verdict in
+# check_position_momentum. These USED to live on swings.ScannerConfig as
+# target_pct / max_hold_days / max_extension_days, and were deleted there
+# when the scanner stopped measuring a 3% floor at all (see
+# swings.run_move_profile). They are kept here, local and clearly named as
+# legacy, because this file still replays that rule.
+#
+# That rule is itself due for replacement: run against the real book it
+# returns an exit verdict for 19 of 19 holdings, including one at +41%,
+# and a signal that fires on everything carries no information. Sudarshan
+# has also been explicit that exits are a human decision. Do not tune
+# these -- replace the logic.
+LEGACY_FLOOR_PCT = 3.0
+LEGACY_MAX_HOLD_DAYS = 5
+LEGACY_MAX_EXTENSION_DAYS = 3
+
+_SERIES_SUFFIX_RE = re.compile(r"-[A-Z]{1,3}$")
+
+
+def _strip_series_suffix(raw_symbol: str) -> str:
+    return _SERIES_SUFFIX_RE.sub("", raw_symbol.upper())
+
+
+def _bse_fallback(ticker: str) -> Optional[str]:
+    """
+    BSE equivalent of an NSE ticker, or None if not applicable. Some symbols
+    (AGOL) simply aren't on NSE via Yahoo but resolve fine on BSE -- confirmed
+    by direct test (AGOL.NS empty, AGOL.BO ok). Same fallback
+    check_position_momentum does inline; factored out so regime checking
+    handles those holdings too instead of reporting them as NO_DATA.
+    """
+    return ticker[:-3] + ".BO" if ticker.upper().endswith(".NS") else None
+
+
+def _find_column(columns: list[str], candidates: list[str]) -> Optional[str]:
+    lower_map = {c.lower().strip(): c for c in columns}
+    for candidate in candidates:
+        if candidate in lower_map:
+            return lower_map[candidate]
+    return None
+
+
+def import_holdings_csv(csv_path: str, project_id: str) -> None:
+    """
+    Loads a Zerodha Console holdings CSV export into data_options.holdings.
+
+    Zerodha's export has quantity and average cost, but NOT the original
+    entry date -- that's a real gap, handled deliberately, not glossed
+    over: for a ticker already in holdings, only Quantity/Entry_Price are
+    updated, the existing Entry_Date is kept as-is (it's the one piece of
+    truth the CSV can't provide). For a ticker not already in holdings,
+    Entry_Date is set to today and printed with an explicit warning --
+    correct it manually if it wasn't actually bought today, since the
+    momentum trace is meaningless from the wrong starting point.
+
+    Any ticker currently Active=TRUE in holdings but NOT present in this
+    CSV is treated as closed (the export is a complete current snapshot)
+    and marked Active=FALSE.
+    """
+    df = pd.read_csv(csv_path)
+    columns = list(df.columns)
+
+    ticker_col = _find_column(columns, CSV_TICKER_COLUMNS)
+    qty_col = _find_column(columns, CSV_QTY_COLUMNS)
+    avg_col = _find_column(columns, CSV_AVG_COST_COLUMNS)
+
+    if not (ticker_col and qty_col and avg_col):
+        raise ValueError(
+            f"Could not find expected columns in {csv_path}. Found: {columns}. "
+            f"Need something matching ticker={CSV_TICKER_COLUMNS}, qty={CSV_QTY_COLUMNS}, "
+            f"avg_cost={CSV_AVG_COST_COLUMNS}."
+        )
+
+    client = bigquery.Client(project=project_id)
+    # Full existing rows, not just Ticker/Entry_Date -- closed positions need
+    # their Entry_Price/Quantity/Notes carried over too, not just flipped to
+    # inactive with data loss.
+    existing = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    today = dt.date.today().isoformat()
+    csv_tickers = set()
+    new_rows = []
+    for _, row in df.iterrows():
+        raw_symbol = str(row[ticker_col]).strip()
+        if not raw_symbol or raw_symbol.lower() == "nan":
+            continue
+        ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(raw_symbol))
+        qty = float(str(row[qty_col]).replace(",", ""))
+        avg_cost = float(str(row[avg_col]).replace(",", ""))
+        if qty <= 0:
+            continue
+
+        csv_tickers.add(ticker)
+        if ticker in existing:
+            entry_date = str(existing[ticker]["Entry_Date"])
+        else:
+            entry_date = today
+            print(f"NEW position detected: {ticker} -- Entry_Date set to {today}. "
+                  f"Correct manually if it wasn't actually bought today.")
+
+        new_rows.append({
+            "Ticker": ticker, "Entry_Price": avg_cost, "Entry_Date": entry_date,
+            "Quantity": qty, "Active": True, "Notes": None,
+        })
+
+    closed_tickers = set(existing) - csv_tickers
+    closed_rows = [
+        {
+            "Ticker": t, "Entry_Price": existing[t]["Entry_Price"], "Entry_Date": str(existing[t]["Entry_Date"]),
+            "Quantity": existing[t]["Quantity"], "Active": False, "Notes": existing[t]["Notes"],
+        }
+        for t in closed_tickers
+    ]
+
+    all_touched = csv_tickers | closed_tickers
+    if all_touched:
+        # DELETE-then-LOAD, not a streaming insert -- streamed rows (and the
+        # whole table, briefly) can't be UPDATE'd/DELETE'd for a while after
+        # insert_rows_json, which silently broke the "mark closed" step the
+        # first time this ran. A LOAD job doesn't have that limitation, same
+        # pattern already proven safe in swings.py's write_to_bigquery.
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@tickers)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", list(all_touched))
+            ]),
+        ).result()
+
+        all_rows = pd.DataFrame(new_rows + closed_rows)
+        client.load_table_from_dataframe(
+            all_rows, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    if closed_tickers:
+        print(f"Marked as closed (no longer in CSV): {', '.join(sorted(closed_tickers))}")
+    print(f"Imported {len(new_rows)} active holdings from {csv_path}")
+
+
+def import_holdings_from_pnl_csv(csv_path: str, project_id: str) -> None:
+    """
+    Syncs data_options.holdings from a Zerodha Console **P&L statement**
+    export, which is a different shape from the holdings export that
+    import_holdings_csv reads. Kept as a separate function rather than
+    widening that one, because reading this file with the holdings-export
+    column rules gets it silently and badly wrong:
+
+      - "Quantity" in a P&L statement is the quantity TRADED in the period
+        (AEGISLOG 191), not the quantity HELD (40). import_holdings_csv
+        would take the traded figure as the position size.
+      - There is no average-cost column at all. Cost basis has to be
+        derived as Open Value / Open Quantity.
+
+    Rights entitlements are kept as DISTINCT tickers. "AGOL-RE" is a
+    separate instrument from "AGOL" -- feeding it through
+    _strip_series_suffix would turn it into AGOL and collide with (here,
+    resurrect) an equity position that was fully sold. Same for
+    "IBUL-RE-BE", which that regex would mangle to "IBUL-RE". Note these
+    won't resolve on Yahoo, so the regime/momentum checks will report
+    NO_DATA for them -- correct behaviour, they have no meaningful price
+    history to trace.
+
+    Rows with Open Quantity 0 are positions closed during the period: any
+    such ticker currently Active=TRUE is flipped to Active=FALSE with its
+    Entry_Price/Date/Notes preserved, same as import_holdings_csv does.
+    """
+    df = pd.read_csv(csv_path)
+    required = {"Symbol", "Open Quantity", "Open Value"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{csv_path} does not look like a Zerodha P&L statement export -- "
+            f"missing {sorted(missing)}. Found: {list(df.columns)}"
+        )
+
+    client = bigquery.Client(project=project_id)
+    existing = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    today = dt.date.today().isoformat()
+    new_rows, csv_tickers, skipped = [], set(), []
+    for _, row in df.iterrows():
+        raw = str(row["Symbol"]).strip()
+        if not raw or raw.lower() == "nan":
+            continue
+        qty = float(str(row["Open Quantity"]).replace(",", "") or 0)
+        if qty <= 0:
+            continue                      # closed in the period -- handled below
+
+        # Rights entitlements stay whole; only settlement/series markers strip.
+        symbol = raw.upper()
+        ticker = (swings.to_yahoo_nse_ticker(symbol) if "-RE" in symbol
+                  else swings.to_yahoo_nse_ticker(_strip_series_suffix(symbol)))
+
+        open_value = float(str(row["Open Value"]).replace(",", "") or 0)
+        if open_value <= 0:
+            # IBUL-RE-BE arrives with Open Value 0 -- a rights entitlement
+            # credited at no cost. Dividing would raise; a 0 cost basis would
+            # make every P&L percentage meaningless. Skip and report it
+            # rather than write a number that looks real.
+            skipped.append(f"{ticker} (qty {qty:.0f}, no cost basis in export)")
+            continue
+        avg_cost = open_value / qty
+
+        csv_tickers.add(ticker)
+        entry_date = str(existing[ticker]["Entry_Date"]) if ticker in existing else today
+        if ticker not in existing:
+            print(f"NEW position: {ticker} -- {qty:.0f} @ {avg_cost:.2f}, Entry_Date set to "
+                  f"{today}. Correct it if not bought today (the momentum trace needs the real date).")
+
+        new_rows.append({"Ticker": ticker, "Entry_Price": round(avg_cost, 4),
+                         "Entry_Date": entry_date, "Quantity": qty,
+                         "Active": True, "Notes": None})
+
+    closed = set(existing) - csv_tickers
+    closed_rows = [{
+        "Ticker": t, "Entry_Price": existing[t]["Entry_Price"],
+        "Entry_Date": str(existing[t]["Entry_Date"]), "Quantity": existing[t]["Quantity"],
+        "Active": False, "Notes": existing[t]["Notes"],
+    } for t in closed]
+
+    touched = csv_tickers | closed
+    if touched:
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@t)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("t", "STRING", list(touched))]),
+        ).result()
+        client.load_table_from_dataframe(
+            pd.DataFrame(new_rows + closed_rows), f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    if closed:
+        print(f"Marked closed (Open Quantity 0): {', '.join(sorted(closed))}")
+    if skipped:
+        print("Skipped (no usable cost basis): " + "; ".join(skipped))
+    print(f"Synced {len(new_rows)} open positions from {csv_path}")
+
+
+def load_account_ledger(csv_path: str, project_id: str) -> None:
+    """
+    Loads a Zerodha Console fund ledger export (deposits, withdrawals,
+    settlements, DP/AMC/delayed-payment charges, running balance) into
+    data_options.account_ledger, so this history is queryable in BigQuery
+    instead of needing the CSV re-pasted every time. WRITE_TRUNCATE --
+    each export is the full account history to date, not an incremental
+    diff, so a fresh export is the new source of truth wholesale.
+    """
+    df = pd.read_csv(csv_path)
+    df = df[df["posting_date"].notna()].copy()
+    df["posting_date"] = pd.to_datetime(df["posting_date"]).dt.date
+
+    client = bigquery.Client(project=project_id)
+    client.load_table_from_dataframe(
+        df, f"{project_id}.data_options.account_ledger",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+    ).result()
+    print(f"Loaded {len(df)} ledger rows into {project_id}.data_options.account_ledger "
+          f"({df['posting_date'].min()} to {df['posting_date'].max()})")
+
+
+def _fifo_open_lots(trades: pd.DataFrame) -> tuple[float, float, str, str, int]:
+    """
+    FIFO-consumes buy/sell rows (already sorted by execution time) for one
+    symbol down to whatever's still open. Returns (qty, weighted_avg_price,
+    oldest_lot_date, newest_lot_date, num_open_lots). A sell that exceeds
+    the lots this dataframe knows about (a pre-existing position from
+    before the tradebook's window) just runs the open-lot list to empty --
+    it does NOT go negative, so a heavier sell than tracked buys silently
+    zeroes out rather than producing a nonsense answer; the caller is
+    expected to sanity-check the resulting qty against the real holding.
+    """
+    lots: list[list] = []  # [qty, price, date]
+    for _, row in trades.iterrows():
+        qty = float(row["quantity"])
+        if row["trade_type"] == "buy":
+            lots.append([qty, float(row["price"]), row["trade_date"]])
+        else:
+            remaining = qty
+            while remaining > 1e-9 and lots:
+                consume = min(lots[0][0], remaining)
+                lots[0][0] -= consume
+                remaining -= consume
+                if lots[0][0] <= 1e-9:
+                    lots.pop(0)
+    total_qty = sum(l[0] for l in lots)
+    if total_qty <= 1e-9:
+        return 0.0, 0.0, "", "", 0
+    wavg_price = sum(l[0] * l[1] for l in lots) / total_qty
+    return total_qty, wavg_price, min(l[2] for l in lots), max(l[2] for l in lots), len(lots)
+
+
+def _fifo_realized_trades(trades: pd.DataFrame) -> list[dict]:
+    """
+    Same FIFO walk as _fifo_open_lots, but returns a record for every SELL
+    instead of just the final open state -- one row per sell event, entry
+    price/date blended (weighted average price, earliest date) across
+    whichever buy lots got consumed by it. A sell that eats into shares
+    bought before this file's window (no matching lot left) reports
+    unmatched_qty > 0 for that portion -- its P&L can't be computed from
+    this file alone, so the caller should skip logging that slice rather
+    than guess.
+    """
+    lots: list[list] = []  # [qty, price, date]
+    realized: list[dict] = []
+    for _, row in trades.iterrows():
+        qty = float(row["quantity"])
+        if row["trade_type"] == "buy":
+            lots.append([qty, float(row["price"]), row["trade_date"]])
+        else:
+            remaining = qty
+            matched_cost = 0.0
+            matched_qty = 0.0
+            earliest_date = None
+            while remaining > 1e-9 and lots:
+                consume = min(lots[0][0], remaining)
+                matched_cost += consume * lots[0][1]
+                matched_qty += consume
+                if earliest_date is None or lots[0][2] < earliest_date:
+                    earliest_date = lots[0][2]
+                lots[0][0] -= consume
+                remaining -= consume
+                if lots[0][0] <= 1e-9:
+                    lots.pop(0)
+            if matched_qty > 1e-9:
+                realized.append({
+                    "qty": matched_qty, "entry_price": matched_cost / matched_qty, "entry_date": str(earliest_date),
+                    "exit_price": float(row["price"]), "exit_date": str(row["trade_date"]),
+                    "unmatched_qty": remaining,
+                })
+    return realized
+
+
+def backfill_realized_trades_from_tradebook(tradebook_csv: str, project_id: str) -> None:
+    """
+    One-time backfill: data_options.realized_trades only has trades booked
+    through book_profit since that feature existed -- everything sold
+    before that (confirmed against a real Zerodha P&L export: AEGISLOG
+    +10,025, MSTCLTD's Aug-19 sale +3,928, SHILPAMED, SKYGOLD, etc.) was
+    never logged. Recovers those from the tradebook via FIFO matching.
+
+    Guards against a double-run: if any row already has
+    Notes='Backfilled from tradebook (FIFO)', does nothing -- re-running
+    this would otherwise duplicate the whole ledger.
+    """
+    client = bigquery.Client(project=project_id)
+    already_done = list(client.query(
+        f"SELECT 1 FROM `{project_id}.data_options.realized_trades` "
+        f"WHERE Notes = 'Backfilled from tradebook (FIFO)' LIMIT 1"
+    ).result())
+    if already_done:
+        print("Backfill already run once (found existing 'Backfilled from tradebook (FIFO)' rows) -- skipping.")
+        return
+
+    trades = pd.read_csv(tradebook_csv)
+    trades["order_execution_time"] = pd.to_datetime(trades["order_execution_time"])
+    trades = trades.sort_values("order_execution_time")
+
+    rows_to_write = []
+    unmatched_notes = []
+    for symbol, g in trades.groupby("symbol"):
+        ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(symbol))
+        for r in _fifo_realized_trades(g):
+            pnl_amount = (r["exit_price"] - r["entry_price"]) * r["qty"]
+            pnl_pct = (r["exit_price"] - r["entry_price"]) / r["entry_price"] * 100
+            rows_to_write.append({
+                "Ticker": ticker, "Entry_Price": round(r["entry_price"], 4), "Entry_Date": r["entry_date"],
+                "Exit_Price": r["exit_price"], "Exit_Date": r["exit_date"], "Quantity": r["qty"],
+                "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2),
+                "Notes": "Backfilled from tradebook (FIFO)",
+            })
+            if r["unmatched_qty"] > 1e-9:
+                unmatched_notes.append(f"{ticker} on {r['exit_date']}: {r['unmatched_qty']:.0f} shares "
+                                        f"sold with no matching buy lot in this file (pre-existing, P&L not computable)")
+
+    if rows_to_write:
+        client.load_table_from_dataframe(
+            pd.DataFrame(rows_to_write), f"{project_id}.data_options.realized_trades",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    total_pnl = sum(r["PnL_Amount"] for r in rows_to_write)
+    print(f"Backfilled {len(rows_to_write)} realized trade(s) from {tradebook_csv}, total P&L {total_pnl:+.2f}")
+    if unmatched_notes:
+        print("Unmatched (skipped, no computable P&L):")
+        for note in unmatched_notes:
+            print(f"  {note}")
+
+
+def apply_tradebook_entry_dates(tradebook_csv: str, project_id: str) -> None:
+    """
+    Zerodha Console's holdings CSV (used by import_holdings_csv) has no
+    purchase date, so anything new to tracking gets Entry_Date defaulted
+    to today -- a real gap, since the momentum/stop/time-stop checks in
+    check_position_momentum can't trace history from a fabricated date.
+
+    A Zerodha tradebook export (every individual fill, with real dates)
+    can recover the real date for a currently-open position: FIFO-consume
+    each symbol's buys/sells down to what's still open, and use the
+    OLDEST remaining lot's date as the entry date -- the date the
+    currently-held tranche started being accumulated.
+
+    Only touches holdings rows whose Entry_Date is still today (the
+    "unknown" marker this same script wrote); rows with a real date
+    already (manually seeded, or fixed in an earlier run) are left alone.
+    Some positions won't fully reconcile against this file (pre-existing
+    shares from before the tradebook's window, e.g. Zerodha's own "long
+    term" quantity flag) -- when the FIFO qty is less than the actual
+    holding, the true entry is even older than what's found here, so the
+    oldest resolvable lot is still a safe (if approximate) choice: it
+    understates how long the capital has been deployed, never overstates
+    it. Symbols with NO trades in this file at all (bought entirely
+    outside its window) are left untouched and reported as unresolved.
+    """
+    trades = pd.read_csv(tradebook_csv)
+    trades["order_execution_time"] = pd.to_datetime(trades["order_execution_time"])
+    trades = trades.sort_values("order_execution_time")
+
+    client = bigquery.Client(project=project_id)
+    today = dt.date.today().isoformat()
+    holdings = {
+        row["Ticker"]: dict(row.items())
+        for row in client.query(
+            f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+            f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+        ).result()
+    }
+
+    updates = []
+    for symbol, g in trades.groupby("symbol"):
+        ticker = swings.to_yahoo_nse_ticker(symbol)
+        if ticker not in holdings or str(holdings[ticker]["Entry_Date"]) != today:
+            continue
+        fifo_qty, _, oldest_date, _, _ = _fifo_open_lots(g)
+        if fifo_qty <= 1e-9:
+            continue
+        held_qty = float(holdings[ticker]["Quantity"])
+        note = "" if abs(fifo_qty - held_qty) < 0.5 else f" (approx -- tradebook shows {fifo_qty:.0f} vs {held_qty:.0f} held, some shares predate this file)"
+        updates.append((ticker, oldest_date, note))
+
+    if updates:
+        client.query(
+            f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker IN UNNEST(@tickers)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", [t for t, _, _ in updates])
+            ]),
+        ).result()
+        new_rows = pd.DataFrame([
+            {
+                "Ticker": t, "Entry_Price": holdings[t]["Entry_Price"], "Entry_Date": new_date,
+                "Quantity": holdings[t]["Quantity"], "Active": True, "Notes": holdings[t]["Notes"],
+            }
+            for t, new_date, _ in updates
+        ])
+        client.load_table_from_dataframe(
+            new_rows, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    for t, new_date, note in updates:
+        print(f"Corrected {t}: Entry_Date -> {new_date}{note}")
+
+    corrected = {t for t, _, _ in updates}
+    still_unresolved = sorted(
+        t for t, h in holdings.items()
+        if str(h["Entry_Date"]) == today and t not in corrected
+    )
+    if still_unresolved:
+        print(f"\nStill unresolved (no usable trades in this file -- position predates it "
+              f"or was entirely offset within it): {', '.join(still_unresolved)}")
+    print(f"\nUpdated {len(updates)} Entry_Date(s) from {tradebook_csv}")
+
+
+def check_position_momentum(
+    ticker: str, entry_price: float, entry_date: str, config: swings.ScannerConfig
+) -> dict:
+    """
+    Traces the actual day-by-day price action from a REAL entry point (not
+    a scanner-signal day) using the exact same rule run_barrier_backtest
+    simulates (see _simulate_floor_extension_trade) -- not just the
+    floor+extension part, the full two-phase rule with both backstops:
+
+    Phase 1 (before the floor is reached): walks forward up to
+    LEGACY_MAX_HOLD_DAYS sessions looking for the stop or the floor,
+    whichever comes first. A position that never reaches the floor within
+    that window is a TIME STOP -- capital that isn't working doesn't get
+    to sit indefinitely just because it hasn't technically lost yet.
+
+    Phase 2 (after the floor is reached): same floor+extension logic as
+    before -- hold up to LEGACY_MAX_EXTENSION_DAYS more sessions while
+    still closing higher, exit on the first non-higher close -- but the
+    stop stays active as a hard backstop throughout, same as phase 1.
+
+    The stop itself is the same ATR/structural/RR-floor stop
+    add_indicators computes for a fresh scanner signal, evaluated as of
+    the entry day (no lookahead). This was the real gap before: a holding
+    that never reached the floor had no exit trigger at all, no matter how
+    far it fell (confirmed live -- IRCTC/AGOL/WAAREERTL were sitting at
+    -40% to -60% and still just read "NOT YET AT FLOOR").
+
+    Returns a dict; does not raise on missing data (returns a NO DATA
+    verdict instead), since this is meant to run across many holdings
+    unattended.
+    """
+    yf = swings.load_yfinance()
+    # Window sized off the real entry date, not a fixed lookback -- a fixed
+    # "6mo" silently truncated history for anything entered further back
+    # than that (confirmed live: a position entered ~895 days ago got no
+    # usable history at all under a flat 6mo window). The extra 90-day
+    # buffer before entry is warm-up room for add_indicators' rolling
+    # windows (ATR/support_window need ~20 bars of lead-in).
+    entry_ts = pd.Timestamp(entry_date)
+    start = (entry_ts - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+    try:
+        raw = yf.download(ticker, start=start, interval="1d", progress=False, auto_adjust=True, threads=False)
+        data = swings.normalize_single_ticker_columns(raw)
+    except Exception as exc:
+        return {"Ticker": ticker, "Verdict": f"DATA ERROR: {exc}"}
+
+    # Some symbols (e.g. AGOL) aren't available on NSE via Yahoo but resolve
+    # fine on BSE -- confirmed via direct testing (AGOL.NS empty, AGOL.BO ok).
+    if data.empty and ticker.upper().endswith(".NS"):
+        bse_ticker = ticker[:-3] + ".BO"
+        try:
+            raw = yf.download(bse_ticker, start=start, interval="1d", progress=False, auto_adjust=True, threads=False)
+            data = swings.normalize_single_ticker_columns(raw)
+            if not data.empty:
+                ticker = bse_ticker
+        except Exception:
+            pass
+
+    if data.empty:
+        return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
+
+    indexed = swings.add_indicators(data, config)
+    post_entry = indexed.loc[indexed.index >= entry_ts]
+    if post_entry.empty:
+        return {"Ticker": ticker, "Verdict": "NO DATA since entry date"}
+
+    closes = post_entry["Close"].to_numpy()
+    lows = post_entry["Low"].to_numpy()
+    dates = post_entry.index
+    n = len(closes)
+    current_price = float(closes[-1])
+    pnl_pct = (current_price - entry_price) / entry_price * 100
+    floor = entry_price * (1 + LEGACY_FLOOR_PCT / 100)
+
+    stop_raw = post_entry["trade_stop"].iloc[0]
+    stop = float(stop_raw) if pd.notna(stop_raw) else None
+
+    base = {
+        "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+        "Current_Price": round(current_price, 2), "PnL_Pct": round(pnl_pct, 2),
+        "Days_Since_Entry": n, "Stop": round(stop, 2) if stop is not None else None,
+    }
+
+    def _stop_hit_verdict(idx: int, during_extension: bool) -> dict:
+        exit_price = float(lows[idx])
+        exit_pnl = (exit_price - entry_price) / entry_price * 100
+        suffix = " during extension" if during_extension else ""
+        return {
+            **base,
+            "Verdict": (
+                f"STOP HIT on {dates[idx].date()} at {exit_price:.2f} ({exit_pnl:+.2f}%) "
+                f"-- exit, downside protection triggered{suffix}"
+            ),
+            "Still_In_Momentum": False,
+        }
+
+    # Phase 1: entry day itself (index 0) isn't monitored -- the position
+    # starts being watched the day after, same convention as the backtest.
+    # Unlike the backtest's bounded trial window, this search is NOT capped
+    # at max_hold_days -- a live position that converts a little late still
+    # converted, and should move into normal phase-2 tracking, not get
+    # frozen into a timeout verdict it already grew out of (a position that
+    # crossed the floor on day 6 instead of day 5 is not still "stuck").
+    # max_hold_days is only used below to judge "stuck as of today."
+    hold = LEGACY_MAX_HOLD_DAYS
+    floor_day_idx = None
+    for j in range(1, n):
+        if stop is not None and lows[j] <= stop:
+            return _stop_hit_verdict(j, during_extension=False)
+        if closes[j] >= floor:
+            floor_day_idx = j
+            break
+
+    if floor_day_idx is None:
+        if n - 1 >= hold:
+            base["Verdict"] = (
+                f"TIME STOP -- {hold}+ sessions since entry, never reached the "
+                f"{LEGACY_FLOOR_PCT}% floor -- exit, capital isn't converting"
+            )
+            base["Still_In_Momentum"] = False
+        elif pnl_pct <= -config.max_risk_pct:
+            # Catches positions whose Entry_Date is unreliable (CSV import
+            # defaults it to today for anything not already tracked, since
+            # Zerodha's export has no real purchase date -- see
+            # import_holdings_csv) so day-count logic above can't see their
+            # real history. PnL_Pct itself is still accurate (it comes
+            # straight from Average Price), so a loss past the scanner's
+            # own max-acceptable-risk threshold is flagged regardless.
+            base["Verdict"] = (
+                f"DEEP LOSS -- {pnl_pct:+.2f}% exceeds max acceptable risk "
+                f"({config.max_risk_pct}%) -- review for exit"
+            )
+            base["Still_In_Momentum"] = False
+        else:
+            base["Verdict"] = "NOT YET AT FLOOR"
+        return base
+
+    # Phase 2: extension window, stop still active throughout.
+    base["Floor_Crossed_On"] = str(dates[floor_day_idx].date())
+    ext_end = min(floor_day_idx + 1 + LEGACY_MAX_EXTENSION_DAYS, n)
+    prev_close = closes[floor_day_idx]
+    for k in range(floor_day_idx + 1, ext_end):
+        if stop is not None and lows[k] <= stop:
+            return _stop_hit_verdict(k, during_extension=True)
+        if closes[k] <= prev_close:
+            exit_price = float(closes[k])
+            exit_pnl = (exit_price - entry_price) / entry_price * 100
+            base["Verdict"] = (
+                f"MOMENTUM BROKEN on {dates[k].date()} at {exit_price:.2f} "
+                f"({exit_pnl:+.2f}%) -- rule's exit already triggered, even though "
+                f"current price may differ"
+            )
+            base["Still_In_Momentum"] = False
+            return base
+        prev_close = closes[k]
+
+    if ext_end - floor_day_idx - 1 >= LEGACY_MAX_EXTENSION_DAYS:
+        base["Verdict"] = f"EXTENSION WINDOW EXPIRED ({LEGACY_MAX_EXTENSION_DAYS} days past floor) -- rule says exit now"
+        base["Still_In_Momentum"] = False
+    else:
+        base["Verdict"] = "STILL IN MOMENTUM -- hold"
+        base["Still_In_Momentum"] = True
+    return base
+
+
+def book_profit(
+    ticker: str, exit_qty: float, exit_price: float, project_id: str,
+    exit_date: Optional[str] = None, notes: Optional[str] = None,
+) -> dict:
+    """
+    Records a real sell against an active holding: logs the realized trade
+    to data_options.realized_trades (append-only ledger -- the "position
+    ledger" gap), then updates data_options.holdings -- full exit closes
+    the row (Active=FALSE), partial exit reduces Quantity and keeps the
+    original Entry_Price/Entry_Date for the remaining shares (cost basis
+    isn't reaveraged on a partial sell).
+    """
+    ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(ticker.strip()))
+    client = bigquery.Client(project=project_id)
+
+    rows = list(client.query(
+        f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+        f"FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker AND Active = TRUE",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result())
+    if not rows:
+        raise ValueError(f"No active holding found for {ticker} in data_options.holdings")
+
+    current = dict(rows[0].items())
+    entry_price = float(current["Entry_Price"])
+    entry_date = str(current["Entry_Date"])
+    held_qty = float(current["Quantity"])
+    if exit_qty > held_qty:
+        raise ValueError(f"Exit qty {exit_qty} exceeds held qty {held_qty} for {ticker}")
+
+    exit_date = exit_date or dt.date.today().isoformat()
+    pnl_amount = (exit_price - entry_price) * exit_qty
+    pnl_pct = (exit_price - entry_price) / entry_price * 100
+
+    trade_row = pd.DataFrame([{
+        "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+        "Exit_Price": exit_price, "Exit_Date": exit_date, "Quantity": exit_qty,
+        "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2), "Notes": notes,
+    }])
+    client.load_table_from_dataframe(
+        trade_row, f"{project_id}.data_options.realized_trades",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+    ).result()
+
+    remaining_qty = held_qty - exit_qty
+    client.query(
+        f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result()
+    if remaining_qty > 0:
+        updated_row = pd.DataFrame([{
+            "Ticker": ticker, "Entry_Price": entry_price, "Entry_Date": entry_date,
+            "Quantity": remaining_qty, "Active": True, "Notes": current["Notes"],
+        }])
+        client.load_table_from_dataframe(
+            updated_row, f"{project_id}.data_options.holdings",
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+        ).result()
+
+    result = {
+        "Ticker": ticker, "Exit_Qty": exit_qty, "Remaining_Qty": remaining_qty,
+        "Entry_Price": entry_price, "Exit_Price": exit_price,
+        "PnL_Amount": round(pnl_amount, 2), "PnL_Pct": round(pnl_pct, 2),
+    }
+    print(
+        f"Booked {exit_qty} of {ticker} @ {exit_price:.2f} (entry {entry_price:.2f}): "
+        f"{pnl_amount:+.2f} ({pnl_pct:+.2f}%). "
+        + (f"{remaining_qty} left, still active." if remaining_qty > 0 else "Position closed.")
+    )
+    return result
+
+
+def book_buy(
+    ticker: str, buy_qty: float, buy_price: float, project_id: str,
+    buy_date: Optional[str] = None, notes: Optional[str] = None,
+) -> dict:
+    """
+    Records a real buy: a brand-new ticker creates a fresh active row; an
+    existing active holding gets the new lot averaged into a single blended
+    cost basis (same weighted-average methodology Zerodha's own Average
+    Price uses, confirmed exact match against real data earlier this
+    session) with Quantity increased. Entry_Date is NOT changed on an
+    add -- the position started when the first shares were bought, adding
+    more doesn't reset how long capital has been deployed (same reasoning
+    as apply_tradebook_entry_dates' oldest-lot choice).
+    """
+    ticker = swings.to_yahoo_nse_ticker(_strip_series_suffix(ticker.strip()))
+    client = bigquery.Client(project=project_id)
+    buy_date = buy_date or dt.date.today().isoformat()
+
+    rows = list(client.query(
+        f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+        f"FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker AND Active = TRUE",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result())
+
+    client.query(
+        f"DELETE FROM `{project_id}.data_options.holdings` WHERE Ticker = @ticker",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+        ]),
+    ).result()
+
+    if rows:
+        current = dict(rows[0].items())
+        old_qty = float(current["Quantity"])
+        old_price = float(current["Entry_Price"])
+        new_qty = old_qty + buy_qty
+        new_avg_price = (old_qty * old_price + buy_qty * buy_price) / new_qty
+        entry_date = str(current["Entry_Date"])
+        row_notes = current["Notes"]
+        action_desc = f"added to existing {old_qty:.0f} @ {old_price:.2f} -> {new_qty:.0f} @ {new_avg_price:.2f} avg"
+    else:
+        new_qty = buy_qty
+        new_avg_price = buy_price
+        entry_date = buy_date
+        row_notes = notes
+        action_desc = "new position"
+
+    new_row = pd.DataFrame([{
+        "Ticker": ticker, "Entry_Price": round(new_avg_price, 4), "Entry_Date": entry_date,
+        "Quantity": new_qty, "Active": True, "Notes": row_notes,
+    }])
+    client.load_table_from_dataframe(
+        new_row, f"{project_id}.data_options.holdings",
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+    ).result()
+
+    result = {"Ticker": ticker, "Quantity": new_qty, "Entry_Price": round(new_avg_price, 4), "Entry_Date": entry_date}
+    print(f"Booked BUY {buy_qty:.0f} of {ticker} @ {buy_price:.2f} ({action_desc})")
+    return result
+
+
+# =========================================================
+# REGIME CLASSIFICATION
+# =========================================================
+# The floor+extension rule in check_position_momentum is a MOMENTUM rule --
+# it assumes a stock that moves up keeps moving up, and exits when it stops.
+# Applied to a stock that is actually oscillating in a band, or one in
+# structural decline, it answers the wrong question. AGOL and IRCTC sat for
+# weeks under momentum logic that could only ever say "not yet at floor"
+# while they fell 44-63%.
+#
+# This classifies which of three regimes a stock is actually in, so the
+# right question gets asked of each:
+#   OSCILLATING  -> where in its band is it? (buy low / sell high)
+#   TRENDING_UP  -> the momentum rule applies; let it run, respect the stop
+#   BREAKOUT_UP  -> left its old band upward; band levels are stale, don't
+#                   read "overbought" into a position above the band
+#   TRENDING_DOWN / BREAKDOWN -> neither rule applies; this is an exit
+#                   question, not an entry one
+REGIME_LOOKBACK_DAYS = 60
+REGIME_DRIFT_THRESHOLD_PCT = 15.0   # |drift| across the window below this = flat enough to call a range
+# 10/90 rather than 15/85: the band is used to judge "has price left its
+# range", and a 15/85 band leaves ~30% of days outside it BY CONSTRUCTION --
+# which made a genuinely range-bound stock sitting at its low (exactly the
+# buy signal) come out as BREAKDOWN. Caught by unit test, not in review.
+REGIME_BAND_LOW_PCTILE = 10
+REGIME_BAND_HIGH_PCTILE = 90
+# ...and even then, only treat price as having LEFT the band when it's
+# decisively outside, not a fraction past the edge.
+REGIME_BREAKOUT_POS = 125.0
+REGIME_BREAKDOWN_POS = -25.0
+
+
+def classify_regime(closes: np.ndarray, lookback: int = REGIME_LOOKBACK_DAYS) -> Optional[dict]:
+    """
+    Characterises the most recent `lookback` sessions as a band plus a drift,
+    and labels the regime.
+
+    Band = 15th/85th percentile of closes (not min/max -- a single spike
+    shouldn't define the range). `pos_in_band` is where price sits in it as
+    a percentage: 0 = at the band low, 100 = at the band high, and values
+    outside 0-100 mean price has left the band entirely, which is exactly
+    the case where a naive mean-reversion reading is dangerous.
+
+    Returns None if there isn't enough history.
+    """
+    if closes is None or len(closes) < lookback:
+        return None
+    w = closes[-lookback:]
+    if not np.all(np.isfinite(w)):
+        w = w[np.isfinite(w)]
+        if len(w) < lookback // 2:
+            return None
+
+    lo = float(np.percentile(w, REGIME_BAND_LOW_PCTILE))
+    hi = float(np.percentile(w, REGIME_BAND_HIGH_PCTILE))
+    band = hi - lo
+    if lo <= 0:
+        return None
+    degenerate_band = False
+    if band <= 0:
+        # Degenerate percentile band: price sat at one level for most of the
+        # window (a long flat base, then a late move). Percentiles collapse to
+        # a point and every downstream ratio divides by zero. Fall back to the
+        # window's true min/max so the ticker still gets reported.
+        #
+        # But note what that fallback costs: with the band set to min..max,
+        # pos is bounded to 0-100 BY CONSTRUCTION, so the breakout/breakdown
+        # thresholds can never fire on this path. Position is therefore
+        # meaningless here and the regime is decided on drift alone.
+        degenerate_band = True
+        lo, hi = float(np.min(w)), float(np.max(w))
+        band = hi - lo
+        if band <= 0:
+            return None   # genuinely no movement at all (suspended/illiquid)
+
+    last = float(w[-1])
+    pos = (last - lo) / band * 100
+    width_pct = band / lo * 100
+    # drift = linear trend across the window, expressed as % of mean price,
+    # so it's comparable across stocks at different price levels.
+    x = np.arange(len(w))
+    drift = float(np.polyfit(x, w, 1)[0] * len(w) / w.mean() * 100)
+    inside_pct = float(((w >= lo) & (w <= hi)).mean() * 100)
+
+    # Order matters, and both orderings have a failure mode -- this is the
+    # third attempt and each earlier one was caught by a concrete case:
+    #   position-first  -> a range-bound stock sitting at its low (the BUY
+    #                      signal) was labelled BREAKDOWN. Wrong, because a
+    #                      10/90 band leaves ~20% of days outside it normally.
+    #   drift-first     -> ANTELOPUS at 366% of band read "OSCILLATING", and
+    #                      IRCTC at -31% read "oscillating, buy zone" while
+    #                      sitting on a -44% loss. Both wrong and the second
+    #                      is dangerous.
+    # So: DECISIVELY outside the band wins first (the band is stale, no zone
+    # reading is valid), and drift only decides among prices still in range.
+    if degenerate_band:
+        # Position carries no information here (see the fallback above). Nor
+        # does linear drift: a long flat base with a sharp move at the end
+        # dilutes the fit badly (55 flat days then a 60% crash fits to just
+        # -14.9%, which reads as "flat"). The meaningful comparison on this
+        # path is the last price against the base level itself.
+        base = float(np.median(w))
+        move_from_base = (last - base) / base * 100 if base > 0 else 0.0
+        if move_from_base > REGIME_DRIFT_THRESHOLD_PCT:
+            regime, note = "TRENDING_UP", (f"flat base then {move_from_base:+.0f}% move up -- "
+                                            f"no usable band, treat levels as unknown")
+        elif move_from_base < -REGIME_DRIFT_THRESHOLD_PCT:
+            regime, note = "TRENDING_DOWN", (f"flat base then {move_from_base:+.0f}% move down -- "
+                                              f"no usable band, exit question")
+        else:
+            regime, note = "OSCILLATING", "barely moved over the window -- no usable band, no edge either way"
+    elif pos > REGIME_BREAKOUT_POS:
+        regime = "BREAKOUT_UP"
+        note = (f"{pos:.0f}% of band -- left its range upward. Band levels are STALE; "
+                f"do NOT read this as overbought")
+    elif pos < REGIME_BREAKDOWN_POS:
+        regime = "BREAKDOWN"
+        note = (f"{pos:.0f}% of band -- broken below its range. NOT a dip to buy; "
+                f"this is an exit question")
+    elif abs(drift) <= REGIME_DRIFT_THRESHOLD_PCT:
+        regime = "OSCILLATING"
+        if pos >= 75:
+            note = f"oscillating, near the TOP of its band ({pos:.0f}%) -- sell zone"
+        elif pos <= 25:
+            note = f"oscillating, near the BOTTOM of its band ({pos:.0f}%) -- buy zone"
+        else:
+            note = f"oscillating, mid-band ({pos:.0f}%) -- no edge either way"
+    elif drift > 0:
+        regime = "TRENDING_UP"
+        note = "trending up inside its range -- the momentum rule applies, band levels do not"
+    else:
+        regime = "TRENDING_DOWN"
+        note = "trending down inside its range -- exit question, not an entry one"
+
+    return {
+        "Regime": regime, "Band_Low": round(lo, 2), "Band_High": round(hi, 2),
+        "Band_Width_Pct": round(width_pct, 2), "Current_Price": round(last, 2),
+        "Pos_In_Band_Pct": round(pos, 1), "Drift_Pct": round(drift, 1),
+        "Inside_Band_Pct": round(inside_pct, 1), "Note": note,
+    }
+
+
+def run_regime_check(project_id: str, lookback: int = REGIME_LOOKBACK_DAYS) -> pd.DataFrame:
+    """
+    Classifies every active holding's regime and writes a timestamped row per
+    ticker to data_options.regime_check (append-only, same pattern as
+    position_momentum_check -- so "what regime was this in when I bought"
+    stays answerable later).
+
+    Deliberately separate from check_position_momentum: that answers "is the
+    momentum rule's exit triggered", this answers "is the momentum rule even
+    the right rule for this stock right now".
+    """
+    client = bigquery.Client(project=project_id)
+    holdings = list(client.query(
+        f"SELECT Ticker, Entry_Price, Quantity FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+    ).result())
+    if not holdings:
+        print("No active holdings in data_options.holdings.")
+        return pd.DataFrame()
+
+    yf = swings.load_yfinance()
+    checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    rows = []
+    for h in holdings:
+        ticker = h["Ticker"]
+        closes = None
+        for candidate_ticker in (ticker, _bse_fallback(ticker)):
+            if candidate_ticker is None:
+                continue
+            try:
+                raw = yf.download(candidate_ticker, period="6mo", interval="1d",
+                                  progress=False, auto_adjust=True, threads=False)
+                data = swings.normalize_single_ticker_columns(raw)
+                if not data.empty:
+                    closes = data["Close"].to_numpy()
+                    break
+            except Exception:
+                continue
+
+        profile = classify_regime(closes, lookback) if closes is not None else None
+        if profile is None:
+            rows.append({"Ticker": ticker, "Regime": "NO_DATA", "Checked_At": checked_at,
+                         "Entry_Price": float(h["Entry_Price"]), "Quantity": float(h["Quantity"]),
+                         "Note": "not enough price history to classify"})
+            continue
+
+        entry = float(h["Entry_Price"])
+        profile.update({
+            "Ticker": ticker, "Checked_At": checked_at, "Entry_Price": entry,
+            "Quantity": float(h["Quantity"]),
+            "PnL_Pct": round((profile["Current_Price"] - entry) / entry * 100, 2),
+        })
+        rows.append(profile)
+
+    df = pd.DataFrame(rows)
+    order = {"OSCILLATING": 0, "BREAKOUT_UP": 1, "TRENDING_UP": 2,
+             "TRENDING_DOWN": 3, "BREAKDOWN": 4, "NO_DATA": 5}
+    df = df.sort_values("Regime", key=lambda s: s.map(order).fillna(9)).reset_index(drop=True)
+
+    print(f"\n{'Ticker':<14}{'Regime':<15}{'band':>17}{'now':>9}{'pos':>7}{'drift':>8}{'PnL%':>8}")
+    for _, r in df.iterrows():
+        if r.get("Regime") == "NO_DATA":
+            print(f"{r['Ticker']:<14}{'NO_DATA':<15}  {r.get('Note','')}")
+            continue
+        print(f"{r['Ticker']:<14}{r['Regime']:<15}{r['Band_Low']:>8.0f}-{r['Band_High']:<8.0f}"
+              f"{r['Current_Price']:>9.0f}{r['Pos_In_Band_Pct']:>6.0f}%{r['Drift_Pct']:>8.1f}{r['PnL_Pct']:>7.1f}%")
+
+    try:
+        client.load_table_from_dataframe(
+            df, f"{project_id}.data_options.regime_check",
+            job_config=bigquery.LoadJobConfig(
+                write_disposition="WRITE_APPEND",
+                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            ),
+        ).result()
+        print(f"\nWrote {len(df)} rows to {project_id}.data_options.regime_check")
+    except Exception as exc:
+        print(f"\nregime_check write skipped/failed: {exc}")
+
+    return df
+
+
+def run_position_check(project_id: str, config: Optional[swings.ScannerConfig] = None) -> pd.DataFrame:
+    """
+    Reads active rows from data_options.holdings, runs check_position_momentum
+    on each, prints a summary, and writes the results to
+    data_options.position_momentum_check (timestamped, append-only history --
+    so "was I told to exit this three days ago" is answerable later, not
+    just "what does it say right now").
+    """
+    config = config or swings.ScannerConfig()
+    client = bigquery.Client(project=project_id)
+
+    holdings = list(client.query(
+        f"SELECT Ticker, Entry_Price, Entry_Date, Quantity, Notes "
+        f"FROM `{project_id}.data_options.holdings` WHERE Active = TRUE"
+    ).result())
+
+    if not holdings:
+        print("No active holdings in data_options.holdings.")
+        return pd.DataFrame()
+
+    checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    rows = []
+    print(f"\n{'Ticker':<14} {'Entry':>9} {'Current':>9} {'PnL%':>7} {'Verdict'}")
+    print("-" * 100)
+    for h in holdings:
+        result = check_position_momentum(h["Ticker"], float(h["Entry_Price"]), str(h["Entry_Date"]), config)
+        result["Checked_At"] = checked_at
+        result["Quantity"] = h["Quantity"]
+        rows.append(result)
+        pnl = result.get("PnL_Pct")
+        current = result.get("Current_Price")
+        print(f"{result['Ticker']:<14} {h['Entry_Price']:>9.2f} "
+              f"{current if current is not None else '-':>9} "
+              f"{(f'{pnl:+.2f}' if pnl is not None else '-'):>7} {result['Verdict']}")
+
+    results_df = pd.DataFrame(rows)
+    try:
+        # ALLOW_FIELD_ADDITION -- this run added Stop, a new column the
+        # existing table's schema doesn't have yet.
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND",
+            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+        )
+        client.load_table_from_dataframe(
+            results_df, f"{project_id}.data_options.position_momentum_check", job_config=job_config
+        ).result()
+        print(f"\nWrote {len(results_df)} rows to {project_id}.data_options.position_momentum_check")
+    except Exception as exc:
+        print(f"\nposition_momentum_check write skipped/failed: {exc}")
+
+    return results_df
+
+
+def format_position_telegram_summary(results_df: pd.DataFrame) -> Optional[str]:
+    """
+    Plain text, same reasoning as swings.format_telegram_digest -- setup/
+    verdict text here is data-driven, not worth risking a Markdown parse
+    error over. Only worth sending if something needs a decision: skips
+    positions that are just "NOT YET AT FLOOR" (nothing to act on) and
+    sends nothing at all if every position is in that state.
+    """
+    if results_df.empty:
+        return None
+
+    actionable = results_df[results_df["Verdict"] != "NOT YET AT FLOOR"]
+    if actionable.empty:
+        return None
+
+    lines = ["Position check -- action needed or momentum update:", ""]
+    for _, r in actionable.iterrows():
+        lines.append(f"{r['Ticker']}: {r['PnL_Pct']:+.2f}% -- {r['Verdict']}")
+    return "\n".join(lines)
+
+
+def main(request: Any = None) -> Optional[tuple[str, int]]:
+    """
+    Branches cleanly on request is not None, same fix swings.py needed --
+    argparse must never see the container's own launch argv on an HTTP
+    invocation (that's what caused swings.py's Cloud Run crash earlier).
+    The HTTP path is deliberately narrower than the CLI: a scheduled
+    trigger should just run the check and notify, not import a CSV or
+    book a trade -- those stay manual, CLI-only actions.
+    """
+    if request is not None:
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        project_id = body.get("project_id", "sudarshan-442212")
+        no_telegram = bool(body.get("no_telegram", False))
+    else:
+        parser = argparse.ArgumentParser(description="Check real holdings against the floor+extension exit rule.")
+        parser.add_argument("--project-id", default="sudarshan-442212")
+        parser.add_argument("--import-csv", default=None,
+                             help="Path to a Zerodha Console holdings CSV export -- imports into "
+                                  "data_options.holdings before running the check")
+        parser.add_argument("--tradebook-csv", default=None,
+                             help="Path to a Zerodha tradebook export -- recovers real Entry_Date "
+                                  "(via FIFO) for holdings rows still defaulted to today")
+        parser.add_argument("--no-telegram", action="store_true", help="Skip sending the Telegram summary")
+        parser.add_argument("--book-profit-ticker", default=None, help="Ticker to book a sell against, e.g. DYCL")
+        parser.add_argument("--book-profit-qty", type=float, default=None, help="Quantity sold")
+        parser.add_argument("--book-profit-price", type=float, default=None, help="Actual sell price")
+        parser.add_argument("--book-profit-notes", default=None, help="Optional note for the realized_trades row")
+        args = parser.parse_args()
+
+        if args.import_csv:
+            import_holdings_csv(args.import_csv, args.project_id)
+
+        if args.tradebook_csv:
+            apply_tradebook_entry_dates(args.tradebook_csv, args.project_id)
+
+        if args.book_profit_ticker or args.book_profit_qty or args.book_profit_price:
+            if not (args.book_profit_ticker and args.book_profit_qty and args.book_profit_price):
+                raise SystemExit("--book-profit-ticker, --book-profit-qty, and --book-profit-price must all be given together")
+            book_profit(
+                args.book_profit_ticker, args.book_profit_qty, args.book_profit_price,
+                args.project_id, notes=args.book_profit_notes,
+            )
+
+        project_id = args.project_id
+        no_telegram = args.no_telegram
+
+    results_df = run_position_check(project_id)
+
+    # Regime check runs alongside, not instead of, the momentum check: the
+    # momentum rule answers "is the exit triggered", the regime answers
+    # "is the momentum rule even the right rule for this stock". A failure
+    # here must not take down the momentum check or the Telegram summary
+    # that already succeeded.
+    try:
+        run_regime_check(project_id)
+    except Exception as exc:
+        print(f"\nRegime check skipped/failed: {exc}")
+
+    if not no_telegram:
+        import os
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
+        if not bot_token or not chat_id_raw:
+            print("\nTelegram summary skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
+        else:
+            text = format_position_telegram_summary(results_df)
+            if text is None:
+                print("\nNothing actionable -- Telegram summary skipped.")
+            else:
+                try:
+                    chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
+                    failures = swings.send_telegram_to_all(text, bot_token, chat_ids)
+                    if failures:
+                        print(f"\nSent Telegram position summary to {len(chat_ids) - len(failures)}/{len(chat_ids)} "
+                              f"recipient(s); failed: {failures}")
+                    else:
+                        print(f"\nSent Telegram position summary to {len(chat_ids)} recipient(s).")
+                except Exception as exc:
+                    print(f"\nTelegram summary skipped/failed: {exc}")
+
+    if request is not None:
+        return (f"Position check completed: {len(results_df)} holdings checked", 200)
+
+
+if __name__ == "__main__":
+    main()

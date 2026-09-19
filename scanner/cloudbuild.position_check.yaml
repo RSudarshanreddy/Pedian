@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.position_check'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/position-check'
+      - '.'
+images:
+  - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/position-check'

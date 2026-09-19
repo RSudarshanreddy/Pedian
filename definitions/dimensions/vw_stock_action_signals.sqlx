@@ -1,0 +1,47 @@
+config {
+  type: "view",
+  schema: "data_options",
+  name: "vw_stock_action_signals"
+}
+
+-- Turns dim_lifecycle_stage's entry_eligible flag + vw_stock_lifecycle_transitions'
+-- day-over-day setup change into an explicit action:
+--   ENTRY -- the setup crossed from NOT entry_eligible into entry_eligible
+--            (coiling -> pullback_bounce, deep_pullback -> reclaim, below_trend ->
+--            reclaim, ...). This is "pullback -> buy."
+--   EXIT  -- the setup crossed the other way: it WAS entry_eligible and no longer
+--            is (pullback_bounce -> coiling, breakout -> extended, ...). The setup
+--            that justified being in the trade has decayed. This is "buy -> breakout
+--            -> exit" once breakout itself rolls over.
+-- A ticker's first-ever appearance (previous_setup_type IS NULL) counts as ENTRY if
+-- its setup_type is already entry_eligible, matching lifecycle_transition's own
+-- INITIAL handling.
+--
+-- NOTE: like dim_lifecycle_stage's own join, this uses LEFT JOINs so an
+-- unmapped/new setup_type lands with a NULL action_signal rather than being
+-- silently dropped.
+
+SELECT
+    t.*,
+    cur.entry_eligible AS currently_entry_eligible,
+    prev.entry_eligible AS previously_entry_eligible,
+
+    CASE
+        WHEN COALESCE(prev.entry_eligible, FALSE) = FALSE
+            AND COALESCE(cur.entry_eligible, FALSE) = TRUE
+            THEN 'ENTRY'
+
+        WHEN COALESCE(prev.entry_eligible, FALSE) = TRUE
+            AND COALESCE(cur.entry_eligible, FALSE) = FALSE
+            THEN 'EXIT'
+
+        ELSE NULL
+    END AS action_signal
+
+FROM ${ref("vw_stock_lifecycle_transitions")} t
+
+LEFT JOIN ${ref("dim_lifecycle_stage")} cur
+    ON cur.setup_type = t.setup_type
+
+LEFT JOIN ${ref("dim_lifecycle_stage")} prev
+    ON prev.setup_type = t.previous_setup_type
