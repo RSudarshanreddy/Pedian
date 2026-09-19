@@ -459,7 +459,7 @@ class ScannerConfig:
     #
     # Capping by RANK keeps the best N whatever they cost. On the live scan the
     # top 15 spanned scores 60.0-71.4 and prices Rs.275-1,169.
-    display_top_n: int = 10
+    display_top_n: int = 50
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -2101,20 +2101,24 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # Kept to one line per ticker on purpose -- score/entry/SL/target are all
     # in BigQuery (vw_daily_digest) for whoever wants to dig in; this is the
     # 5-second phone read, not the full record.
-    header_count = (f"top {len(fresh_buys)} of {total_fresh} candidates"
-                    if total_fresh > len(fresh_buys)
-                    else f"{total_fresh} candidate(s)")
-    lines = [f"Swing scan -- {run_time_ist}", f"{header_count}:", ""]
-    for _, r in fresh_buys.iterrows():
-        # "upside dominance", NOT "win rate" -- it is the share of forward
-        # windows in which the gain exceeded the loss, not a probability that
-        # a trade makes money. The old label was inherited from the retired
-        # 3%-floor backtest and overstated what the number means.
-        lines.append(f"{r['Ticker']} ({r['Setup_Type']}) -- upside dominance "
-                     f"{r['Upside_Dominance_Pct']:.0f}%, typical move {r['Expected_Move']:.0f}%")
+    # Name and Move%, nothing else.
+    #
+    # It used to carry setup type and upside dominance on every line, which
+    # made each entry long enough to wrap on a phone and buried the one number
+    # the list is ranked by. Everything dropped from here is still in the
+    # console output and in BigQuery -- this is the 5-second glance, not the
+    # record. Ticker is padded so the percentages line up in a column, which is
+    # what makes it skimmable rather than a paragraph.
+    width = max((len(str(t)) for t in fresh_buys["Ticker"]), default=10)
+    lines = [f"Swing scan {run_time_ist}", ""]
+    for n, (_, r) in enumerate(fresh_buys.iterrows(), start=1):
+        ticker = str(r["Ticker"]).replace(".NS", "")
+        lines.append(f"{n}. {ticker:<{width}}  {r['Expected_Move']:>5.1f}%")
     lines.append("")
-    lines.append(f"Captured at {run_time_ist} -- ranked by typical move. "
-                 f"Check current price before acting.")
+    lines.append(f"Move% = typical gain over {int(r['Move_Horizon_Days'])} sessions. "
+                 f"Ranked by it." if len(fresh_buys) else "")
+    if total_fresh > len(fresh_buys):
+        lines.append(f"Top {len(fresh_buys)} of {total_fresh}.")
     return "\n".join(lines)
 
 
