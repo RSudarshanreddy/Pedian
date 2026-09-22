@@ -2129,56 +2129,68 @@ def trigger_dataform_run(
 # =========================================================
 # SHORTLIST -- the names to actually act on
 # =========================================================
-# The full scan returns ~73 candidates. That is a research output, not a
+# The full scan returns ~75 candidates. That is a research output, not a
 # decision, and a list nobody can act on is worth the same as no list. This
 # cuts it to a number a person can hold positions in.
 #
-# Measured over 2,383 qualifying observations, 247 tickers, 108 decision dates
-# (2025-12-09 .. 2026-08-06), entry at next open, net of costs, ranked by
-# Expected_Move exactly as scan_tickers already sorts. ret15 / ret30 are mean
-# returns at those holding periods; halves are two disjoint TICKER halves:
-#     N     trades   ret15   ret30   win30   halves (15s)
-#      1       108   +3.81   +9.57   62.0%   -0.08 / 8.50   <- one half negative
-#      3       282   +4.88   +8.56   60.6%    4.82 / 4.95
-#      5       411   +4.05   +7.01   57.9%    4.26 / 3.81
-#     10       628   +3.69   +5.75   55.4%    3.30 / 4.07   <- set here
-#     15       781   +3.53   +5.98   56.3%    3.96 / 3.15
-#     25      1026   +3.32   +5.82   56.2%    3.77 / 2.83
+# READ THIS BEFORE TRUSTING THE TABLE BELOW. An earlier version of this sweep
+# was WRONG and briefly set this field to 10. It sampled each ticker every 3rd
+# session counting from THAT TICKER's own index, so tickers with different
+# history lengths landed on different calendar dates and never pooled: the
+# median "day" held 5 candidates, against the 72-80 a live scan produces. At a
+# pool of 5, "take the top 10" is "take all of them", so the sweep was not
+# measuring concentration at all. The figures below come from the corrected
+# run, where every ticker is evaluated on every session and each date pools the
+# whole universe exactly as the live scanner does (median 18 per date, mean 45,
+# max 126).
 #
-# SET TO 10 BY OWNER PREFERENCE, and the cost is real and stated: 10 returns
-# +3.69% against 3's +4.88% at 15 sessions, and +5.75% against +8.56% at 30.
-# Roughly a third of the measured edge, given up for seven more names to
-# choose among. That is a legitimate trade -- more names means capital spread
-# across more positions, which cuts single-name risk, and the account's worst
-# damage to date came from concentration (BSE alone was 30.8% of capital and
-# -26,552). Nothing here measures position sizing, so the backtest cannot see
-# that benefit; it only sees the per-trade return going down.
+# 7,359 qualifying observations, 262 tickers, 163 decision dates
+# (2025-12-09 .. 2026-08-07), entry at next open, net of costs, no lookahead,
+# ranked by Expected_Move exactly as scan_tickers already sorts:
+#     N     trades   ret15   ret30   win30   ticker halves (30s)
+#      1       163   +7.64  +18.35   66.3%   10.95 / 23.65  <- halves diverge
+#      3       489   +6.48  +12.79   62.4%   12.72 / 12.92  <- set here
+#      5       815   +3.96   +7.99   55.2%    9.05 /  7.28
+#     10      1495   +3.69   +5.99   54.4%    7.05 /  4.84
+#     25      2730   +3.08   +5.87   55.3%    7.29 /  4.09
+#     50      4281   +3.44   +6.45   57.9%    6.64 /  6.27
 #
-# 10 does hold up on the ticker split (3.30 / 4.07) better than 1 does
-# (-0.08 / 8.50), so it is not a fragile setting -- just a less sharp one.
+# 3 is chosen over 1 on STABILITY, not on mean. 1 returns more (+18.35%) but
+# its two disjoint ticker halves run 10.95 and 23.65 -- one half carries it,
+# which is the signature this file has learned to distrust. At 3 the halves are
+# 12.72 and 12.92, the closest agreement of any setting measured here, because
+# three names spread the idiosyncratic risk that one name concentrates.
 #
-# DELIBERATELY NO EXTRA GATE. Three were tested on top of this ranking and all
-# three made it worse, which is the opposite of the intuition (figures at N=3,
-# where they were swept):
-#     top3, no filter          +4.88%   halves  4.82 / 4.95
-#     + tail drawdown >= -12%  +2.38%   halves  3.27 / 1.48
-#     + tail drawdown >= -10%  +2.19%   halves -0.37 / 4.78
-#     + move stability <= 20   +4.14%   halves  5.27 / 3.12
-#     + move stability <= 15   +3.59%   halves  3.95 / 3.07
-# An ABSOLUTE tail floor is the wrong shape: a -17% tail on a stock that
-# travels 50% is not the same risk as a -17% tail on one that travels 15%, and
-# a flat floor scores them identically. It removes the big movers, which is
-# exactly where the return is.
+# The cost of going wider is steep and was badly understated by the broken
+# sweep: 10 returns +5.99% against 3's +12.79%, so more than half the edge goes
+# to buy seven extra names. Nothing here measures position sizing, so the
+# backtest cannot see the offsetting benefit of spreading capital -- that is a
+# real consideration, it is simply not in these numbers.
 #
-# The RELATIVE version (Expected_Move / |Tail_Drawdown_Pct|) does look better
-# -- +6.50% at >= 2.0, and both ticker halves improve (5.54 / 7.68). It is NOT
-# applied, because it fails the other split: by TIME it returned +8.87% in the
-# first half of the period against +2.65% in the second, where unfiltered ran
-# 5.70 / 3.27. So it helped in one regime and slightly hurt in the other, on
-# 189 trades. That is not enough to gate on. It is reported as a COLUMN
-# instead, so the pain is visible without being acted on. Revisit when
-# signal_outcomes carries real forward data (~December).
-SHORTLIST_N = 10
+# RANK KEY. Trailing 3-month return was tested as an alternative and NOT
+# adopted: at N=3 it returns +13.20% against Expected_Move's +12.79%, but its
+# ticker halves run 16.06 / 8.59 against 12.72 / 12.92. Half a point of mean is
+# not worth that much more spread. Note the two are already 0.70 correlated at
+# a 60-day volatility_lookback (0.15 at 180), so Expected_Move is substantially
+# a momentum measure now -- see volatility_lookback for what that change did.
+#
+# DELIBERATELY NO EXTRA GATE. Tail drawdown and move stability were both tested
+# as filters on top of this ranking and both made it worse. An ABSOLUTE tail
+# floor is the wrong shape: a -17% tail on a stock that travels 50% is not the
+# same risk as -17% on one that travels 15%, and a flat floor scores them
+# identically, so it deletes the big movers -- which is where the return is.
+# The relative form (Expected_Move / |Tail_Drawdown_Pct|) looked better on one
+# split and failed the other, so it is reported as a Pain COLUMN rather than
+# gated on. Revisit when signal_outcomes carries real forward data (~December).
+#
+# Shape was tested too, because "swing" ought to mean an oscillation rather
+# than a ramp. Neither zigzag cycle count (non-monotonic: 1 dip +5.74%, 2 dips
+# +2.13%, 4 dips +5.67%) nor path efficiency separated winners, and no shape
+# filter moved the top-N result outside noise. Worth knowing: NO qualifying
+# candidate is a straight ramp -- a path-efficiency > 0.7 filter caught 0 of
+# 2,383 -- because the volatility gates guarantee heavy day-to-day zigzag. The
+# candidates oscillate; they simply oscillate around a rising line.
+SHORTLIST_N = 3
 # How far back to count previous appearances. ~45 calendar days covers roughly
 # 30 sessions, the same horizon the move profile measures over.
 STREAK_LOOKBACK_DAYS = 45
@@ -2190,25 +2202,30 @@ def lookup_list_streak(tickers: list[str], project_id: str, dataset_id: str,
 
     This exists because repeat appearances turned out to be a POSITIVE signal,
     which is the opposite of how a recurring name usually reads. Measured on
-    the top-10 list, mean 30-session return by how many times the name had
-    already appeared:
-        1st appearance   n= 90   +4.58%   win 47.8%
-        2nd              n= 73   +5.26%   win 53.4%
-        3rd              n= 64   +8.61%   win 56.2%
-        4th-6th          n=144   +8.34%   win 64.6%
-        7th or later     n=257   +4.14%   win 53.3%
-    So a name on its 3rd to 6th scan is the best of them -- roughly double a
-    first appearance -- and a familiar name is not a used-up one.
+    the top-3 list over 163 decision dates, mean 30-session return by how many
+    times the name had already appeared:
+        1st appearance   n= 37   +1.52%   win 37.8%
+        2nd              n= 32   +3.32%   win 40.6%
+        3rd              n= 28   +7.16%   win 42.9%
+        4th-6th          n= 73   +7.66%   win 45.2%
+        7th-15th         n=144  +17.47%   win 74.3%
+        16th or later    n=175  +16.11%   win 72.0%
+    Monotonic until it plateaus around the 7th. A name showing up for the tenth
+    time is not a stale signal being repeated -- it is the best thing on the
+    list, and a name appearing for the first time is close to a coin flip.
 
-    Note the DECAY after the 6th. At N=3 that tail-off did not appear (4th+
-    held at +9.41%), so it shows up only once the list is wide enough to carry
-    names that have drifted down the ranking and are sitting near the cut. Read
-    a count above ~6 as neutral rather than as more of a good thing.
+    TREAT THIS AS WEAK. Those 489 slots are filled by only 37 distinct tickers,
+    so the late-appearance rows are a handful of persistent names counted many
+    times over, not 175 independent observations. There is no lookahead (the
+    move profile's window closes 30 sessions before the decision), but a stock
+    that holds a top-3 rank for months is by construction one whose move regime
+    persisted, and this cannot separate "persistence predicts" from "persistence
+    is what we selected on". It is enough to stop treating a familiar name as
+    used up. It is not enough to size a position on.
 
-    Read all of it as weak evidence, not a rule. Those rows come from only 90
-    distinct tickers, so they are far from independent observations, and the
-    whole sample is 8 months of one market. It is enough to stop treating a
-    familiar name as stale. It is not enough to size a position on.
+    An earlier version of this docstring quoted a decay after the 6th
+    appearance. That came from the broken date-pooling sweep described above
+    SHORTLIST_N and does not survive the corrected run.
 
     Best-effort by design: returns {} on any failure. A missing streak column
     must never cost you a scan that already succeeded.
@@ -2297,9 +2314,9 @@ def format_shortlist(short: pd.DataFrame, config: ScannerConfig) -> list[str]:
     lines.append("")
     lines.append("Pain = Move% / tail drawdown -- higher is a smoother ride. Shown, "
                  "not filtered on: it failed a time split.")
-    lines.append("Scans = times on this list in the last 45 days. 3rd-6th has done "
-                 "BEST (+8.5% over 30 sessions against +4.6% for a first); past "
-                 "the 6th it flattens back out.")
+    lines.append("Scans = times on this list in the last 45 days. Higher has done "
+                 "better and keeps doing so: a 1st appearance averaged +1.5% over "
+                 "30 sessions, a 7th-or-later +17.5%. Only 37 names behind that.")
     return lines
 
 
@@ -2320,8 +2337,8 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     if candidates.empty:
         return None
 
-    # Sends the SHORTLIST -- the same three names the console prints, in the
-    # same order, with the same stops. Not the top 10, not fresh BUYs.
+    # Sends the SHORTLIST -- the same names the console prints, in the same
+    # order, with the same stops. Not the top 10, not fresh BUYs.
     #
     # The history of this function is a history of sending the wrong rows. It
     # began as (Action == BUY and Setup_Age_Days == 1), and both halves of that
@@ -2342,9 +2359,8 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
         lines.append("Nothing qualified today.")
         return "\n".join(lines)
 
-    # Two lines per name, not three. At SHORTLIST_N = 10 a third line would
-    # push this past 30 lines, which is a scroll rather than a glance, and the
-    # whole point of this message is that it can be read at a traffic light.
+    # Two lines per name. Three names, so this lands at ~9 lines -- a glance
+    # rather than a scroll, which is the whole point of the message.
     width = max(len(str(t).replace(".NS", "")) for t in short["Ticker"])
     for n, (_, r) in enumerate(short.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
