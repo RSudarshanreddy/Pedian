@@ -1,50 +1,40 @@
 """
-SWING SCANNER -- buy the dip, in a stock that keeps coming back
+VOLATILITY MOMENTUM SCANNER
 
-Rebuilt 2026-09-23. The previous contents of this file ranked stocks by how
-hard they were CURRENTLY moving, which measurement showed to be a momentum
-screener wearing a swing name (Expected_Move correlates +0.701 with trailing
-3-month return). That logic now lives in momentum.py, unchanged and still
-deployed. This file is the strategy the name always claimed.
+Finds NSE stocks that are moving hard RIGHT NOW and ranks them by how far they
+have been travelling. Split out of swings.py on 2026-09-23, because measurement
+showed the two premises are different strategies that happen to share a
+universe filter -- see swings.py for the swing (buy-the-dip) side. Their picks
+overlap only 10%.
 
-THE RULE. Among stocks that qualify on volatility and liquidity, wait until one
-has fallen at least min_dip_pct from its 20-session high while still holding
-above its 50-day average, then rank what is left by the stock's OWN history of
-falling and recovering.
+Do not mistake this for a swing scanner. It never buys a trough. Measured
+decomposition of what each layer contributes (mean 30-session return, entry at
+next open, net of costs):
+    every observation, no filter      n=162,252   +0.87%
+    + universe (price, liquidity)     n= 31,015   +1.77%
+    + volatility identity + character n= 11,727   +4.46%
+    + move profile gate (typ >= 14)   n=  3,705   +3.95%
+    + rank by Expected_Move, take 3   n=    347   +9.24%
+The RANKER does more work than the entire gate stack. Inside the qualified
+pool, Expected_Move is a step function rather than a gradient -- nothing below
+roughly a 27% typical move is worth owning:
+    Q1 15.2% -> +1.63%   Q2 18.0% -> +0.18%   Q3 21.6% -> +1.62%
+    Q4 27.1% -> +8.78%   Q5 40.9% -> +7.59%
 
-MEASURED, 160,308 observations, 2 years, entry at next open, net of costs, no
-lookahead, top 3 per day held 30 sessions:
-    rule                                    dates trades  ret30   win  halves
-    momentum (the old contents, same pool)    136    363  +7.70  57.3  6.07/8.98
-    dip>=12 + above MA50, rank bounce         75    157 +10.06  65.0  9.61/10.62
-    dip>=12 + above MA50, rank Expected_Move  75    157  +9.06  62.4 10.87/6.87
-    dip>=12 + above MA50, rank deepest dip    75    157  +8.76  60.5 11.40/5.95
-    dip>=8  + above MA50, rank bounce        115    280  +6.99  60.4  8.96/4.40
-    dip>=12, NO trend filter                 126    308  +6.09  58.8  7.23/4.53
-All three components earn their place: the dip, the trend filter (worth 4
-points) and the bounce-history ranker (worth 1 point over ranking by
-Expected_Move). Time halves are 9.10 / 10.76, the steadiest result measured.
+At a 60-day volatility_lookback, Expected_Move correlates +0.701 with trailing
+3-month return (it was +0.152 at 180), so this is substantially a momentum
+measure. Momentum paid over the tested period INCLUDING through market
+declines -- when the Nifty fell over the next 30 sessions, the hottest quintile
+returned +12.09% against the coldest quintile's -2.28% -- but that is 8 months
+of one market.
 
-WHY BUYING THE DIP WORKS HERE. Forward return by how far the stock has fallen
-from its 20-session high, across the qualified pool:
-    -20..-12%  n=1667  +7.61%  win 63.3%      -8..-4%   n=2784  +3.59%
-    -12..-8%   n=1809  +5.14%  win 57.9%      at high   n=2825  +3.93%
-Roughly double the return for buying a 12-20% pullback over buying the high.
-
-PROVISIONAL -- read this before trusting the numbers above. The winning cell is
-also the smallest: 157 trades on overlapping 30-session windows is perhaps 5-6
-independent observations, and the shallower dip>=8 variant is WORSE, so the
-effect lives entirely in the thinnest slice. That is the shape of an overfit
-even though both splits are clean. Treat this as a hypothesis under test until
-signal_outcomes carries real forward data (~December), and prefer momentum.py
-for anything that has to work.
-
-It fires on roughly every other session (75 of 164 dates), by design -- a dip
-that deep is not an everyday event.
-
+- Volatility is judged over the last volatility_lookback sessions (60).
+- Measures how far a stock travels over move_horizon_days (30) in BOTH
+  directions, net of costs. It does not threshold that into a win rate.
 - Does NOT model an exit. Exits are a human decision.
-- Ranked by Bounce_Median. Action/Setup are recorded but do not order the list.
-- Written to BigQuery table `swings`, keyed on Run_Timestamp.
+- Ranked by Expected_Move. Score is stored but does not predict (-0.065 vs
+  forward return); nor does Action (BUY +3.54% vs WATCH +4.42% at 30 sessions).
+- Every run's candidates are written to BigQuery, keyed on Run_Timestamp.
 """
 
 
@@ -71,7 +61,7 @@ LOGGER = logging.getLogger(__name__)
 
 NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 REQUIRED_COLUMNS = {"Open", "High", "Low", "Close", "Volume"}
-DEFAULT_BQ_TABLE_ID = "swings"
+DEFAULT_BQ_TABLE_ID = "momentum"
 
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 # NSE continuous trading ends 15:30 IST. Yahoo keeps revising the day's bar for
@@ -173,39 +163,11 @@ class ScannerConfig:
     min_persistence_sample: int = 20
     # ~6 weeks, the timescale the winning trades actually played out on.
     move_horizon_days: int = 30
-    # A QUALITY FLOOR under the bounce ranker, not the membership gate it is in
-    # momentum.py (14.0). Bounce_Median alone will happily rank a stock that
-    # recovers 28% from dips but travels only 7% over 30 sessions -- BALUFORGE
-    # on the first live run, Score 31.9, RR 0.8, ranked 3rd.
-    #
-    # Measured on the dip cohort, top 3/day, 30-session hold:
-    #   no floor   +10.14%  win 65.4%  halves 10.85 / 9.29
-    #   >= 10      +10.41%  win 67.7%  halves 10.18 / 10.76   <- set here
-    #   >= 14       +8.90%  win 66.1%  halves  8.21 / 9.49
-    # 10 is better on return, win rate AND balance; 14 (momentum.py's value)
-    # overshoots and costs 1.5 points. The gate that decides membership here is
-    # the dip, not this.
-    min_typical_move_pct: float = 10.0
-
-    # --- The swing rule ---
-    # How far below its 20-session high the stock must have fallen. Measured
-    # across the qualified pool, forward 30-session return by dip depth:
-    #   -20..-12% +7.61% (win 63.3%)   -8..-4%  +3.59%
-    #   -12..-8%  +5.14% (win 57.9%)   at high  +3.93%
-    # 12 is where the step happens. At 8 the top-3 rule returns +6.99% against
-    # +10.06% at 12 -- but note the deeper cell is also the thinner one, which
-    # is the overfitting risk named in the module docstring.
-    min_dip_pct: float = 12.0
-    # The dip must be a pullback in an uptrend, not a falling knife. Dropping
-    # this costs 4 points: +10.06% with it, +6.09% without.
-    trend_ma_period: int = 50
-    # Reversal threshold for the zigzag that counts completed trough->peak legs.
-    # 5% is large enough that ordinary daily noise in a stock with 4-6% average
-    # range does not register as a swing.
-    zigzag_pct: float = 5.0
-    # Minimum completed bounce legs before a stock's bounce history means
-    # anything. A single leg is an anecdote.
-    min_bounce_legs: int = 1
+    # THE gate that decides membership. Swept requiring both period halves to
+    # agree: 10 -> +3.07%, 12 -> +3.79%, 14 -> +4.30%, 15 -> +4.56%,
+    # 16 -> +4.15% (degrades). Stage 1 alone returned +0.66%, Stage 1+2 +1.19%,
+    # Stage 1+2+3 +3.07% -- this is what earns Stage 3 its place.
+    min_typical_move_pct: float = 14.0
     # Scoring only. Gain/pain and tail drawdown were gates briefly and it was a
     # mistake: a 3.0 ratio floor excluded ANTELOPUS and a -12% tail floor
     # excluded SHILPAMED -- two of the four trades this exists to find.
@@ -273,14 +235,10 @@ class ScannerConfig:
     verbose: bool = False
 
     def __post_init__(self) -> None:
-        if self.min_typical_move_pct < 0:
+        if self.min_typical_move_pct <= 0:
             raise ValueError(
-                f"min_typical_move_pct must be >= 0 (got {self.min_typical_move_pct}). "
-                "0 is valid here and means 'record it, do not gate on it' -- "
-                "momentum.py is the file that gates on it."
+                f"min_typical_move_pct must be > 0 (got {self.min_typical_move_pct})"
             )
-        if self.min_dip_pct <= 0:
-            raise ValueError(f"min_dip_pct must be > 0 (got {self.min_dip_pct})")
         if self.move_horizon_days < 5:
             raise ValueError(
                 f"move_horizon_days must be >= 5 (got {self.move_horizon_days}) -- "
@@ -664,17 +622,6 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig,
         data["Close"].rolling(20).mean() * data["Volume"].rolling(20).mean()
     ) / 10_000_000
 
-    # The swing rule's two price conditions, both trailing.
-    #
-    # dip_from_high is NEGATIVE when below the 20-session high, and is measured
-    # on CLOSES rather than on high_20 (which uses intraday highs) because that
-    # is what the backtest measured. Using the intraday high would report a
-    # deeper dip than was tested and quietly loosen min_dip_pct.
-    data["high_20_close"] = data["Close"].rolling(config.breakout_lookback).max()
-    data["dip_from_high"] = (data["Close"] / data["high_20_close"] - 1) * 100
-    data["trend_ma"] = data["Close"].rolling(config.trend_ma_period).mean()
-    data["above_trend"] = data["Close"] > data["trend_ma"]
-
     # ATR(14) -- simple rolling mean of true range
     prev_close = data["Close"].shift(1)
     tr = pd.concat(
@@ -853,71 +800,6 @@ def upside_rate(data: pd.DataFrame, config: ScannerConfig) -> float:
         total += 1
         wins += peak > abs(trough)
     return round(wins / total * 100, 1) if total else 0.0
-
-
-def zigzag_pivots(closes: np.ndarray, pct: float) -> list[tuple[int, str]]:
-    """Turning points, confirmed only after price reverses by `pct`.
-
-    Returns [(index, 'H'|'L')]. A pivot is only emitted once the reversal is
-    confirmed, so this never uses information from beyond the bar it is called
-    with -- the confirming move has already happened by then.
-    """
-    if len(closes) < 2:
-        return []
-    pivots: list[tuple[int, str]] = []
-    ext = closes[0]; ext_i = 0; direction = 0
-    for i in range(1, len(closes)):
-        if direction > 0:
-            if closes[i] > ext:
-                ext, ext_i = closes[i], i
-            elif closes[i] <= ext * (1 - pct / 100):
-                pivots.append((ext_i, "H")); direction = -1; ext, ext_i = closes[i], i
-        elif direction < 0:
-            if closes[i] < ext:
-                ext, ext_i = closes[i], i
-            elif closes[i] >= ext * (1 + pct / 100):
-                pivots.append((ext_i, "L")); direction = 1; ext, ext_i = closes[i], i
-        else:
-            if closes[i] >= ext * (1 + pct / 100):
-                direction = 1; ext, ext_i = closes[i], i
-            elif closes[i] <= ext * (1 - pct / 100):
-                direction = -1; ext, ext_i = closes[i], i
-            elif closes[i] > ext:
-                ext, ext_i = closes[i], i
-    return pivots
-
-
-def measure_bounce_history(data: pd.DataFrame, config: ScannerConfig) -> tuple[float, int]:
-    """This stock's own record of falling and coming back.
-
-    Returns (median completed trough->peak gain %, number of such legs) over the
-    last persistence_lookback sessions.
-
-    This is the swing analogue of Expected_Move, and it is what this file ranks
-    on. The distinction matters: Expected_Move asks "how far does it travel",
-    which a stock going up in a straight line answers well; this asks "when it
-    falls, how far does it come back", which only an oscillator answers well. A
-    straight ramp scores 0 here because it never completes a trough->peak leg.
-
-    Measured: ranking the dip cohort by this returned +10.06% against +9.06%
-    for ranking the same cohort by Expected_Move and +8.76% for ranking by
-    deepest dip. Across the whole qualified pool it correlates +0.048 with
-    forward 30-session return -- weaker than Expected_Move's +0.064, so it is
-    NOT a better general predictor. It is better specifically at ordering
-    stocks that have already dipped, which is the only population this file
-    ever ranks.
-    """
-    window = data["Close"].tail(config.persistence_lookback).to_numpy()
-    window = window[np.isfinite(window)]
-    if len(window) < config.persistence_lookback // 2:
-        return 0.0, 0
-    pivots = zigzag_pivots(window, config.zigzag_pct)
-    legs = [
-        (window[b] - window[a]) / window[a] * 100
-        for (a, ka), (b, kb) in zip(pivots, pivots[1:])
-        if ka == "L" and kb == "H" and window[a] > 0
-    ]
-    return (round(float(np.median(legs)), 2) if legs else 0.0), len(legs)
 
 
 def measure_spike_ratio(data: pd.DataFrame, config: ScannerConfig) -> float:
@@ -1282,34 +1164,15 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if max_drawdown_pct < config.min_drawdown_pct:
         return None
 
-    # --- THE SWING RULE. These two conditions decide membership in this file,
-    # --- where momentum.py uses min_typical_move_pct instead.
-    dip_from_high = float(latest["dip_from_high"])
-    above_trend = bool(latest["above_trend"]) if pd.notna(latest["above_trend"]) else False
-    if pd.isna(dip_from_high) or pd.isna(latest["trend_ma"]):
-        return None
-    # Has it actually fallen far enough to be a dip worth buying?
-    if dip_from_high > -config.min_dip_pct:
-        return None
-    # Is this a pullback in an uptrend rather than a falling knife? Worth 4
-    # points of return (+10.06% with, +6.09% without).
-    if not above_trend:
-        return None
-
-    bounce_median, bounce_legs = measure_bounce_history(data, config)
-    if bounce_legs < config.min_bounce_legs or bounce_median <= 0:
-        return None
-
     typical_move, sample_size, typical_drawdown, move_stability, tail_drawdown = run_move_profile(data, config)
-    # Quality floor, not the membership gate -- see min_typical_move_pct.
+    if sample_size < config.min_persistence_sample:
+        return None
+    # The one gate here: does it actually travel? Asymmetry and tail drawdown
+    # are scored, not gated -- see the config comment above.
     if typical_move < config.min_typical_move_pct:
         return None
     upside_dominance = upside_rate(data, config)
-    # min_persistence_sample is NOT enforced here. It guards the RELIABILITY of
-    # Expected_Move, which this file records but does not rank on -- and in the
-    # gate test it rejected a cohort that went on to return +8.30% against the
-    # survivors' +3.95%, because a thin sample means the stock only recently
-    # became volatile. momentum.py still enforces it.
+    # move_stability is scoring-only (see calculate_score) -- not a hard reject.
 
     action, setup_type, reason = get_entry_trigger(data, config)
     setup_age_days = compute_setup_age(data, config, setup_type)
@@ -1368,9 +1231,6 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "Move_Stability": move_stability,          # variability of that gain
         "Typical_Drawdown_Pct": typical_drawdown,  # median worst loss in the same windows
         "Tail_Drawdown_Pct": tail_drawdown,        # 10th-percentile (bad) window
-        "Bounce_Median": bounce_median,                # median trough->peak leg %
-        "Bounce_Legs": bounce_legs,                    # completed legs behind it
-        "Dip_From_High_Pct": round(dip_from_high, 2),  # negative: below 20D high
         "Spike_Ratio": round(spike_ratio, 2),          # p95 / median daily move
         "Max_Drawdown_1Y_Pct": max_drawdown_pct,       # worst peak-to-trough, trailing year
         "Traded_Value_Cr": round(avg_traded_value20_cr, 2),
@@ -1546,24 +1406,20 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
         return pd.DataFrame(), failures, 0
 
     df = pd.DataFrame(results)
-    # Ranked by Bounce_Median -- this stock's own history of recovering from a
-    # dip -- NOT by Expected_Move, Score or Action.
+    # Ranked by Expected_Move, NOT Score and NOT Action.
     #
-    # Measured on the dip cohort, top 3 per day, 30-session hold:
-    #   rank by Bounce_Median  +10.06%  win 65.0%  halves 9.61 / 10.62
-    #   rank by Expected_Move   +9.06%  win 62.4%  halves 10.87 / 6.87
-    #   rank by deepest dip     +8.76%  win 60.5%  halves 11.40 / 5.95
-    # Bounce history wins on return, win rate AND balance between the two
-    # disjoint ticker halves.
+    # Score does not predict: across 991 stored signals it correlated -0.065
+    # with forward return, was positive on only 4 of 15 bar dates, and scored
+    # ANTELOPUS/SHILPAMED/AEGISLOG at 48.1 against a 49.0 population mean. It
+    # scored BLISSGVS 7.9 through a +177% run. Still computed and stored.
     #
-    # Note it is the better ranker only for THIS population. Across the whole
-    # qualified pool it correlates +0.048 with forward return against
-    # Expected_Move's +0.064. It is better at ordering stocks that have already
-    # fallen, which is the only population this file ever sees.
+    # Action does not either: BUY +3.54% vs WATCH +4.42% at 30 sessions, so
+    # floating BUY to the top handed the reader the weaker cohort first.
     #
-    # Score and Action are stored but rank nothing: Score correlated -0.065
-    # with forward return, and BUY returned +3.54% against WATCH's +4.42%.
-    df = df.sort_values(["Bounce_Median", "Expected_Move"], ascending=[False, False])
+    # Expected_Move is the one measured quantity that correlated positively and
+    # repeatably (+0.126 to +0.143), and it is already what min_typical_move_pct
+    # gates on, so the list is ordered by the same thing that decides membership.
+    df = df.sort_values(["Expected_Move", "Score"], ascending=[False, False])
 
     total_quality_candidates = len(df)
     # top_n caps STORAGE only; the display cap is applied by the caller. These
@@ -1596,9 +1452,6 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Move_Stability", "FLOAT64"),
     bigquery.SchemaField("Typical_Drawdown_Pct", "FLOAT64"),
     bigquery.SchemaField("Tail_Drawdown_Pct", "FLOAT64"),
-    bigquery.SchemaField("Bounce_Median", "FLOAT64"),
-    bigquery.SchemaField("Bounce_Legs", "INT64"),
-    bigquery.SchemaField("Dip_From_High_Pct", "FLOAT64"),
     bigquery.SchemaField("Spike_Ratio", "FLOAT64"),
     bigquery.SchemaField("Max_Drawdown_1Y_Pct", "FLOAT64"),
     bigquery.SchemaField("Traded_Value_Cr", "FLOAT64"),
@@ -1925,9 +1778,9 @@ def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list
 # =========================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Volatility swing scanner - finds stocks that genuinely move, "
-                    "measures how far they travel over a 30-session window in both "
-                    "directions, and ranks them. It does not model an exit."
+        description="Volatility momentum scanner - finds stocks moving hard now and "
+                    "ranks them by how far they typically travel over 30 sessions. "
+                    "It does not model an exit and it never buys a dip."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
@@ -1941,12 +1794,8 @@ def parse_args() -> argparse.Namespace:
     # silently stricter than the deployed HTTP path, which reads the dataclass.
     p.add_argument("--min-volatile-days", default=ScannerConfig.min_volatile_days, type=int)
 
-    p.add_argument("--min-dip", default=ScannerConfig.min_dip_pct, type=float,
-                    help="How far below the 20-session high the stock must have fallen")
-    p.add_argument("--trend-ma", default=ScannerConfig.trend_ma_period, type=int,
-                    help="Moving average the stock must still be above")
     p.add_argument("--min-typical-move", default=ScannerConfig.min_typical_move_pct, type=float,
-                    help="Recorded, not gated on, in this file -- see momentum.py")
+                    help="Minimum typical move %% over move_horizon_days -- see run_move_profile")
     p.add_argument("--move-horizon-days", default=ScannerConfig.move_horizon_days, type=int,
                     help="Forward window the move profile measures over")
     p.add_argument("--min-persistence-sample", default=ScannerConfig.min_persistence_sample, type=int)
@@ -2020,8 +1869,6 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             range_event_threshold=float(body.get("range_event_threshold", ScannerConfig.range_event_threshold)),
             min_volatile_days=int(body.get("min_volatile_days", ScannerConfig.min_volatile_days)),
             min_typical_move_pct=float(body.get("min_typical_move", ScannerConfig.min_typical_move_pct)),
-            min_dip_pct=float(body.get("min_dip", ScannerConfig.min_dip_pct)),
-            trend_ma_period=int(body.get("trend_ma", ScannerConfig.trend_ma_period)),
             move_horizon_days=int(body.get("move_horizon_days", ScannerConfig.move_horizon_days)),
             min_persistence_sample=int(body.get("min_persistence_sample", ScannerConfig.min_persistence_sample)),
             min_price=float(body.get("min_price", ScannerConfig.min_price)),
@@ -2056,8 +1903,6 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             range_event_threshold=args.range_event_threshold,
             min_volatile_days=args.min_volatile_days,
             min_typical_move_pct=args.min_typical_move,
-            min_dip_pct=args.min_dip,
-            trend_ma_period=args.trend_ma,
             move_horizon_days=args.move_horizon_days,
             min_persistence_sample=args.min_persistence_sample,
             min_price=args.min_price,
@@ -2090,13 +1935,9 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
           f"(>= {config.min_volatility_ratio:.0%})")
     print(f"Stop: ATR/structure only, risk capped at {config.max_risk_pct}% "
           f"(no fixed profit floor -- exits are a human decision)")
-    print(f"Swing rule: fallen >= {config.min_dip_pct:.0f}% from the 20-session high, "
-          f"still above the {config.trend_ma_period}-day average")
-    print(f"Quality floor: typical 30-session gain >= {config.min_typical_move_pct:.0f}% "
-          f"(a floor under the ranker, not the membership gate)")
-    print(f"Ranked by: median recovery from a dip, over the last "
-          f"{config.persistence_lookback} sessions ({config.zigzag_pct:.0f}% zigzag, "
-          f"{config.min_bounce_legs}+ completed legs)")
+    print(f"Move profile: typical gain >= {config.min_typical_move_pct}% over "
+          f"{config.move_horizon_days} sessions "
+          f"({config.min_persistence_sample}+ eligible days in last {config.persistence_lookback})")
     print(f"Scanning {len(tickers)} tickers...")
     print("-" * 80)
 
@@ -2123,11 +1964,10 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         # 0-100 scale (see the field comment), so there is no lower value left
         # that means anything as a relaxation hint. min_typical_move_pct is
         # what actually decides membership now.
-        print(f"  --min-dip 8                  (shallower dip, now {config.min_dip_pct:.0f}%)")
+        print(f"  --min-typical-move 5         (lower move bar, now {config.min_typical_move_pct:.0f})")
         print(f"  --min-avg-volatility 3.0     (lower volatility bar, now {config.min_avg_volatility})")
+        print(f"  --min-persistence-sample 30  (allow smaller sample, now {config.min_persistence_sample})")
         print(f"  --max-price 2000             (widen the universe, now {config.max_price:.0f})")
-        print("  A quiet day here is NORMAL: this rule fired on 75 of 164 tested")
-        print("  sessions. A dip that deep is not an everyday event.")
         return (message, 200) if request is not None else None
 
     display = candidates
@@ -2145,20 +1985,20 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     # "BUY first" after Action stopped being one. A header that describes a
     # different ordering than the rows below it is worse than no header, because
     # it is believed.
-    print("RESULTS (ranked by Bounce% -- this stock's median recovery from a dip)")
-    print(f"Every row has fallen >= {config.min_dip_pct:.0f}% from its 20-session high and is still")
-    print(f"above its {config.trend_ma_period}-day average. Action/Setup do NOT order the list.")
+    print("RESULTS (ranked by Move% -- typical 30-session gain. Not by Score, not by Action)")
+    print("Age = consecutive days this Setup has held. Action/Setup describe today's price")
+    print("structure; they do NOT order the list and BUY has not been shown to beat WATCH.")
     print("-" * 100)
-    header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Dip%':>7} {'Bounce%':>8} {'Legs':>5} "
-              f"{'Score':>6} {'Vol%':>6} {'Move%':>7} {'TailDD':>8} {'RR':>5} "
+    header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
+              f"{'Upside%':>9} {'Stabil':>7} {'Move%':>8} {'TailDD':>8} {'RR':>5} "
               f"{'Entry':>9} {'SL':>9} {'MovePx':>9}")
     print(header)
     print("-" * 100)
     for _, r in display.iterrows():
-        print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} "
-              f"{r['Dip_From_High_Pct']:>6.1f}% {r['Bounce_Median']:>7.1f}% {r['Bounce_Legs']:>5} "
+        print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} {r['Setup_Age_Days']:>4} "
               f"{r['Score']:>6.1f} {r['Avg_Volatility']:>5.1f}% "
-              f"{r['Expected_Move']:>6.1f}% {r['Tail_Drawdown_Pct']:>7.1f}% {r['RR_Ratio']:>5.1f} "
+              f"{r['Upside_Dominance_Pct']:>8.0f}% {r['Move_Stability']:>6.1f} "
+              f"{r['Expected_Move']:>7.1f}% {r['Tail_Drawdown_Pct']:>7.1f}% {r['RR_Ratio']:>5.1f} "
               f"{r['Entry']:>9.2f} {r['Stop_Loss']:>9.2f} {r['Typical_Move_Price']:>9.2f}")
 
     if output_path:

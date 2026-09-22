@@ -1,0 +1,21 @@
+# Momentum scanner. Identical to Dockerfile except for which source file it
+# serves -- the two scanners are separate Cloud Run services writing to
+# separate BigQuery tables, because they are different strategies whose picks
+# overlap only 10% (see the docstrings in src/momentum.py and src/swings.py).
+#
+# Explicit Dockerfile instead of Cloud Run's buildpack auto-detection --
+# buildpacks picked a minimal base image missing libsqlite3, which yfinance's
+# cookie/cache layer requires (see load_yfinance() in src/swings.py). Standard
+# Debian-based python:3.13-slim always ships with a working sqlite3 module.
+
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/momentum.py .
+
+ENV PORT=8080
+CMD exec functions-framework --target=main --source=momentum.py --port=${PORT}
