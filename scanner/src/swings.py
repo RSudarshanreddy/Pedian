@@ -203,13 +203,60 @@ class ScannerConfig:
     min_avg_traded_value_cr: float = 10.0
 
     # Volatility identity (what makes a stock "volatile")
-    volatility_lookback: int = 180
+    #
+    # 180 -> 60 on 2026-09-22. This is the change that addresses the blind spot
+    # this file has documented since the beginning: "a stock that became
+    # volatile only 30 days ago has its 180-day average diluted by 150 quiet
+    # sessions, so it reads as calm and is rejected."
+    #
+    # It is not an abstract concern. ANTELOPUS, one of the four target trades,
+    # was blocked at EVERY point before its +56.2% leg (585.90 -> 915.30). At
+    # the leg start its typical move read 5.6 on a 180-day window -- far below
+    # the 14 gate -- while the same measurement over the most recent sessions
+    # read 31.8 at 60 days and 38.9 at 50. It was already moving hard; the long
+    # window averaged that against six quiet months until it disappeared.
+    #
+    # Swept over 12 months on the full universe, 15-session hold, net, entry at
+    # next open, with the lookahead bug that flattered earlier runs removed:
+    #   180d (sample>=60)  n=1168  ret +1.92%  top5 +1.55%  halves 3.26 / 0.69
+    #    90d (sample>=30)  n=1982  ret +1.59%  top5 +3.23%  halves 1.76 / 1.43
+    #    60d (sample>=20)  n=2456  ret +2.25%  top5 +4.42%  halves 2.83 / 1.69
+    #    50d (sample>=17)  n=2624  ret +2.32%  top5 +6.18%  halves 2.97 / 1.70
+    # Shorter is better on every column AND the two disjoint ticker halves come
+    # closer together -- 180d has the widest split of any setting, which is what
+    # an edge resting on one half looks like. 50 measured best; 60 is chosen
+    # because it keeps more windows behind each median and this file has a
+    # history of the most extreme setting being the one that had to be undone.
+    #
+    # Known limit, stated so nobody re-litigates it: this does NOT rescue
+    # AEGISLOG, the +142.4% trade. It was genuinely dormant before that move --
+    # typical move 1.4-2.9 at every lookback from 40 to 180 days. No window
+    # length sees a stock that has not moved yet, and any gate loose enough to
+    # admit it would admit most of the market.
+    volatility_lookback: int = 60
     range_event_threshold: float = 3.5
     close_move_threshold: float = 2.5
     min_avg_volatility: float = 3.5
     min_median_volatility: float = 2.5
-    min_volatile_days: int = 30
+    # Scaled 30 -> 12 WITH the lookback, to hold the gate's behaviour fixed
+    # rather than its number. These two gates are redundant by design and only
+    # the tighter one ever binds: at a 180-day window the ratio demanded 36 days
+    # against this field's 30, so the RATIO bound. Leaving 30 in place at a
+    # 60-day window would silently flip that -- 30 of 60 sessions is 50%, two
+    # and a half times stricter than the 20% ratio -- and quietly become the
+    # strictest gate in the file. 12 is 0.20 * 60, which keeps the ratio binding
+    # exactly as before.
+    min_volatile_days: int = 12
     min_volatility_ratio: float = 0.20
+    # Kept at 180 deliberately, and NOT tied to volatility_lookback.
+    #
+    # measure_spike_ratio reads this. It is a p95/median ratio, and a p95 drawn
+    # from 60 observations is a far shakier statistic than one drawn from 180 --
+    # the 95th percentile of 60 points is essentially the third-largest value.
+    # The 4.5 threshold was calibrated on a 180-day window, so shortening the
+    # window would re-calibrate a gate nobody asked to change and quietly alter
+    # which stocks it rejects.
+    spike_lookback: int = 180
 
     # Move profile (measured over the MOST RECENT persistence_lookback days).
     #
@@ -229,8 +276,22 @@ class ScannerConfig:
     # survived a control for volatility -- within a FIXED volatility band the
     # low-move-rate tercile stayed worst in all three bands -- so it is not
     # just "volatile stocks are volatile" restated.
-    persistence_lookback: int = 180
-    min_persistence_sample: int = 60
+    # 180 -> 60, alongside volatility_lookback. See that field for the sweep and
+    # for the ANTELOPUS case that motivated it: the same stock reads typical
+    # move 5.6 over 180 days and 31.8 over 60, because the long window averages
+    # a live move against six dead months.
+    persistence_lookback: int = 60
+    # 60 -> 20, and this one is arithmetic rather than preference: a 60-day
+    # lookback can yield at most 60 forward windows, and eligibility (trailing
+    # volatility already >= min_avg_volatility) removes more, so a floor of 60
+    # would reject almost everything and the lookback change would look like it
+    # had broken the scanner.
+    #
+    # 20 is one third of the window, the same proportion the old 60-of-180 was.
+    # The honest cost: a median built from 20 windows is noisier than one from
+    # 76 (the old measured median). That is the price of seeing a move while it
+    # is happening instead of six months after.
+    min_persistence_sample: int = 20
     # Forward window the move profile measures over. 30 sessions ~ 6 weeks,
     # which is the timescale the winning trades actually played out on
     # (SHILPAMED reached +20.7% in 8 sessions and kept running to +58.8%).
@@ -1081,8 +1142,10 @@ def measure_spike_ratio(data: pd.DataFrame, config: ScannerConfig) -> float:
     Returns inf when there is too little history to judge, so the caller
     rejects rather than guesses.
     """
-    hist = data["abs_close_move"].tail(config.volatility_lookback).dropna()
-    if len(hist) < config.volatility_lookback // 2:
+    # spike_lookback, NOT volatility_lookback -- see that field for why this one
+    # stayed at 180 when the volatility window shortened to 60.
+    hist = data["abs_close_move"].tail(config.spike_lookback).dropna()
+    if len(hist) < config.spike_lookback // 2:
         return float("inf")
     median_move = float(hist.median())
     if median_move <= 0:
@@ -2063,12 +2126,190 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
-def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10) -> Optional[str]:
+# =========================================================
+# SHORTLIST -- the names to actually act on
+# =========================================================
+# The full scan returns ~73 candidates. That is a research output, not a
+# decision, and a list nobody can act on is worth the same as no list. This
+# cuts it to a number a person can hold positions in.
+#
+# Measured over 2,383 qualifying observations, 247 tickers, 108 decision dates
+# (2025-12-09 .. 2026-08-06), entry at next open, net of costs, ranked by
+# Expected_Move exactly as scan_tickers already sorts. ret15 / ret30 are mean
+# returns at those holding periods; halves are two disjoint TICKER halves:
+#     N     trades   ret15   ret30   win30   halves (15s)
+#      1       108   +3.81   +9.57   62.0%   -0.08 / 8.50   <- one half negative
+#      3       282   +4.88   +8.56   60.6%    4.82 / 4.95
+#      5       411   +4.05   +7.01   57.9%    4.26 / 3.81
+#     10       628   +3.69   +5.75   55.4%    3.30 / 4.07   <- set here
+#     15       781   +3.53   +5.98   56.3%    3.96 / 3.15
+#     25      1026   +3.32   +5.82   56.2%    3.77 / 2.83
+#
+# SET TO 10 BY OWNER PREFERENCE, and the cost is real and stated: 10 returns
+# +3.69% against 3's +4.88% at 15 sessions, and +5.75% against +8.56% at 30.
+# Roughly a third of the measured edge, given up for seven more names to
+# choose among. That is a legitimate trade -- more names means capital spread
+# across more positions, which cuts single-name risk, and the account's worst
+# damage to date came from concentration (BSE alone was 30.8% of capital and
+# -26,552). Nothing here measures position sizing, so the backtest cannot see
+# that benefit; it only sees the per-trade return going down.
+#
+# 10 does hold up on the ticker split (3.30 / 4.07) better than 1 does
+# (-0.08 / 8.50), so it is not a fragile setting -- just a less sharp one.
+#
+# DELIBERATELY NO EXTRA GATE. Three were tested on top of this ranking and all
+# three made it worse, which is the opposite of the intuition (figures at N=3,
+# where they were swept):
+#     top3, no filter          +4.88%   halves  4.82 / 4.95
+#     + tail drawdown >= -12%  +2.38%   halves  3.27 / 1.48
+#     + tail drawdown >= -10%  +2.19%   halves -0.37 / 4.78
+#     + move stability <= 20   +4.14%   halves  5.27 / 3.12
+#     + move stability <= 15   +3.59%   halves  3.95 / 3.07
+# An ABSOLUTE tail floor is the wrong shape: a -17% tail on a stock that
+# travels 50% is not the same risk as a -17% tail on one that travels 15%, and
+# a flat floor scores them identically. It removes the big movers, which is
+# exactly where the return is.
+#
+# The RELATIVE version (Expected_Move / |Tail_Drawdown_Pct|) does look better
+# -- +6.50% at >= 2.0, and both ticker halves improve (5.54 / 7.68). It is NOT
+# applied, because it fails the other split: by TIME it returned +8.87% in the
+# first half of the period against +2.65% in the second, where unfiltered ran
+# 5.70 / 3.27. So it helped in one regime and slightly hurt in the other, on
+# 189 trades. That is not enough to gate on. It is reported as a COLUMN
+# instead, so the pain is visible without being acted on. Revisit when
+# signal_outcomes carries real forward data (~December).
+SHORTLIST_N = 10
+# How far back to count previous appearances. ~45 calendar days covers roughly
+# 30 sessions, the same horizon the move profile measures over.
+STREAK_LOOKBACK_DAYS = 45
+
+
+def lookup_list_streak(tickers: list[str], project_id: str, dataset_id: str,
+                       table_id: str, bar_date: str) -> dict[str, int]:
+    """How many earlier scans put each ticker in the top SHORTLIST_N.
+
+    This exists because repeat appearances turned out to be a POSITIVE signal,
+    which is the opposite of how a recurring name usually reads. Measured on
+    the top-10 list, mean 30-session return by how many times the name had
+    already appeared:
+        1st appearance   n= 90   +4.58%   win 47.8%
+        2nd              n= 73   +5.26%   win 53.4%
+        3rd              n= 64   +8.61%   win 56.2%
+        4th-6th          n=144   +8.34%   win 64.6%
+        7th or later     n=257   +4.14%   win 53.3%
+    So a name on its 3rd to 6th scan is the best of them -- roughly double a
+    first appearance -- and a familiar name is not a used-up one.
+
+    Note the DECAY after the 6th. At N=3 that tail-off did not appear (4th+
+    held at +9.41%), so it shows up only once the list is wide enough to carry
+    names that have drifted down the ranking and are sitting near the cut. Read
+    a count above ~6 as neutral rather than as more of a good thing.
+
+    Read all of it as weak evidence, not a rule. Those rows come from only 90
+    distinct tickers, so they are far from independent observations, and the
+    whole sample is 8 months of one market. It is enough to stop treating a
+    familiar name as stale. It is not enough to size a position on.
+
+    Best-effort by design: returns {} on any failure. A missing streak column
+    must never cost you a scan that already succeeded.
     """
-    Builds the notification text: the top of the ranked list, which is the
-    same thing the console prints. Returns None only when the scan found
-    nothing at all.
+    if not tickers:
+        return {}
+    try:
+        client = bigquery.Client(project=project_id)
+        query = f"""
+        WITH ranked AS (
+          SELECT Ticker, Bar_Date,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY Run_Timestamp ORDER BY Expected_Move DESC, Score DESC
+                 ) AS rn
+          FROM `{project_id}.{dataset_id}.{table_id}`
+          WHERE Bar_Date >= DATE_SUB(@bar, INTERVAL @days DAY)
+            AND Bar_Date < @bar
+        )
+        SELECT Ticker, COUNT(DISTINCT Bar_Date) AS appearances
+        FROM ranked
+        WHERE rn <= @n AND Ticker IN UNNEST(@tickers)
+        GROUP BY Ticker
+        """
+        job = client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("bar", "DATE", bar_date),
+            bigquery.ScalarQueryParameter("days", "INT64", STREAK_LOOKBACK_DAYS),
+            bigquery.ScalarQueryParameter("n", "INT64", SHORTLIST_N),
+            bigquery.ArrayQueryParameter("tickers", "STRING", tickers),
+        ]))
+        return {row["Ticker"]: int(row["appearances"]) for row in job.result()}
+    except Exception as exc:
+        LOGGER.warning("Shortlist streak lookup failed (non-fatal): %s", exc)
+        return {}
+
+
+def _ordinal(n: int) -> str:
+    """2 -> '2nd'. 11-13 are the exceptions that a bare suffix table gets wrong."""
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def build_shortlist(candidates: pd.DataFrame, streaks: Optional[dict[str, int]] = None,
+                    n: int = SHORTLIST_N) -> pd.DataFrame:
+    """The top n of the already-ranked list, plus the two decision columns.
+
+    Adds nothing to the ranking -- `candidates` arrives sorted by Expected_Move
+    and this takes the head of it. What it adds is the context needed to act on
+    a name rather than merely read it: how much pain per unit of move
+    (Pain_Ratio) and how long it has been on the list (Days_On_List).
+    """
+    short = candidates.head(n).copy()
+    if short.empty:
+        return short
+    short["Pain_Ratio"] = (
+        short["Expected_Move"] / short["Tail_Drawdown_Pct"].abs().clip(lower=0.01)
+    ).round(1)
+    streaks = streaks or {}
+    short["Days_On_List"] = [int(streaks.get(t, 0)) + 1 for t in short["Ticker"]]
+    return short
+
+
+def format_shortlist(short: pd.DataFrame, config: ScannerConfig) -> list[str]:
+    """Console block. Deliberately the same content the Telegram message sends,
+    so the phone and the terminal can never disagree about what to buy."""
+    if short.empty:
+        return ["SHORTLIST: nothing qualified today."]
+    lines = [
+        "=" * 78,
+        f"SHORTLIST -- the {len(short)} to act on. Hold ~{config.move_horizon_days} sessions.",
+        "=" * 78,
+        f"{'':<3}{'Ticker':<13}{'Action':<8}{'Buy below':>10}{'Stop':>9}{'Move%':>7}"
+        f"{'Pain':>6}{'Scans':>6}  Note",
+    ]
+    for i, (_, r) in enumerate(short.iterrows(), start=1):
+        ticker = str(r["Ticker"]).replace(".NS", "")
+        note = (f"{_ordinal(int(r['Days_On_List']))} scan on the list"
+                if r["Days_On_List"] > 1 else "new today")
+        lines.append(
+            f"{i:<3}{ticker:<13}{r['Action']:<8}{r['Entry']:>10.2f}{r['Stop_Loss']:>9.2f}"
+            f"{r['Expected_Move']:>6.1f}%{r['Pain_Ratio']:>6.1f}"
+            f"{r['Days_On_List']:>6}  {note}"
+        )
+    lines.append("")
+    lines.append("Pain = Move% / tail drawdown -- higher is a smoother ride. Shown, "
+                 "not filtered on: it failed a time split.")
+    lines.append("Scans = times on this list in the last 45 days. 3rd-6th has done "
+                 "BEST (+8.5% over 30 sessions against +4.6% for a first); past "
+                 "the 6th it flattens back out.")
+    return lines
+
+
+def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
+                           short: Optional[pd.DataFrame] = None,
+                           horizon_days: int = 30) -> Optional[str]:
+    """
+    Builds the notification text: the shortlist, which is the same thing the
+    console prints at the top. Returns None only when the scan found nothing
+    at all.
 
     Includes the actual run time (IST, not just the date) in the header --
     with 4 scheduled runs a day, the same ticker can legitimately appear in
@@ -2079,44 +2320,41 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     if candidates.empty:
         return None
 
-    # Sends the top of the list by Expected_Move, NOT fresh BUYs only.
+    # Sends the SHORTLIST -- the same three names the console prints, in the
+    # same order, with the same stops. Not the top 10, not fresh BUYs.
     #
-    # The old filter was (Action == BUY and Setup_Age_Days == 1). Both halves
-    # of it turned out to select the wrong rows. BUY returned +0.33% against
-    # WATCH's +2.75%, and the two setups that generate a BUY -- breakout and
-    # pullback_bounce -- are the worst two of the seven. So the alert was
-    # reliably pushing the weakest names and staying silent about the
-    # strongest: through BLISSGVS's +177% run and E2E's +85% run the scanner
-    # said WATCH every single day, and Telegram therefore said nothing at all.
+    # The history of this function is a history of sending the wrong rows. It
+    # began as (Action == BUY and Setup_Age_Days == 1), and both halves of that
+    # selected badly: BUY returned +0.33% against WATCH's +2.75%, and the two
+    # setups that can produce a BUY are the worst two of the seven. Through
+    # BLISSGVS's +177% run and E2E's +85% run the scanner said WATCH every day,
+    # so Telegram said nothing at all. It then sent the top 10 by Expected_Move,
+    # which was honest but still a list to study rather than a decision.
     #
-    # An alert that fires only on the worst cohort is worse than no alert,
-    # because it is acted on. This now mirrors exactly what the console prints:
-    # the same rows, the same order, the same reasoning.
-    fresh_buys = candidates.head(limit)
-    total_fresh = len(candidates)
-
+    # Three names, a price to buy below, and a stop. Everything else -- score,
+    # setup, upside dominance, the other 70 candidates -- is in the console
+    # output and in BigQuery for whoever wants to dig. This is the 5-second
+    # phone read that a position can be opened from.
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
 
-    # Plain text, deliberately -- see send_telegram_notification for why.
-    # Kept to one line per ticker on purpose -- score/entry/SL/target are all
-    # in BigQuery (vw_daily_digest) for whoever wants to dig in; this is the
-    # 5-second phone read, not the full record.
-    # Name and Move%, nothing else.
-    #
-    # It used to carry setup type and upside dominance on every line, which
-    # made each entry long enough to wrap on a phone and buried the one number
-    # the list is ranked by. Everything dropped from here is still in the
-    # console output and in BigQuery -- this is the 5-second glance, not the
-    # record. Ticker is padded so the percentages line up in a column, which is
-    # what makes it skimmable rather than a paragraph.
-    width = max((len(str(t).replace(".NS", "")) for t in fresh_buys["Ticker"]), default=10)
     lines = [f"Swing scan {run_time_ist}", ""]
-    for n, (_, r) in enumerate(fresh_buys.iterrows(), start=1):
+    if short is None or short.empty:
+        lines.append("Nothing qualified today.")
+        return "\n".join(lines)
+
+    # Two lines per name, not three. At SHORTLIST_N = 10 a third line would
+    # push this past 30 lines, which is a scroll rather than a glance, and the
+    # whole point of this message is that it can be read at a traffic light.
+    width = max(len(str(t).replace(".NS", "")) for t in short["Ticker"])
+    for n, (_, r) in enumerate(short.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")
-    if total_fresh > len(fresh_buys):
-        lines.append("")
-        lines.append(f"Top {len(fresh_buys)} of {total_fresh}.")
+        streak = (f"  ({_ordinal(int(r['Days_On_List']))} scan)"
+                  if r["Days_On_List"] > 1 else "")
+        lines.append(f"{n:>2}. {ticker:<{width}}  {r['Action']}")
+        lines.append(f"    {r['Entry']:.0f} -> {r['Typical_Move_Price']:.0f}"
+                     f", stop {r['Stop_Loss']:.0f}{streak}")
+    lines.append("")
+    lines.append(f"Hold ~{horizon_days} sessions. {len(candidates)} candidates scanned.")
     return "\n".join(lines)
 
 
@@ -2317,8 +2555,9 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         table_id = args.table_id
 
     print(f"Universe: Rs.{config.min_price}-{config.max_price} | Liquidity >= {config.min_avg_traded_value_cr} Cr")
-    print(f"Volatility: 6-month avg >= {config.min_avg_volatility}% | median >= {config.min_median_volatility}% | "
-          f"{config.min_volatile_days}+ volatile days")
+    print(f"Volatility: last {config.volatility_lookback} sessions, avg >= {config.min_avg_volatility}% | "
+          f"median >= {config.min_median_volatility}% | {config.min_volatile_days}+ volatile days "
+          f"(>= {config.min_volatility_ratio:.0%})")
     print(f"Stop: ATR/structure only, risk capped at {config.max_risk_pct}% "
           f"(no fixed profit floor -- exits are a human decision)")
     print(f"Move profile: typical gain >= {config.min_typical_move_pct}% over "
@@ -2365,6 +2604,24 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     shown = len(display)
     display = display.head(config.display_top_n)
 
+    # --- shortlist: computed before anything is printed, because it is the
+    # --- output that matters and the 73-row table is the appendix to it.
+    streaks = {}
+    if not no_bq:
+        try:
+            streaks = lookup_list_streak(
+                candidates.head(SHORTLIST_N)["Ticker"].tolist(),
+                _resolve_project_id(project_id), dataset_id, table_id,
+                candidates.iloc[0]["Bar_Date"],
+            )
+        except Exception as exc:
+            LOGGER.warning("Streak lookup skipped: %s", exc)
+    short = build_shortlist(candidates, streaks)
+
+    print()
+    for line in format_shortlist(short, config):
+        print(line)
+
     print("\n" + "-" * 100)
     # This label must keep matching the sort in scan_tickers. It has been wrong
     # twice: it claimed "by score" after Score stopped being the key, then
@@ -2407,7 +2664,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(candidates, run_date, config.display_top_n)
+                digest_text = format_telegram_digest(
+                    candidates, run_date, short, config.move_horizon_days)
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
