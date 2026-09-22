@@ -1,0 +1,18 @@
+# Forward test grader. Reads stored signals from both scanners' BigQuery tables
+# and records what actually happened, so signal_outcomes grows on a schedule
+# instead of only when someone runs it by hand.
+#
+# It imports swings.py for ScannerConfig and the BigQuery helpers, so both
+# files must be in the image.
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/swings.py .
+COPY src/forward_test.py .
+
+ENV PORT=8080
+CMD exec functions-framework --target=main --source=forward_test.py --port=${PORT}

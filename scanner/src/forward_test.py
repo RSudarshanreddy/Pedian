@@ -454,7 +454,43 @@ def report(project: str, dataset: str, horizon: int = 15) -> None:
     print()
 
 
-def main() -> None:
+# Both scanners' tables. The grader must cover BOTH or the freeze produces
+# nothing for one of them: swings.py and momentum.py write to separate tables
+# since the 2026-09-23 split, and S.DEFAULT_BQ_TABLE_ID is now only the swing
+# one. Grading just that would leave momentum -- the scanner with the evidence
+# behind it -- completely unmeasured.
+GRADED_TABLES = ("swings", "momentum")
+
+
+def main(request: Any = None) -> Optional[tuple[str, int]]:
+    """CLI program, or HTTP Cloud Function when handed a request.
+
+    The HTTP path exists so this can run on a schedule. Without it the whole
+    point of freezing the model is lost: signal_outcomes only grows when
+    something runs this, and nothing was.
+
+    Same guard as swings.main -- never call parse_args in the HTTP path, because
+    sys.argv holds the CONTAINER's flags (functions-framework's own
+    --target/--source/--port), not anything about the request.
+    """
+    if request is not None:
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        project = S._resolve_project_id(body.get("project_id"))
+        dataset = body.get("dataset_id", "data_options")
+        tables = body.get("tables") or list(GRADED_TABLES)
+        config = S.ScannerConfig()
+        graded = []
+        for t in tables:
+            try:
+                backfill(project, dataset, t, config, int(body.get("limit", 0)), False)
+                graded.append(t)
+            except Exception as exc:
+                LOGGER.warning("Forward test failed for table %s: %s", t, exc)
+        return (f"Forward test graded: {', '.join(graded) or 'nothing'}", 200)
+
     p = argparse.ArgumentParser(description=__doc__,
                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backfill", action="store_true", help="evaluate signals whose window has completed")
@@ -464,7 +500,8 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="compute but do not write")
     p.add_argument("--project-id", default=None)
     p.add_argument("--dataset-id", default="data_options")
-    p.add_argument("--table-id", default=S.DEFAULT_BQ_TABLE_ID)
+    p.add_argument("--table-id", default=None,
+                   help=f"single table to grade; default grades all of {GRADED_TABLES}")
     args = p.parse_args()
 
     if not (args.backfill or args.report):
@@ -474,7 +511,9 @@ def main() -> None:
     config = S.ScannerConfig()
 
     if args.backfill:
-        backfill(project, args.dataset_id, args.table_id, config, args.limit, args.dry_run)
+        for table in ([args.table_id] if args.table_id else list(GRADED_TABLES)):
+            print(f"--- grading {table} ---")
+            backfill(project, args.dataset_id, table, config, args.limit, args.dry_run)
     if args.report:
         report(project, args.dataset_id, args.horizon)
 
