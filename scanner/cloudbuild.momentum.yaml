@@ -1,0 +1,16 @@
+# Builds the momentum scanner image.
+#
+# Needed because `gcloud run deploy --source` only ever uses the file literally
+# named `Dockerfile`, which serves swings.py. Without this, deploying momentum
+# from source would quietly ship the swing scanner under the momentum name.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.momentum'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/momentum'
+      - '.'
+images:
+  - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/momentum'

@@ -1721,7 +1721,7 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     rows = candidates.head(limit)
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
     width = max((len(str(t).replace(".NS", "")) for t in rows["Ticker"]), default=10)
-    lines = [f"Swing scan {run_time_ist}", ""]
+    lines = [f"Momentum {run_time_ist}", ""]
     for n, (_, r) in enumerate(rows.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
         lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")

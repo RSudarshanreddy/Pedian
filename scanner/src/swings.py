@@ -1311,7 +1311,25 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     # survivors' +3.95%, because a thin sample means the stock only recently
     # became volatile. momentum.py still enforces it.
 
-    action, setup_type, reason = get_entry_trigger(data, config)
+    # Action is OVERRIDDEN to BUY for everything that reaches here, and the
+    # reason is structural rather than optimistic.
+    #
+    # get_entry_trigger returns deep_pullback -> WATCH for any pullback over
+    # 12%, which is precisely what the swing rule selects for. So its Action was
+    # WATCH on 100% of rows -- a column fully determined by the gate that
+    # admitted the row, telling the reader nothing. On the first live run all 7
+    # candidates read WATCH.
+    #
+    # In this file the LIST IS THE SIGNAL: a qualified stock that has fallen
+    # >= min_dip_pct while holding above its trend average is the setup, and
+    # nothing further needs to confirm it. Measured, waiting for confirmation
+    # is actively worse -- deep_pullback (still falling) returned +3.65%
+    # against pullback_bounce (confirmed turn) at +0.02%.
+    #
+    # The raw trigger output is still stored in Setup_Type and Reason, so
+    # nothing is lost; only the word the phone shows changes.
+    _raw_action, setup_type, reason = get_entry_trigger(data, config)
+    action = "BUY"
     setup_age_days = compute_setup_age(data, config, setup_type)
 
     risk = calculate_risk_reward(data, config, typical_move)
@@ -1868,7 +1886,7 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     rows = candidates.head(limit)
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
     width = max((len(str(t).replace(".NS", "")) for t in rows["Ticker"]), default=10)
-    lines = [f"Swing scan {run_time_ist}", ""]
+    lines = [f"Swing (dip) {run_time_ist}", ""]
     for n, (_, r) in enumerate(rows.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
         lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")
