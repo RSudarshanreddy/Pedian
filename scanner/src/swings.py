@@ -2109,15 +2109,13 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # console output and in BigQuery -- this is the 5-second glance, not the
     # record. Ticker is padded so the percentages line up in a column, which is
     # what makes it skimmable rather than a paragraph.
-    width = max((len(str(t)) for t in fresh_buys["Ticker"]), default=10)
+    width = max((len(str(t).replace(".NS", "")) for t in fresh_buys["Ticker"]), default=10)
     lines = [f"Swing scan {run_time_ist}", ""]
     for n, (_, r) in enumerate(fresh_buys.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Expected_Move']:>5.1f}%")
-    lines.append("")
-    lines.append(f"Move% = typical gain over {int(r['Move_Horizon_Days'])} sessions. "
-                 f"Ranked by it." if len(fresh_buys) else "")
+        lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")
     if total_fresh > len(fresh_buys):
+        lines.append("")
         lines.append(f"Top {len(fresh_buys)} of {total_fresh}.")
     return "\n".join(lines)
 
