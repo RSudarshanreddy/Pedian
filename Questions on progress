@@ -1,0 +1,68 @@
+---
+
+"sell at 3% and repeat"---> what do you think is the model improved or confused and landed here.? i would need honest feedback so we can focus on clear goals
+Honest answer: the measurement improved enormously. The strategy drifted. Those are different things and it's worth separating them.
+
+What genuinely got better — and this is real, not consolation. The data is now trustworthy: Yahoo's fabricated holiday bars are dropped, missing sessions are hard-rejected instead of silently spanning gaps, the volume-spike baseline no longer dilutes itself. The backtests have no lookahead — I found and fixed a bug in my own test scripts that had been inflating correlations from +0.068 to +0.249. And split-half validation now catches fragile findings routinely; it killed the Pain-ratio filter, N=1, and the price-band widening today.
+
+Abandoning "sell at 3% and repeat" was unambiguously correct. That metric correlated −0.080 with forward return and scored your four best trades at 5.6, 10.0 and 17.4 out of 100 — it rejected DYCL outright. You were using a rule that actively deselected your winners.
+
+What drifted. The goal has been redefined about four times: 3% scalp → 30-session move profile → momentum ranker → dip-buying swing. That's not refinement converging on something; that's oscillation. And today alone the shortlist went 10 → 3 → deleted, and the price band went 1400 → 5400 → 1400 → 1600. That's thrash, not progress.
+
+The sharpest thing I can tell you: you froze this model on the 20th — "this model is closed off now, we will revisit once we have proper data for at least 1 week." That freeze lasted two days. Since then the lookback went 180→60, a shortlist was added and removed, the file was split in two, and an entirely new strategy was built. None of it had the week of data you asked for.
+
+And the mechanism that broke the freeze was backtests. Each change had numbers behind it, so each felt justified. But today I discovered my own N sweep was measuring date-groups of 5 candidates when a live run has 75 — the conclusion I gave you was wrong by a factor of two, and I'd already written it into the config as settled. That's the third finding I've retracted in this session. Backtests kept licensing changes, and the backtests were not reliable enough to license them.
+
+So where you've landed is more complex than where you started, with two scanners, one of them a day old and explicitly possibly-overfit, and zero live validation of either. That's not obviously better than one frozen model you'd followed for a month.
+
+What I'd focus on:
+
+Freeze, properly this time. No config changes, no new strategies, until signal_outcomes has real graded data. That's December. If I propose a change before then with a backtest behind it, the right answer is no — that's exactly how the last freeze broke.
+
+Do the one thing that doesn't depend on any backtest: size every position the same. Equal-weighting your existing 19 positions turns −₹10,412 into +₹6,506. Same stocks, same entries, ₹16,918 difference. That's larger than any edge either scanner has demonstrated, it requires no validation, and it fixes the actual hole in your P&L — BSE at 30.8% of capital.
+
+Follow momentum, watch swings. Momentum has 163 decision dates behind it. The swing scanner has ~5 independent windows. Treat its list as a watchlist you're auditing, not instructions.
+
+The four months weren't wasted — you have working infrastructure, honest data, and a record of what's been tested. What's missing isn't more analysis. It's a period of not changing anything.
+---
+
+mage built, service deploying. Once it's up I'll add a scheduler — 17:00 IST weekdays makes sense: after both scanners have written the day's signals, grading whatever windows have closed.
+
+Worth being clear about what the grader gives you in December, since that's what the freeze is buying:
+
+It writes one row per (ticker, bar date, horizon) at 5, 10, 15 and 30 sessions, and records both Entry_Close (the price the scanner printed, which you can't actually get) and Entry_Open (next day's open, which you can). That distinction matters — it's the difference between a backtest that flatters itself and one that reflects a fill you could have had.
+
+With both tables graded, December can answer the questions that have been unanswerable all along:
+
+Does the top 3 actually beat ranks 4–25, on live signals rather than my backtests?
+Does the swing scanner beat momentum, or was +10.06% the thin-slice overfit I warned about?
+Does Bounce_Median predict, or was it fitted to 157 trades?
+None of those can be answered by another backtest. That's the whole argument for not touching anything until there's real data.
+
+I'll confirm the deploy and the scheduler, and that's the freeze point.
+
+Bash Verify the forward test service grades both tables
+IN
+tail -3 "C:/Users/Lenovo/AppData/Local/Temp/claude/c--Users-Lenovo-Desktop-stocks-Pedian/0c5895b7-494f-40c9-9118-4376a6d92611/tasks/b4z7asno0.output"; echo "=== smoke test: does it actually grade both tables? ==="; cd "C:/Users/Lenovo/Desktop/stocks/Pedian" && FT=$(timeout 90 gcloud run services describe forward-test --project=sudarshan-442212 --region=europe-west1 --format="value(status.url)" 2>/dev/null) && echo "url: $FT" && TOKEN=$(timeout 60 gcloud auth print-identity-token 2>/dev/null) && timeout 900 curl -s -X POST "$FT" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"limit":30}' -w "\nHTTP %{http_code}\n" 2>&1 | tail -3
+
+OUT
+Command running in background with ID: b3qzx9q0n. Output is being written to: C:\Users\Lenovo\AppData\Local\Temp\claude\c--Users-Lenovo-Desktop-stocks-Pedian\0c5895b7-494f-40c9-9118-4376a6d92611\tasks\b3qzx9q0n.output. You will be notified when it completes. To check interim output, use Read on that file path.
+Session cwd remains C:\Users\Lenovo\Desktop\stocks\Pedian; directory changes made by the backgrounded command do not apply to subsequent commands.
+Bash Schedule the forward test daily
+IN
+cd "C:/Users/Lenovo/Desktop/stocks/Pedian" && FT=$(timeout 90 gcloud run services describe forward-test --project=sudarshan-442212 --region=europe-west1 --format="value(status.url)" 2>/dev/null) && SA=347050126858-compute@developer.gserviceaccount.com && timeout 150 gcloud scheduler jobs create http forward-test-daily --project=sudarshan-442212 --location=asia-south1 --schedule="0 17 * * 1-5" --time-zone="Asia/Kolkata" --uri="$FT/" --http-method=POST --headers="Content-Type=application/json" --message-body='{}' --oidc-service-account-email=$SA --oidc-token-audience="$FT" --attempt-deadline=1800s --quiet 2>&1 | tail -2; echo "=== all jobs ==="; timeout 120 gcloud scheduler jobs list --project=sudarshan-442212 --location=asia-south1 --format="value(name.basename(),schedule,state)" 2>&1
+
+OUT
+timeZone: Asia/Kolkata
+userUpdateTime: '2026-09-22T22:14:21.487684Z'
+=== all jobs ===
+swings-11am	0 10 * * 1-5	ENABLED
+position-check-daily	45 15 * * 1-5	PAUSED
+swings-3pm	10 9 * * 1-5	ENABLED
+forward-test-daily	0 17 * * 1-5	ENABLED
+swings-pre-open	7 9 * * 1-5	ENABLED
+swings-post-market	0 14 * * 1-5	ENABLED
+Background command "Verify the forward test service grades both tables" completed (exit code 0)
+Bash Read the forward test smoke test result
+IN
+cat "C:/Users/Lenovo/AppData/Local/Temp/claude/c--Users-Le
