@@ -96,6 +96,30 @@ ranker does the discrimination, not the gate. The other 80-odd rows exist to
 be stored, because December cannot prove the top 3 beats rank 40 without
 rank 40 on record.
 
+### The blind spot: steady compounders score low
+
+`Expected_Move` is the MEDIAN 30-session peak gain over the last 60 sessions.
+It measures swing MAGNITUDE, not consistency -- so a stock that grinds steadily
+upward scores the same as one that lurches and retraces.
+
+MANINDS on 2026-09-24 is the clean example. It passes every momentum gate
+(Rs.850, 118.9 Cr liquidity, 4.71 avg volatility, 40 volatile days, spike 3.76,
+risk 9.8%) and carried a live BUY/breakout -- yet ranked **70 of 86** on an
+Expected_Move of 17.4%, which sits in the weakest measured band (14-20% ->
++1.31%, win 50.0%). Its actual record: **+18.4% in a month, +43.2% in three,
++130.6% in six.**
+
+The scanner is not rejecting names like this; it is ranking them low on
+purpose, and the band it puts them in has historically returned a coin flip.
+Whether that is correct or a genuine miss is exactly what the forward test can
+settle: if steady compounders keep landing at rank 70 while outperforming, the
+ranker needs a consistency term. Do NOT add one on backtest evidence -- that is
+how the 2026-09-20 freeze broke.
+
+For the swing list MANINDS failed on one gate only, dip -3.0% against -12%, so
+that side is simply saying "not at this price" -- the same answer it gives for
+AEGISLOG.
+
 ## What December answers
 
 ```bash
