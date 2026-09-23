@@ -1888,16 +1888,28 @@ def trigger_dataform_run(
 
 
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10) -> Optional[str]:
-    """Name and Action for the top `limit` rows, in the order the console prints.
+                           limit: int = 10, horizon_days: int = 30) -> Optional[str]:
+    """Name and Bounce% for the top `limit` rows, in the order the console prints.
 
     Returns None only when the scan found nothing at all.
 
-    Sends the top of the ranked list, not fresh BUYs. The old
-    (Action == BUY and Setup_Age_Days == 1) filter selected the worse cohort:
-    BUY returned +0.33% against WATCH's +2.75% over 605 stored signals at a
-    10-session horizon, and through BLISSGVS's +177% run and E2E's +85% run the
-    scanner said WATCH every day, so Telegram said nothing at all.
+    SHOWS Bounce%, NOT Action, to match momentum.py -- one format across both
+    messages so the phone never asks which scanner it is reading.
+
+    Action is useless HERE for a different reason than in momentum.py. There it
+    was misleading, with 91% of top picks reading WATCH while returning +3.71%
+    against BUY's +1.36%. Here it is uninformative: build_candidate overrides
+    Action to BUY on every row, because passing the dip and trend conditions IS
+    the entry. Every line read the same word, so the column carried nothing.
+
+    Bounce_Median is this file's ranker -- the stock's own median recovery from
+    a dip -- so showing it makes the column and the ordering agree, and it
+    separates the names: a 41% recoverer and an 11% one are different
+    propositions even though both cleared the same gate. Measured, ranking the
+    dip cohort by it returned +10.06% against +9.06% for ranking the same
+    cohort by Expected_Move and +8.76% for ranking by deepest dip.
+
+    Action and Setup_Type are still computed and stored in BigQuery.
 
     Plain text, no parse_mode -- see send_telegram_notification.
     """
@@ -1910,9 +1922,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     lines = [f"Swing (dip) {run_time_ist}", ""]
     for n, (_, r) in enumerate(rows.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")
-    if len(candidates) > len(rows):
-        lines += ["", f"Top {len(rows)} of {len(candidates)}."]
+        lines.append(f"{n}. {ticker:<{width}}  {r['Bounce_Median']:.1f}%")
+    lines.append("")
+    lines.append(f"Top {len(rows)} of {len(candidates)}. Hold ~{horizon_days} sessions.")
     return "\n".join(lines)
 
 
@@ -2220,7 +2232,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(candidates, run_date, config.display_top_n)
+                digest_text = format_telegram_digest(
+                    candidates, run_date, config.display_top_n, config.move_horizon_days)
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
