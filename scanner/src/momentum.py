@@ -1723,16 +1723,34 @@ def trigger_dataform_run(
 
 
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10) -> Optional[str]:
-    """Name and Action for the top `limit` rows, in the order the console prints.
+                           limit: int = 10, horizon_days: int = 30) -> Optional[str]:
+    """Name and Move% for the top `limit` rows, in the order the console prints.
 
     Returns None only when the scan found nothing at all.
 
-    Sends the top of the ranked list, not fresh BUYs. The old
-    (Action == BUY and Setup_Age_Days == 1) filter selected the worse cohort:
-    BUY returned +0.33% against WATCH's +2.75% over 605 stored signals at a
-    10-session horizon, and through BLISSGVS's +177% run and E2E's +85% run the
-    scanner said WATCH every day, so Telegram said nothing at all.
+    SHOWS Move%, NOT Action, because Action was actively misleading here.
+    Measured within the top 3 across 102 decision dates:
+        WATCH  n=182  91% of picks  ret30 +3.71%  win 61.0%
+        BUY    n= 18   9% of picks  ret30 +1.36%  win 50.0%
+    91% of picks carried the WATCH label and those were the ones that made the
+    money. Reading WATCH as "do not buy" meant skipping 182 trades at +3.71% to
+    take 18 at +1.36%. By state it inverts further: `coiling` ("volatile &
+    coiling, watch for trigger") is 54% of picks and the BEST performer at
+    +5.32%, while `pullback_bounce` -- one of the two states that says BUY --
+    is the only one that lost money, at -0.65%.
+
+    Action is not wrong, it answers a different question: did a candle do
+    something yesterday. Five of the seven trigger states return WATCH, so it
+    is the default rather than a warning, and a breakout needs 2.3x volume,
+    which a stock cannot trade without having already moved (median +6.35%
+    AFTER the fact). On a list where membership IS the signal, a column reading
+    WATCH beside the strongest name in the universe fights the reader daily.
+
+    Move% is the honest replacement: it is the ranker, so the column and the
+    ordering finally agree; it is the one measure shown to predict (+0.126 to
+    +0.143 vs forward return); and it differentiates the three names -- today's
+    top pick travels 25pp further than the third, which BUY/WATCH could never
+    convey. Action and Setup_Type are still computed and stored in BigQuery.
 
     Plain text, no parse_mode -- see send_telegram_notification.
     """
@@ -1745,9 +1763,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     lines = [f"Momentum {run_time_ist}", ""]
     for n, (_, r) in enumerate(rows.iterrows(), start=1):
         ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Action']}")
-    if len(candidates) > len(rows):
-        lines += ["", f"Top {len(rows)} of {len(candidates)}."]
+        lines.append(f"{n}. {ticker:<{width}}  {r['Expected_Move']:.1f}%")
+    lines.append("")
+    lines.append(f"Top {len(rows)} of {len(candidates)}. Hold ~{horizon_days} sessions.")
     return "\n".join(lines)
 
 
@@ -2042,7 +2060,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(candidates, run_date, config.display_top_n)
+                digest_text = format_telegram_digest(
+                    candidates, run_date, config.display_top_n, config.move_horizon_days)
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
