@@ -267,9 +267,30 @@ class ScannerConfig:
     # STORAGE cap. Deliberately high: the stored history feeds the signal-history
     # test, which needs the LOW scores too.
     top_n: int = 200
-    # DISPLAY cap -- attention knob, not a filter. Caps by RANK so storage is
-    # unaffected and cheap-but-good names are not deleted for being cheap.
-    display_top_n: int = 50
+    # DISPLAY cap -- how many rows are printed and sent to Telegram. Caps by
+    # RANK, so storage (top_n = 200) is untouched and nothing is lost from the
+    # record; this is purely how much lands in front of a human.
+    #
+    # 50 -> 3 on 2026-09-26. At 50 the momentum digest was 50 names three times
+    # a day -- 150 lines -- which spreads attention rather than directing it.
+    # 50 was never a considered choice for this role: it was the fallback left
+    # behind when the shortlist block was removed.
+    #
+    # 3 is also the measured optimum, not a compromise. Top N per day by
+    # Expected_Move, 30-session hold, entry at next open, net of costs, over
+    # 7,359 observations and 163 decision dates:
+    #     N= 1  +18.35%  halves 10.95 / 23.65   <- one half carries it
+    #     N= 3  +12.79%  halves 12.72 / 12.92   <- set here
+    #     N= 5   +7.99%  halves  9.05 /  7.28
+    #     N=10   +5.99%  halves  7.05 /  4.84
+    #     N=25   +5.87%  halves  7.29 /  4.09
+    #     N=50   +6.45%  halves  6.64 /  6.27
+    # 3 beats 50 by more than double AND has the closest agreement between the
+    # two disjoint ticker halves of any setting measured. 1 returns more but
+    # rests on one half, which is the pattern this file has learned to distrust.
+    #
+    # Raise it with --display-top-n for a session when you want to read wider.
+    display_top_n: int = 3
     verbose: bool = False
 
     def __post_init__(self) -> None:
