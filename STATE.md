@@ -55,6 +55,47 @@ answer is no.
 
 Exempt: a genuine bug, a data-integrity failure, or the grader breaking.
 
+## How the list is ordered, and how steeply
+
+Rank matters far more than it looks. Each rank on its own, 30-session hold,
+163 decision dates, entry at next open, net of costs:
+
+| rank | trades | ret30 | median | win |
+|---|---|---|---|---|
+| 1 | 163 | **+18.35%** | +13.99 | 66.3% |
+| 2 | 163 | **+14.80%** | +14.76 | 66.3% |
+| 3 | 163 | +5.23% | +5.28 | 54.6% |
+| 4 | 163 | **-2.78%** | -5.22 | **36.2%** |
+| 5 | 163 | +4.34% | +1.16 | 52.8% |
+
+Ranks 1 and 2 are the list. Rank 3 returns a third of rank 2. Rank 4 loses
+money at a 36% win rate, and returned -16.56% in the second half of the
+period. Below the cut is not a near-miss; it is a different quality of name.
+
+**Open question for December: does top 2 beat top 3?** Measured, it did --
+ranks 1-2 returned +16.58% with ticker halves 16.09 / 17.23, against the
+deployed top 3's +12.79% and 12.72 / 12.92. NOT acted on, deliberately: it is
+the same 8-month backtest, and the last `N` change made on backtest evidence
+rested on a sweep that turned out to be measuring the wrong thing. Let the
+live data decide.
+
+### Two things that read as problems but are not
+
+**Higher Move% is not always better -- EXCEPT at the top of the list.** Pooled
+across all 3,983 qualifying observations the bands peak at 27-45% and fall
+away (45-60% wins only 46.1% of the time). But that does NOT transfer to the
+top 3: capping Move% costs return at every level (below 60% -> +8.08%, below
+45% -> +8.76%, below 35% -> +4.65%, against +12.79% uncapped) and wrecks the
+half-split. The 45-60% band returned +7.65% pooled but +50.39% when it was a
+top-3 pick. Being the best name available today carries information the raw
+band number does not.
+
+**~86 candidates qualify but only ~27 are real.** min_typical_move_pct = 14 is
+a coarse sieve; the money starts around 27% (Q3 +1.62% -> Q4 +8.78%). The
+ranker does the discrimination, not the gate. The other 80-odd rows exist to
+be stored, because December cannot prove the top 3 beats rank 40 without
+rank 40 on record.
+
 ## What December answers
 
 ```bash
