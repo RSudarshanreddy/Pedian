@@ -247,12 +247,38 @@ class ScannerConfig:
     #     N=10   +5.99%  halves  7.05 /  4.84
     #     N=25   +5.87%  halves  7.29 /  4.09
     #     N=50   +6.45%  halves  6.64 /  6.27
-    # 3 beats 50 by more than double AND has the closest agreement between the
-    # two disjoint ticker halves of any setting measured. 1 returns more but
-    # rests on one half, which is the pattern this file has learned to distrust.
+    # 3 had the best AVERAGE. That was the wrong objective: it is only right if
+    # the list is bought mechanically, and it is not -- it is eyeballed, and the
+    # picks that made money (ANTELOPUS +49.8% at rank 5-15, SIGMAADV at 12,
+    # BLUESTONE at 18) were all below a 3-row cut. For a reader who selects, the
+    # measure that matters is whether the list CONTAINS a winner at all.
     #
-    # Raise it with --display-top-n for a session when you want to read wider.
-    display_top_n: int = 3
+    # Per session, P(r30 > 25%) present anywhere in the list, 163 dates:
+    #     top 3   54.0%    r30 +13.30%   holds 15% of all big winners
+    #     top 10  67.5%    r30  +6.24%   28%
+    #     top 20  82.2%    r30  +6.26%   43%
+    #     top 30  82.8%    r30  +6.22%   54%
+    # 20 is where coverage plateaus, and ~20 is also the most that can be read
+    # by eye in one pass without becoming a second analysis.
+    display_top_n: int = 20
+
+    # Quality FLOOR for the display only -- min_typical_move_pct (14) still
+    # governs what is scanned and stored, so the forward test keeps seeing the
+    # weak ranks it needs in order to prove the strong ones.
+    #
+    # A floor ALONE cannot produce a 20-name list: thresholds tight enough to
+    # leave 20 names (Expected_Move >= 28) discard 55% of all big winners and
+    # leave the list empty-handed on 44% of sessions, because on a weak day
+    # nothing clears. A cap adapts; a gate does not. Measured over 30 sessions:
+    #     >= 28 alone       19.6 names  r30 +8.88%  >=1 winner on 56.4%
+    #     top 20 alone      15.0 names  r30 +6.26%  >=1 winner on 82.2%
+    #     >= 18 AND top 20  12.2 names  r30 +8.20%  >=1 winner on 78.5%
+    # The pair returns 31% more than the cap alone while giving up 3.7pp of
+    # coverage. 18 also keeps the names that actually worked -- ANTELOPUS
+    # (22.4-22.9) and SHILPAMED (23.9-32.6) clear it, AEGISLOG (16.5-19.8)
+    # clears it on its stronger days, GANECOS (14.7, stuck) does not. Floors at
+    # 26 or 28 would have removed all three winners.
+    display_min_move_pct: float = 18.0
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -267,6 +293,11 @@ class ScannerConfig:
             )
         if self.min_price >= self.max_price:
             raise ValueError(f"min_price ({self.min_price}) must be < max_price ({self.max_price})")
+        if self.display_min_move_pct < self.min_typical_move_pct:
+            # Not fatal -- a floor below the scan gate simply never binds, and
+            # saying so beats silently doing nothing.
+            print(f"Note: display_min_move_pct ({self.display_min_move_pct}) is below "
+                  f"min_typical_move_pct ({self.min_typical_move_pct}); it will not bind.")
 
 
 # =========================================================
@@ -1722,8 +1753,28 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
+def select_for_display(candidates: pd.DataFrame, config: ScannerConfig) -> pd.DataFrame:
+    """The rows a human reads: quality floor first, then the rank cap.
+
+    Console and Telegram both go through here so they cannot drift apart. What
+    is scanned and what is written to BigQuery are untouched -- see
+    display_min_move_pct for why the floor is display-only.
+
+    The floor is skipped entirely when it would empty the list. A morning with
+    nothing on it is the failure this selection exists to avoid, and the best
+    20 available always beats showing nothing.
+    """
+    if candidates.empty:
+        return candidates
+    kept = candidates[candidates["Expected_Move"] >= config.display_min_move_pct]
+    if kept.empty:
+        kept = candidates
+    return kept.head(config.display_top_n)
+
+
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10, horizon_days: int = 30) -> Optional[str]:
+                           limit: int = 10, horizon_days: int = 30,
+                           limit_total: Optional[int] = None) -> Optional[str]:
     """Name and Move% for the top `limit` rows, in the order the console prints.
 
     Returns None only when the scan found nothing at all.
@@ -1758,6 +1809,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
         return None
 
     rows = candidates.head(limit)
+    # candidates arrives pre-selected, so its length is the shown count, not
+    # the pool. limit_total carries the real pool size for the footer.
+    total = int(limit_total) if limit_total is not None else len(candidates)
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
     width = max((len(str(t).replace(".NS", "")) for t in rows["Ticker"]), default=10)
     lines = [f"Momentum {run_time_ist}", ""]
@@ -1765,7 +1819,7 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
         ticker = str(r["Ticker"]).replace(".NS", "")
         lines.append(f"{n}. {ticker:<{width}}  {r['Expected_Move']:.1f}%")
     lines.append("")
-    lines.append(f"Top {len(rows)} of {len(candidates)}. Hold ~{horizon_days} sessions.")
+    lines.append(f"Top {len(rows)} of {total}. Hold ~{horizon_days} sessions.")
     return "\n".join(lines)
 
 
@@ -1854,6 +1908,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-n", default=ScannerConfig.top_n, type=int,
                     help="Max rows written to BigQuery. Keep high -- stored history feeds "
                          "the signal-history test, which needs low scores too")
+    p.add_argument("--display-min-move-pct", default=ScannerConfig.display_min_move_pct,
+                   type=float, help="Quality floor for the displayed list only; "
+                                    "does not change what is scanned or stored")
     p.add_argument("--display-top-n", default=ScannerConfig.display_top_n, type=int,
                     help="How many rows to print and send to Telegram. Attention knob, "
                          "not a filter -- storage is unaffected")
@@ -1918,6 +1975,8 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_score=float(body.get("min_score", ScannerConfig.min_score)),
             top_n=int(body.get("top_n", ScannerConfig.top_n)),
             display_top_n=int(body.get("display_top_n", ScannerConfig.display_top_n)),
+            display_min_move_pct=float(body.get("display_min_move_pct",
+                                                ScannerConfig.display_min_move_pct)),
             verbose=bool(body.get("verbose", False)),
         )
         raw_tickers = body.get("tickers")
@@ -1952,6 +2011,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             min_score=args.min_score,
             top_n=args.top_n,
             display_top_n=args.display_top_n,
+            display_min_move_pct=args.display_min_move_pct,
             verbose=args.verbose,
         )
 
@@ -1998,7 +2058,6 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         # --min-score 55, both ABOVE the defaults of that time, which would
         # have tightened the scan while claiming to loosen it. --min-rr is
         # not listed: it no longer exists, and the stop is ATR/structural.
-        #
         # --min-score is also not listed: at 5.0 it is already near-zero on a
         # 0-100 scale (see the field comment), so there is no lower value left
         # that means anything as a relaxation hint. min_typical_move_pct is
@@ -2016,7 +2075,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             print("\nNo BUY signals today. Showing top WATCH candidates instead:")
             display = candidates
     shown = len(display)
-    display = display.head(config.display_top_n)
+    display = select_for_display(display, config)
 
     print("\n" + "-" * 100)
     # This label must keep matching the sort in scan_tickers. It has been wrong
@@ -2061,7 +2120,9 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
                 digest_text = format_telegram_digest(
-                    candidates, run_date, config.display_top_n, config.move_horizon_days)
+                    select_for_display(candidates, config), run_date,
+                    config.display_top_n, config.move_horizon_days,
+                    limit_total=len(candidates))
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
