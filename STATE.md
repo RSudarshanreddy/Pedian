@@ -64,6 +64,26 @@ that window has already been caught disagreeing with live (see December, Q4).
 
 Exempt: a genuine bug, a data-integrity failure, or the grader breaking.
 
+**A previous freeze, declared 2026-09-20, lasted two days.** Nothing broke it
+on purpose. Every change had numbers behind it, so every change felt licensed:
+the lookback went 180 → 60, a shortlist was added and removed, the file was
+split in two, and an entirely new strategy was built — none of it with the week
+of live data the freeze had asked for.
+
+**The mechanism that broke it was backtests, and the backtests were wrong.**
+The sweep that set the shortlist to 10 was sampling each ticker from its own
+index, so its "top 10 per day" was drawn from date-groups with a median of 5
+candidates when a live run has ~85. It was often ranking every candidate there
+was. Corrected, N=3 returned +12.79% against N=10's +5.99% — the figure given
+was off by a factor of two, and it had already been written into the config as
+settled. That was the third finding retracted in a single session; a whole
+day's worth were retracted on 2026-09-26.
+
+So the rule is not "be careful with backtests". It is: **if a backtest argues
+for a change before there is live data, the answer is no** — however good the
+numbers look, and however many splits it survives. That is what the freeze is
+for, and it is the only thing that has ever held.
+
 ## What changed 2026-09-26, and why
 
 `display_top_n: 3 → 20`, plus a new display-only floor
