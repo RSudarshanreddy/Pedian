@@ -29,19 +29,30 @@ All in GCP project `sudarshan-442212`, region `europe-west1`,
 schedulers in `asia-south1`, all services at **min-instances 0**.
 
 ```
-09:07  momentum       previous complete session, actionable pre-open
-09:10  swings         same, dip list
-10:00  momentum       intraday breakouts, same-day entry
-14:00  momentum
+09:10  swings         previous complete session, dip list
+10:00  momentum       (job `swings-11am`) -- now its only run
+10:00  form           (job `form-10am`) stocks/pet/form.py, 10-name list to Telegram
 17:00  forward-test   grades BOTH tables, every weekday
 ```
+
+**Changed 2026-10-09, the owner's decision:** momentum's 09:07 (`swings-pre-open`)
+and 14:00 (`swings-post-market`) jobs are **PAUSED, not deleted**. Resume them
+with `gcloud scheduler jobs resume <job> --location=asia-south1`. The owner
+uses `form` for the daily list now; momentum keeps running once a day so the
+forward test still gets data for the December review. Live rows from
+2026-10-09 come from the 10:00 run only, where earlier days kept the 14:00 run
+after deduping. Keep that in mind when comparing before and after.
+
+`form` is a separate Cloud Run service built from `stocks/pet/` with
+`cloudbuild.form.yaml`. It uses momentum's Telegram bot settings and writes
+nothing to BigQuery.
 
 BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`.
 
 Note `swings` holds momentum-era rows up to 2026-09-22 and swing-era rows after.
 `Bounce_Median IS NOT NULL` identifies swing rows. Left deliberately unlabelled.
 
-**Momentum runs 3x/day and each run APPENDS ~89 rows under the same Run_Date.**
+**Up to 2026-10-08, momentum ran 3x/day, and each run APPENDS ~89 rows under the same Run_Date.**
 Any query grouping by `Run_Date` alone triple-counts. Always dedupe:
 `ROW_NUMBER() OVER (PARTITION BY Run_Date, Ticker ORDER BY Run_Timestamp DESC) = 1`.
 Within one day the runs can also use different `Bar_Date` (Yahoo lag) — on

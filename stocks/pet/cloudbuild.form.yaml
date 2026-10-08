@@ -1,0 +1,14 @@
+# Builds the `form` image:
+#   gcloud builds submit --config cloudbuild.form.yaml --project sudarshan-442212
+# then deploy it as the `form` Cloud Run service (europe-west1).
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.form'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/form'
+      - '.'
+images:
+  - 'europe-west1-docker.pkg.dev/sudarshan-442212/cloud-run-source-deploy/form'

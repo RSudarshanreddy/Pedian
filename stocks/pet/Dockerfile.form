@@ -1,0 +1,18 @@
+# The `form` Cloud Run service: form.py, called by Cloud Scheduler at 10:00 IST
+# on weekdays, sending its 10-name list to Telegram. Built with
+# cloudbuild.form.yaml from this folder.
+#
+# python:3.13-slim rather than buildpacks, for the same reason as the momentum
+# image: yfinance's cache layer needs a working sqlite3.
+
+FROM python:3.13-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY data.py form.py ./
+
+ENV PORT=8080
+CMD exec functions-framework --target=main --source=form.py --port=${PORT}
