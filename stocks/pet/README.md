@@ -76,7 +76,9 @@ close after it. It can be any length. Measured on it:
 
 **Ranking:** leg size × persistence. At most 30 names are shown.
 
-**The daily Telegram message** (the `form` service, 10:00 IST) has three lines:
+**The daily Telegram message** (the `form` service, at 18:00 IST on the day's
+close and again at 10:00 IST the next morning) starts with the close it was
+computed on, for example `form 09 Oct, on 08 Oct close`, and then has three lines:
 1. **READY:** candidates in a healthy pullback.
 2. **WATCH:** persistent movers within 4% of their peak, waiting for a dip, up
    to 10 names together with READY.
@@ -89,6 +91,33 @@ close after it. It can be any length. Measured on it:
    **+4.7% a trade, with 67% going up**, against +3.5% for the whole momentum
    top 20 and −0.05% for `form`'s own swing. That's one month, with few
    distinct stocks, so treat it as a lead rather than a law.
+
+**Prices: NSE's own end-of-day files (changed 2026-10-09, a data fix).** Until
+then the live list used Yahoo, and Yahoo was late. At 02:48 IST on 9 Oct it
+still had no 8 Oct prices for 2,542 of 2,550 stocks, so the 9 Oct list was
+built on 7 Oct closes. Adding 8 Oct changed **7 of the 10 names**. KOPRAN and
+HBLENGINE, READY on 7 Oct, were on their 6th pullback day on 8 Oct, beyond the
+5-day limit. NSE publishes each session's file (the CM bhavcopy) at about
+16:35 IST the same day. The list now comes from those files, with Yahoo kept
+only as a fallback; a fallback run says `(Yahoo)` in the message.
+
+Checked before switching:
+- On the same days, `form`'s list from NSE's files was **identical** to the
+  list from Yahoo on 1, 6 and 7 Oct. The rules see the same thing; only
+  freshness changes.
+- Closes match Yahoo within 2% for 96.7% of stocks over 60 sessions, and
+  volume matches for all of them. The gaps are dividends: Yahoo adjusts old
+  prices for them, while NSE's files and Kite's charts don't.
+- NSE's files carry raw prices, and their previous close is **not** adjusted
+  for splits. A split or bonus is therefore read from the opening gap: no stock
+  can open 30% away from its last close without one, because of price bands.
+  The gap is snapped to the nearest common ratio. This caught every split Yahoo
+  caught (TEMBO 10:1, TCC 5:1, GOODLUCK, POCL, NARMADA) and three it missed
+  (INDIAGLYCO 5:1, GENESYS, TRIVENI).
+- Limit: small bonuses (1:4, 1:5) move the price by less than 30%, so they
+  look like a real fall (FMGOETZE). Such a stock reads as exhausted and is
+  skipped until the bonus leaves the 25-session window. That costs a missed
+  name, never a false READY.
 
 **Test trade:** buy at the next open. Exit on whichever comes first:
 - the leg's peak price (a limit order, from the day after buying);
@@ -377,7 +406,8 @@ and PARAS 49.1% in Jan 2025. There are too few of them to change the result.
 - The test only uses stocks that are listed today. Stocks that were delisted,
   often the worst ones, are missing, and that makes the results look better
   than they really are.
-- The data comes from Yahoo's daily prices, which have occasional bad prints.
+- The tests used Yahoo's daily prices, which have occasional bad prints. The
+  live list uses NSE's own files (see "Prices" above).
 - Tax is not included in the trade returns. Short-term gains are taxed at 20%.
 
 ## Files
@@ -385,7 +415,7 @@ and PARAS 49.1% in Jan 2025. There are too few of them to change the result.
 | file | what it does |
 |---|---|
 | `form.py` | The scanner. It runs locally (`python form.py`) and as the `form` Cloud Run service. |
-| `data.py` | Fetches the NSE stock list and daily prices from Yahoo. |
+| `data.py` | Fetches the NSE stock list; recent daily prices from NSE's end-of-day files (live list), years of history from Yahoo (tests). |
 | `Dockerfile.form`, `cloudbuild.form.yaml`, `requirements.txt`, `.dockerignore` | Build and deploy the `form` service. |
 
 The scripts behind the results recorded above (`form_test.py` for the form

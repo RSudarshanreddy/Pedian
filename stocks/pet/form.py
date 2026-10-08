@@ -15,10 +15,14 @@ Telegram gets the names only; the details (targets, exits, buy zones) go to the 
 
     python form.py        # downloads ~3 months for every NSE stock (a few minutes)
 
-Deployed as the `form` Cloud Run service, called at 10:00 IST on weekdays; it
-sends the list to the same Telegram chat as the momentum scanner. At 10:00 the
-day's bar is only 45 minutes old, so a bar for today is dropped until after
-the close -- the list is always judged on complete sessions, as in the test.
+Prices come from NSE's own end-of-day files (data.nse_bars), out the same evening.
+Yahoo was a day or two late -- on 9 Oct it still lacked 8 Oct, which changed 7 of
+the 10 names -- so it is only the fallback, and the message then says so.
+
+Deployed as the `form` Cloud Run service, called at 10:00 IST and in the evening
+on weekdays; it sends the list to the same Telegram chat as the momentum scanner.
+A bar for today is never used before the close -- the list is always judged on
+complete sessions, as in the test -- and the message names the close it is on.
 """
 
 from __future__ import annotations
@@ -35,18 +39,21 @@ import pandas as pd
 import data
 
 WINDOW = 25
+SESSIONS = WINDOW + 5                 # fetched from NSE, so a stock missing a few days still fills the window
 MIN_PRICE = 100.0
 MIN_TRADED_CR = 10.0
 MAX_SHOWN = 30
 LIST_SIZE = 10
 PROJECT = "sudarshan-442212"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+CLOSE_DONE = dt.time(15, 45)         # after this a bar for today is a complete session
 MOMENTUM_SHOWN, MOMENTUM_FLOOR, RED_DAY = 20, 18.0, -0.02   # the momentum digest's top 20; a 2%+ down close
 BQ_TABLE = f"{PROJECT}.data_options.form_signals"
 BQ_SCHEMA = (("run_date", "DATE"), ("run_timestamp", "TIMESTAMP"), ("prices_to", "DATE"), ("status", "STRING"),
              ("position", "INTEGER"), ("symbol", "STRING"), ("price", "FLOAT"), ("leg_pct", "FLOAT"),
              ("leg_days", "INTEGER"), ("up_days_pct", "FLOAT"), ("pullback_pct", "FLOAT"), ("target", "FLOAT"),
-             ("exit_below", "FLOAT"), ("momentum_rank", "INTEGER"), ("day_change_pct", "FLOAT"))
+             ("exit_below", "FLOAT"), ("momentum_rank", "INTEGER"), ("day_change_pct", "FLOAT"),
+             ("slot", "STRING"), ("source", "STRING"))
 
 
 def analyse(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict:
@@ -173,9 +180,24 @@ def universe() -> list[str]:
 
 def complete_sessions_only(bars: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     now = dt.datetime.now(IST)
-    if now.time() >= dt.time(15, 45):
+    if now.time() >= CLOSE_DONE:
         return bars
     return {s: df[df.index.date < now.date()] for s, df in bars.items()}
+
+
+def prices() -> tuple[dict[str, pd.DataFrame], str]:
+    """Every stock's recent sessions, from NSE's end-of-day files; Yahoo only if NSE can't be reached."""
+    symbols = universe()
+    try:
+        bars = data.nse_bars(symbols, SESSIONS, dt.datetime.now(IST).date())
+        source = "nse"
+    except Exception as exc:
+        print(f"NSE files unavailable ({exc}); falling back to Yahoo")
+        bars = {}
+    if len({d for df in bars.values() for d in df.index}) < WINDOW:
+        bars, source = data.download(symbols, period="3mo", min_rows=WINDOW), "yahoo"
+    bars = complete_sessions_only(bars)
+    return {s: df for s, df in bars.items() if len(df) >= WINDOW}, source
 
 
 def send_telegram(text: str) -> None:
@@ -218,9 +240,9 @@ def momentum_dips(bars: dict[str, pd.DataFrame]) -> tuple[list[str], list[str]]:
     return dips
 
 
-def names_only(s: pd.DataFrame, dips: list[dict] | None) -> str:
+def names_only(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source: str) -> str:
     """The Telegram message: just the names. The details stay in digest(), printed to the logs."""
-    lines = [f"form {dt.datetime.now(IST):%d %b}"]
+    lines = [f"form {dt.datetime.now(IST):%d %b}, on {prices_to:%d %b} close" + (" (Yahoo)" if source == "yahoo" else "")]
     for status in ("READY", "WATCH"):
         names = list(s.index[s.status == status])
         if names:
@@ -232,15 +254,18 @@ def names_only(s: pd.DataFrame, dips: list[dict] | None) -> str:
     return "\n".join(lines)
 
 
-def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date) -> None:
-    """Keep what was sent, for the end-of-October and December reviews. Re-running on the
-    same day replaces that day's rows. A load job, not streaming, so the DELETE always works."""
+def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source: str) -> None:
+    """Keep what was sent, for the end-of-October and December reviews. Re-running in the same
+    slot (morning, or evening after the close) replaces that slot's rows. A load job, not
+    streaming, so the DELETE always works."""
     from google.cloud import bigquery
     client = bigquery.Client(project=PROJECT)
     schema = [bigquery.SchemaField(n, t) for n, t in BQ_SCHEMA]
     client.create_table(bigquery.Table(BQ_TABLE, schema=schema), exists_ok=True)
     now = dt.datetime.now(IST)
-    base = {"run_date": now.date().isoformat(), "run_timestamp": now.isoformat(), "prices_to": prices_to.isoformat()}
+    slot = "evening" if now.time() >= CLOSE_DONE else "morning"
+    base = {"run_date": now.date().isoformat(), "run_timestamp": now.isoformat(), "prices_to": prices_to.isoformat(),
+            "slot": slot, "source": source}
     rows = [{**base, "status": r.status, "position": i, "symbol": sym, "price": float(r.price),
              "leg_pct": float(r["size"]) * 100, "leg_days": int(r.length), "up_days_pct": float(r.persistence) * 100,
              "pullback_pct": float(r.pullback) * 100, "target": float(r.peak), "exit_below": float(r.halfway)}
@@ -248,21 +273,22 @@ def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date) -> None
     rows += [{**base, "status": "MOMENTUM_DIP", "position": i, "symbol": d["symbol"], "price": d["price"],
               "momentum_rank": d["rank"], "day_change_pct": d["change"] * 100}
              for i, d in enumerate(dips or [], 1)]
-    client.query(f"DELETE FROM `{BQ_TABLE}` WHERE run_date = @d", job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", now.date())])).result()
+    client.query(f"DELETE FROM `{BQ_TABLE}` WHERE run_date = @d AND slot = @slot", job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", now.date()),
+                          bigquery.ScalarQueryParameter("slot", "STRING", slot)])).result()
     if rows:
         client.load_table_from_json(rows, BQ_TABLE, job_config=bigquery.LoadJobConfig(
             schema=schema, write_disposition="WRITE_APPEND")).result()
-    print(f"recorded {len(rows)} rows in {BQ_TABLE} for {now.date()}")
+    print(f"recorded {len(rows)} rows in {BQ_TABLE} for {now.date()} {slot}")
 
 
 def run() -> dict:
     """The day's list: details for the log, the names-only message, and what to record."""
-    bars = complete_sessions_only(data.download(universe(), period="3mo", min_rows=WINDOW))
-    bars = {s: df for s, df in bars.items() if len(df) >= WINDOW}
+    bars, source = prices()
     t = scan(bars)
     prices_to = last_session(bars).date()
-    print(f"{len(t)} liquid stocks priced Rs {MIN_PRICE:.0f}+; form: {t.form.value_counts().to_dict()}")
+    print(f"prices from {source} to {prices_to}; {len(t)} liquid stocks priced Rs {MIN_PRICE:.0f}+; "
+          f"form: {t.form.value_counts().to_dict()}")
     s = shortlist(t)
     try:
         dips = momentum_dips(bars)
@@ -273,7 +299,8 @@ def run() -> dict:
                  f"{d['change'] * 100:+.1f}% on {d['session']:%d %b}" for d in dips or []]
     details = digest(s, prices_to) + "\n\nMOMENTUM DIPS -- the momentum list's names that closed down 2%+:\n" + \
         ("\n".join(dip_lines) if dip_lines else "none")
-    return {"details": details, "names": names_only(s, dips), "shortlist": s, "dips": dips, "prices_to": prices_to}
+    return {"details": details, "names": names_only(s, dips, prices_to, source), "shortlist": s, "dips": dips,
+            "prices_to": prices_to, "source": source}
 
 
 def main(request: Any = None):
@@ -285,7 +312,7 @@ def main(request: Any = None):
         return None
     body = request.get_json(silent=True) or {}
     try:
-        record(out["shortlist"], out["dips"], out["prices_to"])
+        record(out["shortlist"], out["dips"], out["prices_to"], out["source"])
     except Exception as exc:          # recording must never stop the message
         print(f"recording failed: {exc}")
     if not body.get("no_telegram"):

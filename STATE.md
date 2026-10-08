@@ -29,11 +29,17 @@ All in GCP project `sudarshan-442212`, region `europe-west1`,
 schedulers in `asia-south1`, all services at **min-instances 0**.
 
 ```
-09:10  swings         previous complete session, dip list
 10:00  momentum       (job `swings-11am`) -- now its only run
 10:00  form           (job `form-10am`) stocks/pet/form.py, 10-name list to Telegram
-17:00  forward-test   grades BOTH tables, every weekday
+18:00  form           (job `form-evening`) same list on the day's NSE close
 ```
+
+**PAUSED (still billed: a paused job counts as a job, $0.10/month each beyond
+3 free per billing account):** `swings-3pm` (09:10 swings) and
+`forward-test-daily` (17:00, grades both tables), both paused by the owner at
+02:41 IST on 2026-10-09; `swings-pre-open`, `swings-post-market` (below);
+`position-check-daily` (since 2026-09-19). While `forward-test-daily` is paused
+`signal_outcomes` gets no new grades, and the December review depends on it.
 
 **Changed 2026-10-09, the owner's decision:** momentum's 09:07 (`swings-pre-open`)
 and 14:00 (`swings-post-market`) jobs are **PAUSED, not deleted**. Resume them
@@ -44,14 +50,16 @@ forward test still gets data for the December review. Live rows from
 after deduping. Keep that in mind when comparing before and after.
 
 `form` is a separate Cloud Run service built from `stocks/pet/` with
-`cloudbuild.form.yaml`. It uses momentum's Telegram bot settings. It reads
+`cloudbuild.form.yaml`. Its prices come from NSE's end-of-day files (published
+~16:35 IST), not Yahoo, which ran a day or two late. It uses momentum's Telegram bot settings. It reads
 `data_options.momentum`'s latest run for its MOMENTUM DIPS line (top-20 names
 that closed down 2%+), and writes what it sent to `data_options.form_signals`.
 Its rules are **frozen until the reviews at the end of October and in December**
 (Q7).
 
 BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`, and `form_signals`
-(each day's `form` list as sent: READY, WATCH, MOMENTUM_DIP).
+(each `form` list as sent: READY, WATCH, MOMENTUM_DIP; `slot` morning/evening,
+`source` nse/yahoo, `prices_to` the close it was computed on).
 
 Note `swings` holds momentum-era rows up to 2026-09-22 and swing-era rows after.
 `Bounce_Median IS NOT NULL` identifies swing rows. Left deliberately unlabelled.
