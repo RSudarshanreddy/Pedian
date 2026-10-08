@@ -115,6 +115,21 @@ the thresholds were fixed beforehand):
   skipped. It would have avoided Jan–Feb 2025, but it skipped a good Aug 2025
   (+3.2%) and trusted a bad Sep 2025 (−2.7%).
 
+**How long to hold** (782 READY signals, Jan 2025 – Sep 2026, bought at the
+next open):
+- **It usually moves, but it doesn't stay up.** The typical stock reached +3.3%
+  within 3 sessions, +4.2% within 5 and +6.0% within 10. Held without selling,
+  it made about nothing: −0.2% after 5 sessions, +0.3% after 10, and it was up
+  only 48% of the time.
+- **Days to reach the target (the leg's old peak):** 29% by day 3, 41% by day 5,
+  56% by day 10, 66% by day 20. The ones that got there took a median of 4
+  days; 75% arrived within 8.
+- **Don't hold past the target.** Five more sessions after reaching it averaged
+  −0.3%, and the stock was up only 43% of the time.
+- **So the trade is:** buy READY, place a GTT sell at the old peak, exit on a
+  close below halfway, and give it at most about 10 sessions. The money is in
+  selling into the move.
+
 Both measures point the right way, but they're too weak and too inconsistent
 to be a hard rule. At most they can be shown as information. A Yahoo glitch
 (18 Mar 2025, prices for only 3% of stocks) first broke the breadth figures.
