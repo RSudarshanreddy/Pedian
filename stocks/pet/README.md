@@ -85,6 +85,41 @@ The rules were fixed before this test. Changing them now to improve these
 numbers would be fitting to the result. Any improvement should be a new,
 written-down idea, tested again.
 
+### Follow-ups, 2026-10-09 (2 years of prices; the scripts were run from a scratch folder)
+
+**Leg definition, A/B/C on the same 12 months:**
+
+| | trades | win % | avg | median |
+|---|---|---|---|---|
+| A, as deployed (whole run, 4–7%) | 508 | 58.7% | +0.31% | +3.22% |
+| B, active leg (last low after a 5%+ dip, 4–7%) | 429 | 57.3% | +0.26% | +3.10% |
+| C, active leg with a 4–5% zone | 288 | 62.9% | +0.51% | +3.51% |
+
+B makes no measurable difference. C is better on paper, but it has 40% fewer
+trades and is inconsistent month to month. **A was kept.**
+
+**Why Oct–Mar was weak.** The READY setups looked the same as in the strong
+months: same leg length, persistence, pullback depth, days and volume. What
+differed was the market. Breadth (liquid stocks above their own 50-day
+average) was 45% against 67%, there were 36 persistent movers a day against 65,
+and 37% of trades were stopped out against 16%. Inside the weak months,
+winners and losers looked alike. The best 10% of trades earned more than the
+whole total (+372 points against +158).
+
+**When to trust it, tested on Jan–Sep 2025** (months the diagnosis never saw;
+the thresholds were fixed beforehand):
+- **The base model held up:** 360 trades, 56% winners, +0.20% per trade, the
+  same small edge as the first test.
+- **Breadth of 50% or more:** +0.30% when trusted, against −0.01% when skipped.
+- **47 or more persistent movers:** +0.38% when trusted, against −0.17% when
+  skipped. It would have avoided Jan–Feb 2025, but it skipped a good Aug 2025
+  (+3.2%) and trusted a bad Sep 2025 (−2.7%).
+
+Both measures point the right way, but they're too weak and too inconsistent
+to be a hard rule. At most they can be shown as information. A Yahoo glitch
+(18 Mar 2025, prices for only 3% of stocks) first broke the breadth figures.
+Dates that most stocks didn't trade must be dropped before computing breadth.
+
 ---
 
 ## Tried and deleted: `movers.py`, fresh movers among qualified momentum stocks (built 2026-10-01, deleted 2026-10-06)
