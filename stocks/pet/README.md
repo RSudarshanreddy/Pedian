@@ -13,6 +13,18 @@
 > halfway? For each MOMENTUM DIP, what was its 10-session return? How did the
 > owner's own form trades do (journal, October tradebook)? Compare these with
 > the test numbers below.
+>
+> Also on the October list:
+> - **Split the owner's trades by where the idea came from:** the momentum
+>   list, form, or their own finds. The two biggest open winners on 9 Oct,
+>   AUGMONT (+58%) and MILKYMIST (+33%), were recent listings that neither
+>   scanner showed.
+> - **The volume check is unfair to new listings.** AUGMONT was a textbook
+>   persistent mover (+51% in 11 days, 82% up-days, biggest day 23%), yet it
+>   counted as burst only because its leg volume (0.84×) was compared with a
+>   25-session average inflated by the days right after listing. Decide then
+>   whether stocks under ~40 sessions should be measured differently. This is
+>   not a hotfix.
 
 ## Now: `form.py`, movers in form, entered on a healthy pullback (2026-10-08)
 
