@@ -32,24 +32,26 @@ schedulers in `asia-south1`, all services at **min-instances 0**.
 10:00  momentum       (job `swings-11am`) -- its only run
 10:00  form           (job `form-10am`) stocks/pet/form.py, 10-name list to Telegram
 14:00  form           (job `form-2pm`) same list; MOMENTUM DIPS read the day's momentum run
+17:00  forward-test   (job `forward-test-daily`) grades BOTH tables, every weekday
 ```
 
-These are the only three scheduler jobs: the free tier is 3 jobs per billing
-account, and a paused job counts and is billed like a running one.
+These are the only four scheduler jobs. The free tier is 3 jobs per billing
+account, so the fourth costs $0.10/month; a paused job counts and is billed
+like a running one.
 
 **Changed 2026-10-09, the owner's decision:** every other job was **DELETED**:
 `swings-pre-open` (09:07 momentum), `swings-post-market` (14:00 momentum),
-`swings-3pm` (09:10, the `swings` service), `forward-test-daily` (17:00, the
-`forward-test` service), `position-check-daily` (15:45, `position-check`), and
+`swings-3pm` (09:10, the `swings` service), `position-check-daily` (15:45,
+`position-check`), and
 `form-evening` (18:00 form, which lived for a few hours). The Cloud Run services
 themselves are untouched and idle at min-instances 0. To bring one back,
 recreate its job with `gcloud scheduler jobs create http <job> --location=asia-south1
 --schedule="<cron>" --time-zone=Asia/Kolkata --uri=<service URL>/ --http-method=POST
 --oidc-service-account-email=347050126858-compute@developer.gserviceaccount.com`.
 
-**Consequences for the December review:** with `forward-test-daily` gone,
-`signal_outcomes` gets no new grades after 2026-10-08. Grade the stored lists
-then, in one pass, from prices. Momentum's live rows from 2026-10-09 come from
+`forward-test-daily` was deleted with them and recreated the same day, with
+the same settings, at the owner's request. No run was missed: it ran on 8 Oct
+and runs again on 9 Oct. Momentum's live rows from 2026-10-09 come from
 its 10:00 run only, where earlier days kept the 14:00 run after deduping. Keep
 that in mind when comparing before and after.
 
