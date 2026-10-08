@@ -4,6 +4,7 @@ Scans every NSE stock using only its last 25 sessions:
   find the active leg -> judge its form -> keep the persistent movers
   -> READY: those in a healthy 4-7% pullback; WATCH: those still near their peak.
 The daily list is 10 names: every READY name first (best leg first), then WATCH.
+Telegram gets the names only; the details (targets, exits, buy zones) go to the log.
 
     python form.py        # downloads ~3 months for every NSE stock (a few minutes)
 
@@ -175,22 +176,36 @@ def send_telegram(text: str) -> None:
     urllib.request.urlopen(req, timeout=15).read()
 
 
-def run() -> str:
+def names_only(s: pd.DataFrame) -> str:
+    """The Telegram message: just the names. The details stay in digest(), printed to the logs."""
+    lines = [f"form {dt.datetime.now(IST):%d %b}"]
+    for status in ("READY", "WATCH"):
+        names = list(s.index[s.status == status])
+        if names:
+            lines.append(f"{status}: {', '.join(names)}")
+    if len(lines) == 1:
+        lines.append("No persistent movers today.")
+    return "\n".join(lines)
+
+
+def run() -> tuple[str, str]:
+    """(details for the log, names-only message for Telegram)"""
     bars = complete_sessions_only(data.download(universe(), period="3mo", min_rows=WINDOW))
     bars = {s: df for s, df in bars.items() if len(df) >= WINDOW}
     t = scan(bars)
     prices_to = max(df.index[-1] for df in bars.values()).date()
     print(f"{len(t)} liquid stocks priced Rs {MIN_PRICE:.0f}+; form: {t.form.value_counts().to_dict()}")
-    return digest(shortlist(t), prices_to)
+    s = shortlist(t)
+    return digest(s, prices_to), names_only(s)
 
 
 def main(request: Any = None):
     """Cloud Run entry point (functions-framework) and command line."""
-    text = run()
-    print(text)
+    details, names = run()
+    print(details)
     if request is not None:
-        send_telegram(text)
-        return text, 200
+        send_telegram(names)
+        return names, 200
     return None
 
 
