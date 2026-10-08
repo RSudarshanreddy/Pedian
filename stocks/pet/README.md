@@ -284,13 +284,11 @@ and PARAS 49.1% in Jan 2025. There are too few of them to change the result.
 
 | file | what it does |
 |---|---|
-| `data.py` | Fetches the NSE stock list and 4 years of daily prices, and caches them in `data/`. |
-| `rules.py` | The rules above, and nothing else. |
-| `backtest.py` | Replays the rules over every stock and prints the results. |
-| `hindsight.py` | The follow-up: how high each trade got, and 15 alternative exits. |
+| `form.py` | The scanner. It runs locally (`python form.py`) and as the `form` Cloud Run service. |
+| `data.py` | Fetches the NSE stock list and daily prices from Yahoo. |
+| `Dockerfile.form`, `cloudbuild.form.yaml`, `requirements.txt`, `.dockerignore` | Build and deploy the `form` service. |
 
-```bash
-cd stocks/pet
-python backtest.py            # uses the cache; the first run downloads (~10 min)
-python backtest.py --refresh  # downloads fresh prices
-```
+The scripts behind the results recorded above (`form_test.py` for the form
+model; `rules.py`, `backtest.py` and `hindsight.py` for the range dip) were
+removed on 2026-10-09 to keep the folder small. They can be recovered from git
+at commit `57d6e6e`, for example with `git show 57d6e6e:stocks/pet/form_test.py`.
