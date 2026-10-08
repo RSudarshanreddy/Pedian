@@ -76,9 +76,12 @@ close after it. It can be any length. Measured on it:
 
 **Ranking:** leg size × persistence. At most 30 names are shown.
 
-**The daily Telegram message** (the `form` service, at 18:00 IST on the day's
-close and again at 10:00 IST the next morning) starts with the close it was
-computed on, for example `form 09 Oct, on 08 Oct close`, and then has three lines:
+**The daily Telegram message** (the `form` service, 10:00 and 14:00 IST on
+weekdays) starts with the close it was computed on, for example `form 09 Oct,
+on 08 Oct close`, and then has three lines. Both runs use the previous close,
+because today's bar is never used before the close. The 14:00 run can differ
+only in MOMENTUM DIPS, since by then the momentum scanner's 10:00 list for the
+day is stored. The lines are:
 1. **READY:** candidates in a healthy pullback.
 2. **WATCH:** persistent movers within 4% of their peak, waiting for a dip, up
    to 10 names together with READY.

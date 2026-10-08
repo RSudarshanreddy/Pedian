@@ -19,8 +19,8 @@ Prices come from NSE's own end-of-day files (data.nse_bars), out the same evenin
 Yahoo was a day or two late -- on 9 Oct it still lacked 8 Oct, which changed 7 of
 the 10 names -- so it is only the fallback, and the message then says so.
 
-Deployed as the `form` Cloud Run service, called at 10:00 IST and in the evening
-on weekdays; it sends the list to the same Telegram chat as the momentum scanner.
+Deployed as the `form` Cloud Run service, called at 10:00 and 14:00 IST on
+weekdays; it sends the list to the same Telegram chat as the momentum scanner.
 A bar for today is never used before the close -- the list is always judged on
 complete sessions, as in the test -- and the message names the close it is on.
 """
@@ -256,14 +256,14 @@ def names_only(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, sou
 
 def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source: str) -> None:
     """Keep what was sent, for the end-of-October and December reviews. Re-running in the same
-    slot (morning, or evening after the close) replaces that slot's rows. A load job, not
+    slot (morning, afternoon, or evening after the close) replaces that slot's rows. A load job, not
     streaming, so the DELETE always works."""
     from google.cloud import bigquery
     client = bigquery.Client(project=PROJECT)
     schema = [bigquery.SchemaField(n, t) for n, t in BQ_SCHEMA]
     client.create_table(bigquery.Table(BQ_TABLE, schema=schema), exists_ok=True)
     now = dt.datetime.now(IST)
-    slot = "evening" if now.time() >= CLOSE_DONE else "morning"
+    slot = "morning" if now.hour < 12 else "afternoon" if now.time() < CLOSE_DONE else "evening"
     base = {"run_date": now.date().isoformat(), "run_timestamp": now.isoformat(), "prices_to": prices_to.isoformat(),
             "slot": slot, "source": source}
     rows = [{**base, "status": r.status, "position": i, "symbol": sym, "price": float(r.price),

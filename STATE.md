@@ -29,25 +29,29 @@ All in GCP project `sudarshan-442212`, region `europe-west1`,
 schedulers in `asia-south1`, all services at **min-instances 0**.
 
 ```
-10:00  momentum       (job `swings-11am`) -- now its only run
+10:00  momentum       (job `swings-11am`) -- its only run
 10:00  form           (job `form-10am`) stocks/pet/form.py, 10-name list to Telegram
-18:00  form           (job `form-evening`) same list on the day's NSE close
+14:00  form           (job `form-2pm`) same list; MOMENTUM DIPS read the day's momentum run
 ```
 
-**PAUSED (still billed: a paused job counts as a job, $0.10/month each beyond
-3 free per billing account):** `swings-3pm` (09:10 swings) and
-`forward-test-daily` (17:00, grades both tables), both paused by the owner at
-02:41 IST on 2026-10-09; `swings-pre-open`, `swings-post-market` (below);
-`position-check-daily` (since 2026-09-19). While `forward-test-daily` is paused
-`signal_outcomes` gets no new grades, and the December review depends on it.
+These are the only three scheduler jobs: the free tier is 3 jobs per billing
+account, and a paused job counts and is billed like a running one.
 
-**Changed 2026-10-09, the owner's decision:** momentum's 09:07 (`swings-pre-open`)
-and 14:00 (`swings-post-market`) jobs are **PAUSED, not deleted**. Resume them
-with `gcloud scheduler jobs resume <job> --location=asia-south1`. The owner
-uses `form` for the daily list now; momentum keeps running once a day so the
-forward test still gets data for the December review. Live rows from
-2026-10-09 come from the 10:00 run only, where earlier days kept the 14:00 run
-after deduping. Keep that in mind when comparing before and after.
+**Changed 2026-10-09, the owner's decision:** every other job was **DELETED**:
+`swings-pre-open` (09:07 momentum), `swings-post-market` (14:00 momentum),
+`swings-3pm` (09:10, the `swings` service), `forward-test-daily` (17:00, the
+`forward-test` service), `position-check-daily` (15:45, `position-check`), and
+`form-evening` (18:00 form, which lived for a few hours). The Cloud Run services
+themselves are untouched and idle at min-instances 0. To bring one back,
+recreate its job with `gcloud scheduler jobs create http <job> --location=asia-south1
+--schedule="<cron>" --time-zone=Asia/Kolkata --uri=<service URL>/ --http-method=POST
+--oidc-service-account-email=347050126858-compute@developer.gserviceaccount.com`.
+
+**Consequences for the December review:** with `forward-test-daily` gone,
+`signal_outcomes` gets no new grades after 2026-10-08. Grade the stored lists
+then, in one pass, from prices. Momentum's live rows from 2026-10-09 come from
+its 10:00 run only, where earlier days kept the 14:00 run after deduping. Keep
+that in mind when comparing before and after.
 
 `form` is a separate Cloud Run service built from `stocks/pet/` with
 `cloudbuild.form.yaml`. Its prices come from NSE's end-of-day files (published
