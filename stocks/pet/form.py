@@ -42,6 +42,11 @@ LIST_SIZE = 10
 PROJECT = "sudarshan-442212"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 MOMENTUM_SHOWN, MOMENTUM_FLOOR, RED_DAY = 20, 18.0, -0.02   # the momentum digest's top 20; a 2%+ down close
+BQ_TABLE = f"{PROJECT}.data_options.form_signals"
+BQ_SCHEMA = (("run_date", "DATE"), ("run_timestamp", "TIMESTAMP"), ("prices_to", "DATE"), ("status", "STRING"),
+             ("position", "INTEGER"), ("symbol", "STRING"), ("price", "FLOAT"), ("leg_pct", "FLOAT"),
+             ("leg_days", "INTEGER"), ("up_days_pct", "FLOAT"), ("pullback_pct", "FLOAT"), ("target", "FLOAT"),
+             ("exit_below", "FLOAT"), ("momentum_rank", "INTEGER"), ("day_change_pct", "FLOAT"))
 
 
 def analyse(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict:
@@ -201,20 +206,19 @@ def momentum_dips(bars: dict[str, pd.DataFrame]) -> tuple[list[str], list[str]]:
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker ORDER BY Run_Timestamp DESC) = 1""").result()
     rows = sorted(rows, key=lambda r: -r.Expected_Move)[:MOMENTUM_SHOWN]
     latest = last_session(bars)
-    names, details = [], []
+    dips = []
     for rank, r in enumerate(rows, 1):
         df = bars.get(r.sym)
         if r.Expected_Move < MOMENTUM_FLOOR or df is None or len(df) < 2 or df.index[-1] != latest:
             continue
         change = df.Close.iloc[-1] / df.Close.iloc[-2] - 1
         if change <= RED_DAY:
-            names.append(r.sym)
-            details.append(f"{r.sym} #{rank} on the momentum list ({r.Run_Date:%d %b}) | {df.Close.iloc[-1]:,.1f}, "
-                           f"{change * 100:+.1f}% on {latest:%d %b}")
-    return names, details
+            dips.append({"symbol": r.sym, "rank": rank, "price": float(df.Close.iloc[-1]), "change": float(change),
+                         "list_date": r.Run_Date, "session": latest})
+    return dips
 
 
-def names_only(s: pd.DataFrame, dips: list[str] | None) -> str:
+def names_only(s: pd.DataFrame, dips: list[dict] | None) -> str:
     """The Telegram message: just the names. The details stay in digest(), printed to the logs."""
     lines = [f"form {dt.datetime.now(IST):%d %b}"]
     for status in ("READY", "WATCH"):
@@ -224,12 +228,36 @@ def names_only(s: pd.DataFrame, dips: list[str] | None) -> str:
     if len(lines) == 1:
         lines.append("No persistent movers today.")
     lines.append("MOMENTUM DIPS (hold ~10 days): " +
-                 ("unavailable" if dips is None else ", ".join(dips) if dips else "none today"))
+                 ("unavailable" if dips is None else ", ".join(d["symbol"] for d in dips) if dips else "none today"))
     return "\n".join(lines)
 
 
-def run() -> tuple[str, str]:
-    """(details for the log, names-only message for Telegram)"""
+def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date) -> None:
+    """Keep what was sent, for the end-of-October and December reviews. Re-running on the
+    same day replaces that day's rows. A load job, not streaming, so the DELETE always works."""
+    from google.cloud import bigquery
+    client = bigquery.Client(project=PROJECT)
+    schema = [bigquery.SchemaField(n, t) for n, t in BQ_SCHEMA]
+    client.create_table(bigquery.Table(BQ_TABLE, schema=schema), exists_ok=True)
+    now = dt.datetime.now(IST)
+    base = {"run_date": now.date().isoformat(), "run_timestamp": now.isoformat(), "prices_to": prices_to.isoformat()}
+    rows = [{**base, "status": r.status, "position": i, "symbol": sym, "price": float(r.price),
+             "leg_pct": float(r["size"]) * 100, "leg_days": int(r.length), "up_days_pct": float(r.persistence) * 100,
+             "pullback_pct": float(r.pullback) * 100, "target": float(r.peak), "exit_below": float(r.halfway)}
+            for i, (sym, r) in enumerate(s.iterrows(), 1)]
+    rows += [{**base, "status": "MOMENTUM_DIP", "position": i, "symbol": d["symbol"], "price": d["price"],
+              "momentum_rank": d["rank"], "day_change_pct": d["change"] * 100}
+             for i, d in enumerate(dips or [], 1)]
+    client.query(f"DELETE FROM `{BQ_TABLE}` WHERE run_date = @d", job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", now.date())])).result()
+    if rows:
+        client.load_table_from_json(rows, BQ_TABLE, job_config=bigquery.LoadJobConfig(
+            schema=schema, write_disposition="WRITE_APPEND")).result()
+    print(f"recorded {len(rows)} rows in {BQ_TABLE} for {now.date()}")
+
+
+def run() -> dict:
+    """The day's list: details for the log, the names-only message, and what to record."""
     bars = complete_sessions_only(data.download(universe(), period="3mo", min_rows=WINDOW))
     bars = {s: df for s, df in bars.items() if len(df) >= WINDOW}
     t = scan(bars)
@@ -237,23 +265,32 @@ def run() -> tuple[str, str]:
     print(f"{len(t)} liquid stocks priced Rs {MIN_PRICE:.0f}+; form: {t.form.value_counts().to_dict()}")
     s = shortlist(t)
     try:
-        dips, dip_details = momentum_dips(bars)
+        dips = momentum_dips(bars)
     except Exception as exc:          # the form list still goes out if BigQuery is unreachable
         print(f"momentum dips unavailable: {exc}")
-        dips, dip_details = None, []
+        dips = None
+    dip_lines = [f"{d['symbol']} #{d['rank']} on the momentum list ({d['list_date']:%d %b}) | {d['price']:,.1f}, "
+                 f"{d['change'] * 100:+.1f}% on {d['session']:%d %b}" for d in dips or []]
     details = digest(s, prices_to) + "\n\nMOMENTUM DIPS -- the momentum list's names that closed down 2%+:\n" + \
-        ("\n".join(dip_details) if dip_details else "none")
-    return details, names_only(s, dips)
+        ("\n".join(dip_lines) if dip_lines else "none")
+    return {"details": details, "names": names_only(s, dips), "shortlist": s, "dips": dips, "prices_to": prices_to}
 
 
 def main(request: Any = None):
-    """Cloud Run entry point (functions-framework) and command line."""
-    details, names = run()
-    print(details)
-    if request is not None:
-        send_telegram(names)
-        return names, 200
-    return None
+    """Cloud Run entry point (functions-framework) and command line. Only scheduled runs
+    record to BigQuery; a request body of {"no_telegram": true} skips the message (for tests)."""
+    out = run()
+    print(out["details"])
+    if request is None:
+        return None
+    body = request.get_json(silent=True) or {}
+    try:
+        record(out["shortlist"], out["dips"], out["prices_to"])
+    except Exception as exc:          # recording must never stop the message
+        print(f"recording failed: {exc}")
+    if not body.get("no_telegram"):
+        send_telegram(out["names"])
+    return out["names"], 200
 
 
 if __name__ == "__main__":

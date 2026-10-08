@@ -1,5 +1,19 @@
 # pet
 
+> **FROZEN on 2026-10-09.** `form`'s rules and its three-line message (READY,
+> WATCH, MOMENTUM DIPS) stay exactly as they are until the reviews:
+> **end of October 2026** (first look) and **December 2026** (the decision,
+> together with the momentum scanner's review). The only exceptions are bugs,
+> data errors, and the service breaking. Every scheduled run saves what it sent
+> to BigQuery `data_options.form_signals`, so the reviews grade what was
+> actually sent, not a replay.
+>
+> **End-of-October review:** for each READY name, did it reach the target
+> (the old peak), how many days did it take, and how often did it break
+> halfway? For each MOMENTUM DIP, what was its 10-session return? How did the
+> owner's own form trades do (journal, October tradebook)? Compare these with
+> the test numbers below.
+
 ## Now: `form.py`, movers in form, entered on a healthy pullback (2026-10-08)
 
 The owner's model: **find stocks that are in form now, identify their active

@@ -44,11 +44,14 @@ forward test still gets data for the December review. Live rows from
 after deduping. Keep that in mind when comparing before and after.
 
 `form` is a separate Cloud Run service built from `stocks/pet/` with
-`cloudbuild.form.yaml`. It uses momentum's Telegram bot settings and writes
-nothing to BigQuery. It reads `data_options.momentum`'s latest run for its
-MOMENTUM DIPS line: top-20 names that closed down 2%+ (see stocks/pet/README.md).
+`cloudbuild.form.yaml`. It uses momentum's Telegram bot settings. It reads
+`data_options.momentum`'s latest run for its MOMENTUM DIPS line (top-20 names
+that closed down 2%+), and writes what it sent to `data_options.form_signals`.
+Its rules are **frozen until the reviews at the end of October and in December**
+(Q7).
 
-BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`.
+BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`, and `form_signals`
+(each day's `form` list as sent: READY, WATCH, MOMENTUM_DIP).
 
 Note `swings` holds momentum-era rows up to 2026-09-22 and swing-era rows after.
 `Bounce_Median IS NOT NULL` identifies swing rows. Left deliberately unlabelled.
@@ -262,6 +265,13 @@ a median magnitude, so it ranks grinders low on purpose. MANINDS on 2026-09-24
 ranked 70 of 86 on 17.4% and did +18.4% in a month, +130.6% in six. If names
 like this keep landing at rank 70 while outperforming, the ranker needs a
 consistency term. Do NOT add one on backtest evidence.
+
+**Q7. The `form` service (added 2026-10-09, frozen the same day).** Grade its
+saved lists in `data_options.form_signals`. Did READY names reach their old
+peak within 10 sessions? Did MOMENTUM DIPS make money over 10 sessions? First
+look at the end of October, decision here. The rules and test numbers are in
+`stocks/pet/README.md`. The dip line rests on one month of evidence, so it's
+the first thing to confirm or drop.
 
 ## What the tradebook says (measured 2026-09-26, Aug 3 – Sep 25)
 
