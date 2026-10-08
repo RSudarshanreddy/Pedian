@@ -170,6 +170,16 @@ next open):
   close below halfway, and give it at most about 10 sessions. The money is in
   selling into the move.
 
+**Buying the move against buying the dip** (Jan 2025 – Sep 2026, rules fixed
+beforehand). MOVE means a persistent mover within 2% of a peak set today or
+yesterday, bought at the next open. Over 1,808 trades it averaged **−0.73%**
+held 5 sessions, −0.59% held 10 and −0.13% held 20, going up only 41–45% of the
+time. DIP (`form`'s READY), over 782 trades, averaged −0.21%, +0.25% and +0.55%,
+and +0.18% with `form`'s own exit (typical +3.1%, 57% up). **DIP beat MOVE in
+all three periods.** Buying at a fresh high is chasing, so don't re-propose a
+MOVE entry. Holding a dip entry for 20 days averages a little more than selling
+at the old peak, but it is up only 49% of the time against 57%.
+
 Both measures point the right way, but they're too weak and too inconsistent
 to be a hard rule. At most they can be shown as information. A Yahoo glitch
 (18 Mar 2025, prices for only 3% of stocks) first broke the breadth figures.
