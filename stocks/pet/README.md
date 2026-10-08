@@ -50,6 +50,20 @@ close after it. It can be any length. Measured on it:
 
 **Ranking:** leg size × persistence. At most 30 names are shown.
 
+**The daily Telegram message** (the `form` service, 10:00 IST) has three lines:
+1. **READY:** candidates in a healthy pullback.
+2. **WATCH:** persistent movers within 4% of their peak, waiting for a dip, up
+   to 10 names together with READY.
+3. **MOMENTUM DIPS (hold about 10 days):** names from the frozen momentum
+   scanner's latest stored top 20 (by Expected_Move, at least 18) that closed
+   down 2% or more on the last session most stocks have a price for.
+
+   It was added on 2026-10-09 after a same-dates comparison (signals 23 Aug –
+   24 Sep 2026, bought at the next open, held 10 sessions). Those dips made
+   **+4.7% a trade, with 67% going up**, against +3.5% for the whole momentum
+   top 20 and −0.05% for `form`'s own swing. That's one month, with few
+   distinct stocks, so treat it as a lead rather than a law.
+
 **Test trade:** buy at the next open. Exit on whichever comes first:
 - the leg's peak price (a limit order, from the day after buying);
 - a close below the halfway point (sell at the next open);

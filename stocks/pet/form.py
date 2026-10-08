@@ -4,6 +4,13 @@ Scans every NSE stock using only its last 25 sessions:
   find the active leg -> judge its form -> keep the persistent movers
   -> READY: those in a healthy 4-7% pullback; WATCH: those still near their peak.
 The daily list is 10 names: every READY name first (best leg first), then WATCH.
+
+It also adds MOMENTUM DIPS: names on the frozen momentum scanner's list (its
+latest stored top 20 by Expected_Move, >= 18) that closed down 2%+ on the last
+complete session. On 23 Aug - 24 Sep 2026 those, bought next open and held 10
+sessions, made +4.7% a trade with 67% up -- against -0.05% for form's own swing
+on the same days. One month, few distinct stocks: a lead, not a law.
+
 Telegram gets the names only; the details (targets, exits, buy zones) go to the log.
 
     python form.py        # downloads ~3 months for every NSE stock (a few minutes)
@@ -34,6 +41,7 @@ MAX_SHOWN = 30
 LIST_SIZE = 10
 PROJECT = "sudarshan-442212"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+MOMENTUM_SHOWN, MOMENTUM_FLOOR, RED_DAY = 20, 18.0, -0.02   # the momentum digest's top 20; a 2%+ down close
 
 
 def analyse(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict:
@@ -176,7 +184,37 @@ def send_telegram(text: str) -> None:
     urllib.request.urlopen(req, timeout=15).read()
 
 
-def names_only(s: pd.DataFrame) -> str:
+def last_session(bars: dict[str, pd.DataFrame]) -> pd.Timestamp:
+    """The latest session MOST stocks have. Yahoo publishes some stocks a day or two ahead
+    of the rest, so the newest date of any single stock would make the rest look stale."""
+    return pd.Series([df.index[-1] for df in bars.values()]).mode().iloc[0]
+
+
+def momentum_dips(bars: dict[str, pd.DataFrame]) -> tuple[list[str], list[str]]:
+    """Names on the momentum scanner's latest stored top 20 that closed down 2%+ on the
+    last complete session. Returns (names, detail lines)."""
+    from google.cloud import bigquery
+    rows = bigquery.Client(project=PROJECT).query(f"""
+        SELECT REGEXP_REPLACE(Ticker, r'\\.NS$', '') AS sym, Expected_Move, Run_Date
+        FROM `{PROJECT}.data_options.momentum`
+        WHERE Run_Date = (SELECT MAX(Run_Date) FROM `{PROJECT}.data_options.momentum`)
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker ORDER BY Run_Timestamp DESC) = 1""").result()
+    rows = sorted(rows, key=lambda r: -r.Expected_Move)[:MOMENTUM_SHOWN]
+    latest = last_session(bars)
+    names, details = [], []
+    for rank, r in enumerate(rows, 1):
+        df = bars.get(r.sym)
+        if r.Expected_Move < MOMENTUM_FLOOR or df is None or len(df) < 2 or df.index[-1] != latest:
+            continue
+        change = df.Close.iloc[-1] / df.Close.iloc[-2] - 1
+        if change <= RED_DAY:
+            names.append(r.sym)
+            details.append(f"{r.sym} #{rank} on the momentum list ({r.Run_Date:%d %b}) | {df.Close.iloc[-1]:,.1f}, "
+                           f"{change * 100:+.1f}% on {latest:%d %b}")
+    return names, details
+
+
+def names_only(s: pd.DataFrame, dips: list[str] | None) -> str:
     """The Telegram message: just the names. The details stay in digest(), printed to the logs."""
     lines = [f"form {dt.datetime.now(IST):%d %b}"]
     for status in ("READY", "WATCH"):
@@ -185,6 +223,8 @@ def names_only(s: pd.DataFrame) -> str:
             lines.append(f"{status}: {', '.join(names)}")
     if len(lines) == 1:
         lines.append("No persistent movers today.")
+    lines.append("MOMENTUM DIPS (hold ~10 days): " +
+                 ("unavailable" if dips is None else ", ".join(dips) if dips else "none today"))
     return "\n".join(lines)
 
 
@@ -193,10 +233,17 @@ def run() -> tuple[str, str]:
     bars = complete_sessions_only(data.download(universe(), period="3mo", min_rows=WINDOW))
     bars = {s: df for s, df in bars.items() if len(df) >= WINDOW}
     t = scan(bars)
-    prices_to = max(df.index[-1] for df in bars.values()).date()
+    prices_to = last_session(bars).date()
     print(f"{len(t)} liquid stocks priced Rs {MIN_PRICE:.0f}+; form: {t.form.value_counts().to_dict()}")
     s = shortlist(t)
-    return digest(s, prices_to), names_only(s)
+    try:
+        dips, dip_details = momentum_dips(bars)
+    except Exception as exc:          # the form list still goes out if BigQuery is unreachable
+        print(f"momentum dips unavailable: {exc}")
+        dips, dip_details = None, []
+    details = digest(s, prices_to) + "\n\nMOMENTUM DIPS -- the momentum list's names that closed down 2%+:\n" + \
+        ("\n".join(dip_details) if dip_details else "none")
+    return details, names_only(s, dips)
 
 
 def main(request: Any = None):

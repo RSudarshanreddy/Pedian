@@ -45,7 +45,8 @@ after deduping. Keep that in mind when comparing before and after.
 
 `form` is a separate Cloud Run service built from `stocks/pet/` with
 `cloudbuild.form.yaml`. It uses momentum's Telegram bot settings and writes
-nothing to BigQuery.
+nothing to BigQuery. It reads `data_options.momentum`'s latest run for its
+MOMENTUM DIPS line: top-20 names that closed down 2%+ (see stocks/pet/README.md).
 
 BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`.
 
