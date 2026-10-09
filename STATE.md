@@ -64,8 +64,24 @@ Its rules are **frozen until the reviews at the end of October and in December**
 (Q7).
 
 BigQuery `data_options`: `momentum`, `swings`, `signal_outcomes`, and `form_signals`
-(each `form` list as sent: READY, WATCH, MOMENTUM_DIP; `slot` morning/evening,
+(each `form` list as sent: READY, WATCH, MOMENTUM_DIP; `slot` morning/afternoon/evening,
 `source` nse/yahoo, `prices_to` the close it was computed on).
+
+**Dataform (`sudarshan_repo`, us-central1, workspace `worker1`)** builds
+`fact_stock_scan` (incremental, one row per stock per trading day, from
+`swings`) and the views `vw_daily_digest`, `vw_stock_action_signals`,
+`vw_stock_lifecycle_observation` and `vw_stock_lifecycle_transitions`. The
+scanners trigger it at the end of each run. **It failed on every run from
+2026-10-01 to 10-09**: `swings` had the same Ticker and Bar_Date twice (several
+runs in a day, or a run that reused an older session because Yahoo was late),
+and the MERGE refused. Fixed on 2026-10-09: the source is deduplicated (latest
+Run_Timestamp wins). The workspace was pulled, and one full refresh removed the
+old duplicates: 2,581 rows down to 1,269, one per stock-day. The previous table
+is kept as `data_options.fact_stock_scan_backup_20261009`; delete it once
+satisfied. Remember: scheduled runs compile `worker1`, not GitHub, so after
+changing a `.sqlx` file, pull the workspace. Since the `swings` 09:10 job was
+deleted (2026-10-09), `fact_stock_scan` gets no new rows: its last bar is
+2026-10-07.
 
 Note `swings` holds momentum-era rows up to 2026-09-22 and swing-era rows after.
 `Bounce_Median IS NOT NULL` identifies swing rows. Left deliberately unlabelled.
