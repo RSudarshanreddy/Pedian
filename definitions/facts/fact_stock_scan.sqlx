@@ -59,7 +59,18 @@ SELECT
   S.Max_Hold_Days AS max_hold_days,
   CURRENT_TIMESTAMP() AS loaded_at
 
-FROM ${ref("swings")} S
+-- One row per stock per trading day. The scanner can write the same Bar_Date
+-- twice: several runs in one day, or a run whose price feed had not published
+-- the previous session yet and so reused an older one (the 1 Oct run wrote
+-- 29 Sep again, 2 Oct wrote 30 Sep, 8 Oct wrote 6 Oct). Two source rows for one
+-- (stock_key, date_key) make the incremental MERGE fail outright ("must match
+-- at most one source row"), which stopped this table and every view after it
+-- from 1 Oct to 9 Oct 2026. The latest run wins, as everywhere else here.
+FROM (
+  SELECT * FROM ${ref("swings")}
+  WHERE Ticker IS NOT NULL AND Bar_Date IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker, Bar_Date ORDER BY Run_Timestamp DESC) = 1
+) S
 
 JOIN ${ref("dim_stock")} ds
   ON ds.ticker = S.Ticker
