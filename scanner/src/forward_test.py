@@ -23,9 +23,19 @@ WHAT MAKES IT HONEST
   1. TWO ENTRY CONVENTIONS, both recorded. Entry_Close is the signal bar's
      close, which is what every backtest in this project assumed and is NOT
      reachable -- the signal does not exist until that bar has closed.
-     Entry_Open is the NEXT session's open, which is the first price you could
-     genuinely transact at. The gap between them is the cost of the assumption,
-     and reporting both means nobody has to take my word for how big it is.
+     Entry_Open is the open of the first session that starts AFTER THE RUN
+     that issued the signal -- the first price you could genuinely transact
+     at. The gap between them is the cost of the assumption, and reporting both
+     means nobody has to take my word for how big it is.
+
+     FIXED 2026-10-27. Entry used to be the open after the signal's BAR, with
+     no reference to when the run happened. Until 9 Oct the scanner often read
+     a bar 2-4 sessions old (Yahoo lag) -- the 6 Oct run used 1 Oct's bar -- so
+     the graded "entry" was a price from days BEFORE the alert existed. Every
+     horizon is now measured from the entry session; Entry_Date and
+     Run_Timestamp are stored so it can be checked. For the 10:00 runs since
+     9 Oct nothing changes: their bar is the run day, and the next session
+     already starts after the run.
   2. Costs charged on every outcome at config.round_trip_cost_pct.
   3. Stop and target come from the STORED row, not recomputed, so the test
      grades the signal that was actually issued rather than a tidied-up version
@@ -66,6 +76,9 @@ LOGGER = logging.getLogger(__name__)
 
 OUTCOME_TABLE_ID = "signal_outcomes"
 
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+MARKET_OPEN = dt.time(9, 15)     # a session's open is usable only by a run that came before it
+
 # Horizons evaluated for every signal, in SESSIONS.
 #
 # 30 is the scanner's own move_horizon_days -- the window Expected_Move is
@@ -95,6 +108,8 @@ OUTCOME_SCHEMA = [
     bigquery.SchemaField("Stop_Loss", "FLOAT64"),
     bigquery.SchemaField("Typical_Move_Price", "FLOAT64"),
     # --- what actually happened ---
+    bigquery.SchemaField("Run_Timestamp", "TIMESTAMP"),   # the run that issued the signal
+    bigquery.SchemaField("Entry_Date", "DATE"),           # the session Entry_Open is taken from
     bigquery.SchemaField("Entry_Close", "FLOAT64"),
     bigquery.SchemaField("Entry_Open", "FLOAT64"),
     bigquery.SchemaField("Sessions_Available", "INT64"),
@@ -161,6 +176,10 @@ def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
     target_parts = [c for c in ("Typical_Move_Price", "Target") if c in existing]
     select += (f", COALESCE({', '.join(target_parts)}) AS Typical_Move_Price"
                if target_parts else ", CAST(NULL AS FLOAT64) AS Typical_Move_Price")
+    # When the signal was issued -- the earliest run that saw this bar (see the
+    # ORDER BY below). The entry is measured from it.
+    select += (", Run_Timestamp" if "Run_Timestamp" in existing
+               else ", CAST(NULL AS TIMESTAMP) AS Run_Timestamp")
     missing = [alias for src, alias in wanted if src not in existing]
     if not target_parts:
         missing.append("Typical_Move_Price/Target")
@@ -228,11 +247,27 @@ def evaluate_signal(row: Any, frame: pd.DataFrame,
     low = frame["Low"].to_numpy(dtype=float)
     open_ = frame["Open"].to_numpy(dtype=float)
 
-    entry_close = close[i]
-    # The first genuinely transactable price. The signal is computed FROM the
-    # close of bar i, so it does not exist until that session is over; the
-    # earliest you can act is the next open.
-    entry_open = open_[i + 1] if i + 1 < len(frame) else np.nan
+    # The first session you could genuinely buy in: after the signal's bar AND
+    # after the run that issued it. The bar alone is not enough -- runs before
+    # 9 Oct often read a bar several sessions old, and the open after that bar
+    # was a price from before the alert existed. A session's open counts only
+    # if the run came before 09:15 IST that day. No run time (very old rows)
+    # falls back to the old rule, the open after the bar.
+    e = i + 1
+    run_ts = getattr(row, "Run_Timestamp", None)
+    if run_ts is not None and pd.notna(run_ts):
+        ts = pd.Timestamp(run_ts)
+        ts = (ts.tz_localize("UTC") if ts.tzinfo is None else ts).tz_convert(IST)
+        run_day, before_open = ts.date(), ts.time() < MARKET_OPEN
+        while e < len(dates) and (dates[e] < run_day or (dates[e] == run_day and not before_open)):
+            e += 1
+    if e >= len(frame):
+        return []                                  # not tradeable yet -- stays pending
+    entry_open = open_[e]
+    # The last close before the entry session. For a run during market hours
+    # (every run since 9 Oct) that is the run day's close, so it is reachable
+    # too; for a signal read off a fresh bar it is the same close as before.
+    entry_close = close[e - 1]
     if not np.isfinite(entry_close) or entry_close <= 0:
         return []
 
@@ -241,7 +276,7 @@ def evaluate_signal(row: Any, frame: pd.DataFrame,
 
     out: list[dict[str, Any]] = []
     for horizon in HORIZONS:
-        window = slice(i + 1, i + 1 + horizon)
+        window = slice(e, e + horizon)
         w_close, w_high, w_low = close[window], high[window], low[window]
         if len(w_close) < horizon:
             continue
@@ -267,6 +302,8 @@ def evaluate_signal(row: Any, frame: pd.DataFrame,
             "Signal_Price": _f(row.Signal_Price),
             "Stop_Loss": _f(row.Stop_Loss),
             "Typical_Move_Price": _f(row.Typical_Move_Price),
+            "Run_Timestamp": (pd.Timestamp(run_ts) if run_ts is not None and pd.notna(run_ts) else None),
+            "Entry_Date": dates[e],
             "Entry_Close": round(float(entry_close), 2),
             "Entry_Open": round(float(entry_open), 2) if np.isfinite(entry_open) else None,
             "Sessions_Available": int(len(w_close)),
@@ -352,6 +389,8 @@ def backfill(project: str, dataset: str, table: str, config: S.ScannerConfig,
 
     out = pd.DataFrame(rows)
     out["Bar_Date"] = pd.to_datetime(out["Bar_Date"]).dt.date
+    out["Entry_Date"] = pd.to_datetime(out["Entry_Date"]).dt.date
+    out["Run_Timestamp"] = pd.to_datetime(out["Run_Timestamp"], utc=True)
     ref = f"{project}.{dataset}.{OUTCOME_TABLE_ID}"
     try:
         client.get_table(ref)

@@ -7,9 +7,11 @@ showed the two premises are different strategies that happen to share a
 universe filter -- see swings.py for the swing (buy-the-dip) side. Their picks
 overlap only 10%.
 
-Do not mistake this for a swing scanner. It never buys a trough. Measured
+Its GATES find stocks that move; since 2026-10-27 its MESSAGE shows two groups
+of them -- MOVING (at a fresh high) and SWING (a dip from a recent high), see
+below. It is not swings.py, which buys deep pullbacks in an uptrend. Measured
 decomposition of what each layer contributes (mean 30-session return, entry at
-next open, net of costs):
+next open, net of costs -- this table describes the old Expected_Move ranking):
     every observation, no filter      n=162,252   +0.87%
     + universe (price, liquidity)     n= 31,015   +1.77%
     + volatility identity + character n= 11,727   +4.46%
@@ -35,6 +37,20 @@ of one market.
 - Ranked by Expected_Move. Score is stored but does not predict (-0.065 vs
   forward return); nor does Action (BUY +3.54% vs WATCH +4.42% at 30 sessions).
 - Every run's candidates are written to BigQuery, keyed on Run_Timestamp.
+
+WHAT THE MESSAGE SHOWS (since 2026-10-27): two groups drawn from EVERY stock that
+passed the scanner's gates (not just a top 20), each ordered by Score --
+    MOVING  at (within 2% of) its 20-session high and above its close 5 sessions ago
+    SWING   8-15% below its 20-session high, that high made within the last 10 sessions
+The owner's method in two lines: buy what is moving up; buy the dip from a recent high.
+Expected_Move is still computed and stored, but its only job is the >= 14 entry
+gate. It no longer orders anything, because it is confidence built from past gains: it
+ranked KABRAEXTRU #1 for a month after its run, and kept AEGISLOG out of the top 20
+until 1,283 although the pool had it at 752. Backtest, 212 days: the two groups
+showed AEGISLOG at 779 (4% of its run done), ANTELOPUS at 791 (17%) and SHILPAMED at
+424 (before its run), where the top 20 showed them at 72% done, never, and 70% done.
+Returns over 10 sessions: +1.16% against the top 20's +1.28% (rest of pool +1.09%);
+over 30 sessions the top 20 led, +5.46% against +3.57%.
 """
 
 
@@ -279,6 +295,16 @@ class ScannerConfig:
     # clears it on its stronger days, GANECOS (14.7, stuck) does not. Floors at
     # 26 or 28 would have removed all three winners.
     display_min_move_pct: float = 18.0
+
+    # --- What a stock is doing NOW: the two groups in the message ---
+    # Measured on the last now_window sessions of closes. See the module docstring
+    # for the evidence. Every stock in the pool is labelled; nothing is ranked.
+    now_window: int = 20
+    moving_within_pct: float = 2.0     # MOVING: close within this % of the window high...
+    moving_up_sessions: int = 5        # ...and above its close this many sessions ago
+    swing_from_pct: float = 8.0        # SWING: close this far below the window high...
+    swing_to_pct: float = 15.0         # ...but not further (deeper is a break, not a swing)
+    swing_high_within: int = 10        # ...and the high itself made this recently
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -491,8 +517,12 @@ def market_session_calendar(yf: Any, tickers: list[str],
     """
     if not tickers:
         return None
-    stride = max(1, len(tickers) // SESSION_SAMPLE_SIZE)
-    sample = tickers[::stride][:SESSION_SAMPLE_SIZE]
+    # Evenly spaced over the whole list. The old integer stride sampled only
+    # the first 150 tickers for lists of 151-299, and skipped the tail of
+    # longer ones -- a bias whenever the NSE list is ordered.
+    idx = np.unique(np.linspace(0, len(tickers) - 1,
+                                min(SESSION_SAMPLE_SIZE, len(tickers))).astype(int))
+    sample = [tickers[i] for i in idx]
     try:
         probe = download_batch(yf, sample, ScannerConfig(period="3mo"))
     except Exception as exc:
@@ -670,8 +700,13 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig,
     # Liquidity deliberately still uses the inclusive average -- it is a
     # "is this tradeable" measure, not a deviation-from-normal one, and
     # including today is the more current answer.
+    #
+    # The average of each day's Close x Volume. Fixed 2026-10-27: this was
+    # mean(Close) x mean(Volume), which is not the same number whenever price
+    # and volume move together -- and a breakout is exactly that. KABRAEXTRU
+    # sat at 9.94 Cr against the 10 Cr gate under the old formula.
     data["avg_traded_value20_cr"] = (
-        data["Close"].rolling(20).mean() * data["Volume"].rolling(20).mean()
+        (data["Close"] * data["Volume"]).rolling(20).mean()
     ) / 10_000_000
 
     # ATR(14) -- simple rolling mean of true range
@@ -1167,6 +1202,36 @@ def calculate_score(
     return round(max(min(score, 100), 0), 2)
 
 # =========================================================
+# NOW STATE -- moving up, or dipping from a recent high
+# =========================================================
+def now_state_of(data: pd.DataFrame, config: ScannerConfig) -> tuple[str, float, int, float]:
+    """(state, % below the window high, sessions since that high, the high).
+
+    state is "MOVING", "SWING" or "". Uses closes only, up to and including the
+    latest bar the scan used -- at the 10:00 run that is the session in progress,
+    so the label describes the price the owner sees when the message arrives.
+    """
+    close = data["Close"].to_numpy(dtype=float)
+    w = close[-config.now_window:]
+    if len(w) < config.now_window or not np.all(np.isfinite(w)):
+        return "", float("nan"), -1, float("nan")
+    # Most RECENT occurrence of the high: np.argmax returns the first of tied
+    # values, which would make "sessions since the high" look older than it is.
+    hi_idx = len(w) - 1 - int(np.argmax(w[::-1]))
+    high = float(w[hi_idx])
+    off = (w[-1] / high - 1) * 100
+    since = len(w) - 1 - hi_idx
+    up = len(close) > config.moving_up_sessions and close[-1] > close[-1 - config.moving_up_sessions]
+    if off >= -config.moving_within_pct and up:
+        state = "MOVING"
+    elif -config.swing_to_pct <= off <= -config.swing_from_pct and since <= config.swing_high_within:
+        state = "SWING"
+    else:
+        state = ""
+    return state, round(off, 2), since, round(high, 2)
+
+
+# =========================================================
 # CANDIDATE BUILDER
 # =========================================================
 def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str, run_timestamp: str) -> Optional[dict[str, Any]]:
@@ -1256,6 +1321,8 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if score < config.min_score:
         return None
 
+    now_state, pct_off_high, since_high, high_now = now_state_of(data, config)
+
     return {
         "Ticker": ticker,
         "Bar_Date": pd.Timestamp(data.index[-1]).date().isoformat(),
@@ -1298,6 +1365,10 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "RR_Ratio": risk["rr_ratio"],
         "ATR": risk["atr"],
         "Move_Horizon_Days": config.move_horizon_days,
+        "Now_State": now_state,                      # MOVING / SWING / "" (see now_state_of)
+        "Pct_Off_High20": pct_off_high,
+        "Sessions_Since_High20": since_high,
+        "High20": high_now,
     }
 # =========================================================
 # SCANNER
@@ -1333,6 +1404,7 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     batches = chunks(tickers, config.chunk_size)
     total = len(batches)
     attempted = 0
+    empty_frames = 0
 
     calendar = (
         market_session_calendar(yf, tickers, config) if config.require_current_bar else None
@@ -1371,9 +1443,11 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
             for ticker in batch:
                 attempted += 1
                 try:
+                    raw_frame = get_ticker_frame(batch_data, ticker)
+                    if raw_frame.empty:
+                        empty_frames += 1
                     frame, bar_state = align_to_session(
-                        get_ticker_frame(batch_data, ticker), calendar,
-                        config.contiguous_sessions_required,
+                        raw_frame, calendar, config.contiguous_sessions_required,
                     )
                     bar_state_counts[bar_state] += 1
                     if bar_state != "current":
@@ -1454,24 +1528,42 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
                   f"({config.min_session_coverage:.0%}) before trusting this run.")
         LOGGER.warning("%s", message)
 
+    # A Yahoo outage returns empty frames rather than errors, and used to end
+    # in "No candidates matched" with filter-relaxation hints -- an outage
+    # dressed up as a quiet market. Past half the universe it is an outage.
+    no_data = len(batch_failures) + empty_frames
+    if tickers and no_data / len(tickers) > 0.5:
+        raise RuntimeError(
+            f"{no_data}/{len(tickers)} tickers came back with no prices "
+            f"({len(batch_failures)} in failed batches, {empty_frames} empty). "
+            f"That is a data outage, not an empty market -- nothing was scanned."
+        )
+
     if not results:
         return pd.DataFrame(), failures, 0
 
     df = pd.DataFrame(results)
-    # Ranked by Expected_Move, NOT Score and NOT Action.
+    # Ranked by Score -- the owner's decision, 2026-10-27. Expected_Move keeps
+    # exactly one job: the >= 14 entry gate (min_typical_move_pct).
     #
-    # Score does not predict: across 991 stored signals it correlated -0.065
-    # with forward return, was positive on only 4 of 15 bar dates, and scored
-    # ANTELOPUS/SHILPAMED/AEGISLOG at 48.1 against a 49.0 population mean. It
-    # scored BLISSGVS 7.9 through a +177% run. Still computed and stored.
+    # Why Expected_Move stopped ordering anything: it is the median best gain
+    # of windows that closed 30+ sessions ago, so it grows most confident
+    # AFTER a stock has run and never falls when the stock does. Live, it held
+    # KABRAEXTRU at #1 on every run from 22 Sep while it gave back its whole
+    # run, and kept AEGISLOG out of the top 20 until 1,283 though the pool had
+    # it at 752.
     #
-    # Action does not either: BUY +3.54% vs WATCH +4.42% at 30 sessions, so
-    # floating BUY to the top handed the reader the weaker cohort first.
+    # What to know about Score before trusting the order. MOVE_PTS (40 of its
+    # 100 points) is computed from Expected_Move, so Score still leans on the
+    # past -- less than before, not zero. Measured before this change: Score
+    # correlated -0.065 with forward return across 991 stored signals, and as
+    # a top-20 ranker on the live lists from 22 Sep it beat the rest of the
+    # pool by +1.7 points over 10 sessions (Expected_Move: +5.3). Revisit with
+    # live results: Now_State and Score are both stored on every row.
     #
-    # Expected_Move is the one measured quantity that correlated positively and
-    # repeatably (+0.126 to +0.143), and it is already what min_typical_move_pct
-    # gates on, so the list is ordered by the same thing that decides membership.
-    df = df.sort_values(["Expected_Move", "Score"], ascending=[False, False])
+    # Action still does not order anything: BUY +3.54% vs WATCH +4.42% at 30
+    # sessions.
+    df = df.sort_values(["Score", "Expected_Move"], ascending=[False, False])
 
     total_quality_candidates = len(df)
     # top_n caps STORAGE only; the display cap is applied by the caller. These
@@ -1519,6 +1611,10 @@ BQ_SCHEMA = [
     bigquery.SchemaField("RR_Ratio", "FLOAT64"),
     bigquery.SchemaField("ATR", "FLOAT64"),
     bigquery.SchemaField("Move_Horizon_Days", "INT64"),
+    bigquery.SchemaField("Now_State", "STRING"),
+    bigquery.SchemaField("Pct_Off_High20", "FLOAT64"),
+    bigquery.SchemaField("Sessions_Since_High20", "INT64"),
+    bigquery.SchemaField("High20", "FLOAT64"),
 ]
 
 def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
@@ -1772,55 +1868,66 @@ def select_for_display(candidates: pd.DataFrame, config: ScannerConfig) -> pd.Da
     return kept.head(config.display_top_n)
 
 
+MAX_NAMES_PER_GROUP = 40     # per group in the message; the rest are stored, not lost
+TELEGRAM_MAX = 4096          # Bot API limit for one text message
+
+
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10, horizon_days: int = 30,
-                           limit_total: Optional[int] = None) -> Optional[str]:
-    """Name and Move% for the top `limit` rows, in the order the console prints.
+                           config: ScannerConfig) -> Optional[str]:
+    """MOVING and SWING names from every stock that passed the gates, each by Score.
 
     Returns None only when the scan found nothing at all.
 
-    SHOWS Move%, NOT Action, because Action was actively misleading here.
-    Measured within the top 3 across 102 decision dates:
-        WATCH  n=182  91% of picks  ret30 +3.71%  win 61.0%
-        BUY    n= 18   9% of picks  ret30 +1.36%  win 50.0%
-    91% of picks carried the WATCH label and those were the ones that made the
-    money. Reading WATCH as "do not buy" meant skipping 182 trades at +3.71% to
-    take 18 at +1.36%. By state it inverts further: `coiling` ("volatile &
-    coiling, watch for trigger") is 54% of picks and the BEST performer at
-    +5.32%, while `pullback_bounce` -- one of the two states that says BUY --
-    is the only one that lost money, at -0.65%.
-
-    Action is not wrong, it answers a different question: did a candle do
-    something yesterday. Five of the seven trigger states return WATCH, so it
-    is the default rather than a warning, and a breakout needs 2.3x volume,
-    which a stock cannot trade without having already moved (median +6.35%
-    AFTER the fact). On a list where membership IS the signal, a column reading
-    WATCH beside the strongest name in the universe fights the reader daily.
-
-    Move% is the honest replacement: it is the ranker, so the column and the
-    ordering finally agree; it is the one measure shown to predict (+0.126 to
-    +0.143 vs forward return); and it differentiates the three names -- today's
-    top pick travels 25pp further than the third, which BUY/WATCH could never
-    convey. Action and Setup_Type are still computed and stored in BigQuery.
+    Ordered by Score, highest first (the owner's decision, 2026-10-27) -- NOT
+    by Expected_Move, which grows most confident after a stock has already run,
+    the same mistake as adding to a position after the move. See the note at
+    the sort in scan_tickers for what Score does and does not contain.
 
     Plain text, no parse_mode -- see send_telegram_notification.
     """
     if candidates.empty:
         return None
-
-    rows = candidates.head(limit)
-    # candidates arrives pre-selected, so its length is the shown count, not
-    # the pool. limit_total carries the real pool size for the footer.
-    total = int(limit_total) if limit_total is not None else len(candidates)
     run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
-    width = max((len(str(t).replace(".NS", "")) for t in rows["Ticker"]), default=10)
-    lines = [f"Momentum {run_time_ist}", ""]
-    for n, (_, r) in enumerate(rows.iterrows(), start=1):
-        ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Expected_Move']:.1f}%")
+    # Which session's prices the labels describe. The session calendar can pick
+    # an older, widely covered date when Yahoo lags, so the run time alone can
+    # look fresher than the prices are.
+    bars = pd.to_datetime(candidates["Bar_Date"]).dt.date
+    bar = bars.max()
+    today_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).date()
+    when = (f"{bar} (session in progress)" if bar == today_ist and
+            (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).time() < dt.time(15, 45)
+            else f"close of {bar}")
+    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min()})"
+    lines = [f"Momentum {run_time_ist}", f"Prices: {when}{mixed}", ""]
+    moving = [str(t).replace(".NS", "") for t in
+              candidates[candidates["Now_State"] == "MOVING"].sort_values("Score", ascending=False)["Ticker"]]
+    lines.append("MOVING")
+    if not moving:
+        lines.append("  none today")
+    for k in range(0, min(len(moving), MAX_NAMES_PER_GROUP), 6):
+        lines.append("  " + "  ".join(moving[k:k + 6]))
+    if len(moving) > MAX_NAMES_PER_GROUP:
+        lines.append(f"  ... +{len(moving) - MAX_NAMES_PER_GROUP} more (all stored in BigQuery)")
+    swing = candidates[candidates["Now_State"] == "SWING"].copy()
+    swing["name"] = swing["Ticker"].astype(str).str.replace(".NS", "", regex=False)
     lines.append("")
-    lines.append(f"Top {len(rows)} of {total}. Hold ~{horizon_days} sessions.")
-    return "\n".join(lines)
+    lines.append(f"SWING (dip from a high made in the last {config.swing_high_within} sessions)")
+    if swing.empty:
+        lines.append("  none today")
+    else:
+        width = int(swing["name"].str.len().max())
+        shown = swing.sort_values("Score", ascending=False)
+        for _, r in shown.head(MAX_NAMES_PER_GROUP).iterrows():
+            lines.append(f"  {r['name']:<{width}}  {r['Pct_Off_High20']:>4.0f}%  "
+                         f"closing high {r['High20']:,.0f}")
+        if len(shown) > MAX_NAMES_PER_GROUP:
+            lines.append(f"  ... +{len(shown) - MAX_NAMES_PER_GROUP} more (all stored in BigQuery)")
+    lines.append("")
+    lines.append(f"From {len(candidates)} stocks that passed the scanner.")
+    text = "\n".join(lines)
+    # Telegram rejects a message over 4,096 characters outright; cut rather
+    # than lose the whole alert.
+    return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 
 
 def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
@@ -1871,14 +1978,15 @@ def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list
 # =========================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Volatility momentum scanner - finds stocks moving hard now and "
-                    "ranks them by how far they typically travel over 30 sessions. "
-                    "It does not model an exit and it never buys a dip."
+        description="Volatility momentum scanner - qualifies stocks that move, then "
+                    "reports which are MOVING (at a fresh high) and which are in a SWING "
+                    "(a dip from a recent high). It does not model an exit."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
     p.add_argument("--limit", default=0, type=int)
-    p.add_argument("--only-buy", action="store_true")
+    p.add_argument("--only-buy", action="store_true",
+                   help="Console only: show Action == BUY rows. Does not change Telegram")
 
     p.add_argument("--min-avg-volatility", default=ScannerConfig.min_avg_volatility, type=float)
     p.add_argument("--range-event-threshold", default=ScannerConfig.range_event_threshold, type=float)
@@ -1912,8 +2020,8 @@ def parse_args() -> argparse.Namespace:
                    type=float, help="Quality floor for the displayed list only; "
                                     "does not change what is scanned or stored")
     p.add_argument("--display-top-n", default=ScannerConfig.display_top_n, type=int,
-                    help="How many rows to print and send to Telegram. Attention knob, "
-                         "not a filter -- storage is unaffected")
+                    help="How many rows to print in the CONSOLE table. Telegram shows the "
+                         "MOVING and SWING groups instead; storage is unaffected")
     p.add_argument("--output", default="", help="CSV output path")
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
     p.add_argument("--no-dataform-trigger", action="store_true",
@@ -2083,17 +2191,19 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     # "BUY first" after Action stopped being one. A header that describes a
     # different ordering than the rows below it is worse than no header, because
     # it is believed.
-    print("RESULTS (ranked by Move% -- typical 30-session gain. Not by Score, not by Action)")
+    print("RESULTS (ranked by Score. Expected_Move is only the entry gate; Action orders nothing)")
     print("Age = consecutive days this Setup has held. Action/Setup describe today's price")
     print("structure; they do NOT order the list and BUY has not been shown to beat WATCH.")
+    print("MovePx and RR come from Expected_Move -- a historical BEST gain, not a tested trade")
+    print("outcome. Telegram shows the MOVING and SWING groups, not this table.")
     print("-" * 100)
-    header = (f"{'Ticker':<13} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
+    header = (f"{'Ticker':<13} {'Now':<7} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
               f"{'Upside%':>9} {'Stabil':>7} {'Move%':>8} {'TailDD':>8} {'RR':>5} "
               f"{'Entry':>9} {'SL':>9} {'MovePx':>9}")
     print(header)
     print("-" * 100)
     for _, r in display.iterrows():
-        print(f"{r['Ticker']:<13} {r['Action']:<7} {r['Setup_Type']:<16} {r['Setup_Age_Days']:>4} "
+        print(f"{r['Ticker']:<13} {r['Now_State'] or '-':<7} {r['Action']:<7} {r['Setup_Type']:<16} {r['Setup_Age_Days']:>4} "
               f"{r['Score']:>6.1f} {r['Avg_Volatility']:>5.1f}% "
               f"{r['Upside_Dominance_Pct']:>8.0f}% {r['Move_Stability']:>6.1f} "
               f"{r['Expected_Move']:>7.1f}% {r['Tail_Drawdown_Pct']:>7.1f}% {r['RR_Ratio']:>5.1f} "
@@ -2104,7 +2214,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         print(f"\nSaved {len(candidates)} rows to {output_path}")
 
     if shown > len(display):
-        print(f"\nShowing the top {len(display)} of {shown} by Move%. "
+        print(f"\nShowing the top {len(display)} of {shown} by Score. "
               f"All {len(candidates)} are written to BigQuery -- raise --display-top-n to see more.")
     else:
         print(f"\nTotal quality candidates: {total_quality}")
@@ -2119,10 +2229,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(
-                    select_for_display(candidates, config), run_date,
-                    config.display_top_n, config.move_horizon_days,
-                    limit_total=len(candidates))
+                digest_text = format_telegram_digest(candidates, run_date, config)
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
@@ -2144,6 +2251,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         except Exception as exc:
             print(f"\nTelegram notification skipped/failed: {exc}")
             print("Use --no-telegram to suppress this.")
+    bq_failed = False
     if not no_bq:
         try:
             resolved_project_id = _resolve_project_id(project_id)
@@ -2159,10 +2267,16 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
                     print("Use --no-dataform-trigger to suppress this, or check the calling "
                           "service account has roles/dataform.editor.")
         except Exception as exc:
+            bq_failed = True
             print(f"\nBigQuery write skipped/failed: {exc}")
             print("Use --no-bq to suppress this, or --project-id / set GCP_PROJECT to fix it.")
 
     if request is not None:
+        # A failed write means the forward test has nothing to grade for this
+        # run. Say so with a 500 so the scheduler records a failure, instead of
+        # "completed" -- the Telegram message may still have gone out.
+        if bq_failed:
+            return (f"Scanned {len(candidates)} candidates but the BigQuery write FAILED.", 500)
         return (f"Scanner completed: {len(candidates)} candidates processed.", 200)
     return None
 
