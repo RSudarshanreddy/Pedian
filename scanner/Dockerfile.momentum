@@ -16,6 +16,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/momentum.py .
+# swings.py runs in the same 10:00 call, after momentum (see main() in
+# momentum.py): the owner keeps three scheduler jobs. It is still deployable
+# on its own as the `swings` service, from Dockerfile.
+COPY src/swings.py .
 
 ENV PORT=8080
 CMD exec functions-framework --target=main --source=momentum.py --port=${PORT}

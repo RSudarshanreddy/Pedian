@@ -2138,7 +2138,7 @@ def parse_args() -> argparse.Namespace:
 # =========================================================
 # MAIN
 # =========================================================
-def main(request: Any = None) -> Optional[tuple[str, int]]:
+def run_momentum(request: Any = None) -> Optional[tuple[str, int]]:
     """Run as either a CLI program or an HTTP Cloud Function.
     
     Functions Framework calls the configured entry point with the Flask
@@ -2373,6 +2373,38 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             return (f"Scanned {len(candidates)} candidates but the BigQuery write FAILED.", 500)
         return (f"Scanner completed: {len(candidates)} candidates processed.", 200)
     return None
+
+def main(request: Any = None) -> Optional[tuple[str, int]]:
+    """Entry point: the momentum scan, then -- over HTTP only -- the swing scan.
+
+    swings.py rides on this service's 10:00 call because the owner keeps three
+    scheduler jobs (2026-10-28). The two stay separate scanners: their own rules,
+    message and BigQuery table; only the trigger is shared. Both read the same
+    request body, so {"no_telegram": true, "no_bq": true} quiets both, and
+    {"no_swings": true} runs momentum alone. A failure in either still lets the
+    other run, and the response is a 500 if either failed.
+    """
+    if request is None:
+        return run_momentum(None)
+    try:
+        momentum_msg, momentum_code = run_momentum(request)
+    except Exception as exc:
+        LOGGER.exception("momentum scan failed")
+        momentum_msg, momentum_code = f"Momentum FAILED: {exc}", 500
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    if body.get("no_swings"):
+        return momentum_msg, momentum_code
+    try:
+        import swings
+        swings_msg, swings_code = swings.main(request)
+    except Exception as exc:
+        LOGGER.exception("swing scan failed")
+        swings_msg, swings_code = f"FAILED: {exc}", 500
+    return f"{momentum_msg} | Swings: {swings_msg}", max(momentum_code, swings_code)
+
 
 if __name__ == "__main__":
     main()
