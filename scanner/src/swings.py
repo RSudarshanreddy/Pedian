@@ -2038,14 +2038,18 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
         name = str(r["Ticker"]).replace(".NS", "")
         action = "WATCH"
         if buy:
-            action = f"BUY, GTT {r['Plan_Target']:,.0f}"
+            action = f"BUY now, GTT {r['Plan_Target']:,.0f}"
             if pd.notna(r.get("Plan_Sell_By")):
                 action += f", sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
         lines.append(f"{name} | {r['Score']:.0f} | {action}")
     lines.append("")
     lines.append(f"{len(shown)} of {len(ranked)} shown. Score orders the list; it is not a forecast.")
     if buy:
-        lines.append("No price stop: GTT at the old high, else sell on the date. Same amount in each.")
+        # "now": ICICI 5-minute bars, 2026-10-28 -- swing names bought at 12:00,
+        # 14:30 or the close did 0.4-0.5 a trade worse than at the open, on all
+        # four halves; 10:00 was -0.2 (mixed). Buy as soon as the list arrives.
+        lines.append("Buy now -- waiting until the afternoon cost 0.4 a trade in the test. "
+                     "No price stop: GTT at the old high, else sell on the date. Same amount in each.")
     text = "\n".join(lines)
     return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 

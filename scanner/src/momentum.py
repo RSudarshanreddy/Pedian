@@ -2029,13 +2029,17 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
             name = str(r["Ticker"]).replace(".NS", "")
             action = "WATCH"
             if buy:
-                action = (f"BUY, sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
-                          if pd.notna(r.get("Plan_Sell_By")) else "BUY")
+                action = (f"BUY after 14:30, sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
+                          if pd.notna(r.get("Plan_Sell_By")) else "BUY after 14:30")
             lines.append(f"{name} | {r['Score']:.0f} | {action}")
         lines.append("")
         lines.append(f"{len(shown)} of {len(moving)} shown. Score orders the list; it is not a forecast.")
         if buy:
-            lines.append("No price stop: sell on the date. Same amount in each.")
+            # 14:30: ICICI 5-minute bars, 2026-10-28 -- MOVING names bought at 14:30
+            # did +0.29 a trade better than at the open, and +0.42 at the close,
+            # on all four halves; they tend to dip during the day.
+            lines.append("Buy after 14:30 (tested: momentum names dip during the day). "
+                         "No price stop: sell on the date. Same amount in each.")
     text = "\n".join(lines)
     return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 

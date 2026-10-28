@@ -23,8 +23,11 @@ Prices come from NSE's own end-of-day files (data.nse_bars), out the same evenin
 Yahoo was a day or two late -- on 9 Oct it still lacked 8 Oct, which changed 7 of
 the 10 names -- so it is only the fallback, and the message then says so.
 
-Deployed as the `form` Cloud Run service, called at 10:00 and 14:00 IST on
-weekdays; it sends the list to the same Telegram chat as the momentum scanner.
+Deployed as the `form` Cloud Run service, called at 08:45 IST on weekdays (since
+2026-10-28; it was 10:00 and 14:00), so the list arrives before the 9:00-9:08
+pre-open order window: READY names bought at the opening price did 0.26-0.40 a
+trade better than at any later time (ICICI 5-minute bars, all four halves). It
+sends the list to the same Telegram chat as the momentum scanner.
 A bar for today is never used before the close -- the list is always judged on
 complete sessions, as in the test -- and the message names the close it is on.
 """
@@ -222,8 +225,8 @@ def last_session(bars: dict[str, pd.DataFrame]) -> pd.Timestamp:
 def market_gauge() -> tuple[float, dt.date] | None:
     """The market gauge from the latest momentum run: the share of every stock in its
     price/liquidity range above its own 50-day average. form's own bars are 30 sessions,
-    too short for a 50-day average, so it reads the value momentum.py stores. At 10:00
-    that is usually the previous day's run; the message says which day."""
+    too short for a 50-day average, so it reads the value momentum.py stores. At 08:45
+    that is the previous day's run; the message says which day."""
     from google.cloud import bigquery
     rows = list(bigquery.Client(project=PROJECT).query(f"""
         SELECT Market_Breadth_Pct AS pct, Run_Date AS day FROM `{PROJECT}.data_options.momentum`
@@ -261,13 +264,17 @@ def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: 
         return "\n".join(lines)
     lines.append("Stock | Score | Action")
     for sym, r in s.iterrows():
-        action = (f"BUY, GTT {r.peak:,.0f}, exit below {r.halfway:,.0f}, sell by {sell_by(prices_to):%d %b}"
+        action = (f"BUY at the open, GTT {r.peak:,.0f}, exit below {r.halfway:,.0f}, sell by {sell_by(prices_to):%d %b}"
                   if buy else "WATCH")
         lines.append(f"{sym} | {float(r.score) * 100:.0f} | {action}")
     lines.append("")
     lines.append(f"{len(s)} READY (healthy 4-7% pullback). Score orders the list; it is not a forecast.")
     if buy:
-        lines.append("Exit on a close below the line, or sell on the date. Same amount in each.")
+        # "at the open": ICICI 5-minute bars, 2026-10-28 -- form names bought at
+        # 09:20 or any later time did 0.26-0.40 a trade worse than at the opening
+        # (pre-open) price, on all four halves. Hence the 08:45 run.
+        lines.append("Buy at the open: place orders 9:00-9:08 (pre-open). "
+                     "Exit on a close below the line, or sell on the date. Same amount in each.")
     return "\n".join(lines)
 
 

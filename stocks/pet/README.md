@@ -58,6 +58,10 @@ though it lost money there in absolute terms (−0.67%). Live, 9-28 Oct, every R
 came while the gauge was OFF, and READY lost 3.7% a trade on this exit.
 
 **What changed:**
+- Runs at 08:45 (was 10:00 and 14:00), and the action reads "BUY at the open".
+  ICICI 5-minute bars for the same 250 trades: buying at the opening
+  (pre-open) price beat buying at 09:20, 10:00, 12:00, 14:30 or the close by
+  0.26-0.40 a trade, on both ticker and time halves.
 - READY names go out with the plan: sell at the peak (a GTT), sell on a
   close below halfway, and sell 10 sessions after the close used at the latest.
 - Below 50% on the gauge, READY is sent as WATCH ONLY. The gauge is read from
