@@ -44,6 +44,26 @@ WHAT MAKES IT HONEST
      Yahoo's fabricated zero-volume holiday bars), so outcomes are not measured
      against sessions that never happened.
 
+ADDED 2026-10-28 (outside review: "the scorekeeper grades every pick" was not true)
+  - Source: which table a row came from (momentum / swings / form_signals). Before
+    this, both scanners' outcomes shared one key, so a stock on both lists on the
+    same bar was graded once and the second skipped as done. Rows written before
+    have Source NULL and stay ambiguous.
+  - form_signals is graded too (READY rows; earliest run per symbol and session).
+  - Day1 and Gauge_Pct are carried over, so a review can isolate the tested BUY
+    signals: Day1 true and Gauge_Pct >= 50.
+  - The exit PLAN each message gave is graded, from the price you could buy at:
+      momentum  MOVING rows: entry the run day's close (the message: buy after
+                14:30), exit the close on the sell-by date
+      swings    entry the price when the list went out (buy now), exit at the
+                GTT (the old closing high) or the close on the sell-by date
+      form      entry the open after the run (pre-open order), skipped if it
+                opens at/above the target or at/below the exit line; exit at the
+                GTT, the next open after a close below the exit line, or the
+                close 10 sessions on
+    Plan_* is filled once the plan has finished -- read it from the
+    Horizon_Days = 30 rows, which are written last.
+
 WHAT IT DELIBERATELY DOES NOT DO
   Model an exit. Stop_Hit and Target_Hit are recorded as facts about the price
   path -- did it touch that level, and on which session -- not as a simulated
@@ -121,7 +141,18 @@ OUTCOME_SCHEMA = [
     bigquery.SchemaField("Sessions_To_Stop", "INT64"),
     bigquery.SchemaField("Target_Hit", "BOOL"),
     bigquery.SchemaField("Sessions_To_Target", "INT64"),
+    # --- added 2026-10-28: which scanner, whether it was a tested BUY, its plan ---
+    bigquery.SchemaField("Source", "STRING"),
+    bigquery.SchemaField("Day1", "BOOL"),
+    bigquery.SchemaField("Gauge_Pct", "FLOAT64"),
+    bigquery.SchemaField("Plan_Entry", "FLOAT64"),
+    bigquery.SchemaField("Plan_Exit", "FLOAT64"),
+    bigquery.SchemaField("Plan_Exit_Date", "DATE"),
+    bigquery.SchemaField("Plan_Exit_Reason", "STRING"),
+    bigquery.SchemaField("Plan_Return_Pct", "FLOAT64"),
 ]
+
+FORM_HOLD_SESSIONS = 10      # form.py's HOLD_SESSIONS
 
 
 def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
@@ -135,17 +166,48 @@ def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
     day is kept, because that is the first moment the signal was available.
     """
     outcome_ref = f"{project}.{dataset}.{OUTCOME_TABLE_ID}"
+    is_form = table == "form_signals"
+    key_t, key_b = ("CONCAT(s.symbol, '.NS')", "s.prices_to") if is_form else ("s.Ticker", "s.Bar_Date")
     try:
-        client.get_table(outcome_ref)
+        has_source = any(f.name == "Source" for f in client.get_table(outcome_ref).schema)
+        src = "Source" if has_source else "CAST(NULL AS STRING)"
+        # Rows from before Source existed count as done for momentum/swings (they
+        # were graded then, just unlabelled) but not for form, which was never graded.
+        src_cond = f"done.src = '{table}'" if is_form else f"(done.src = '{table}' OR done.src IS NULL)"
         already = f"""
         LEFT JOIN (
-          SELECT Ticker t, Bar_Date b FROM `{outcome_ref}`
+          SELECT Ticker t, Bar_Date b, {src} src FROM `{outcome_ref}`
           WHERE Horizon_Days = {max(HORIZONS)}
-        ) done ON done.t = s.Ticker AND done.b = s.Bar_Date
+        ) done ON done.t = {key_t} AND done.b = {key_b} AND {src_cond}
         """
         where_done = "AND done.t IS NULL"
     except NotFound:
         already, where_done = "", ""
+
+    existing = {f.name for f in client.get_table(f"{project}.{dataset}.{table}").schema}
+    if is_form:
+        nulls = ", ".join(f"CAST(NULL AS {t}) AS {a}" for a, t in (
+            ("Setup_Type", "STRING"), ("Score", "FLOAT64"), ("Expected_Move", "FLOAT64"),
+            ("Avg_Volatility", "FLOAT64"), ("Tail_Drawdown_Pct", "FLOAT64"), ("Spike_Ratio", "FLOAT64"),
+            ("Max_Drawdown_1Y_Pct", "FLOAT64"), ("Traded_Value_Cr", "FLOAT64"), ("Risk_Pct", "FLOAT64"),
+            ("Stop_Loss", "FLOAT64"), ("Plan_Sell_By", "DATE"), ("Now_State", "STRING")))
+        day1 = "day1" if "day1" in existing else "CAST(NULL AS BOOL)"
+        gauge = "gauge_pct" if "gauge_pct" in existing else "CAST(NULL AS FLOAT64)"
+        sql = f"""
+        WITH ranked AS (
+          SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.symbol, s.prices_to ORDER BY s.run_timestamp) rn
+          FROM `{project}.{dataset}.{table}` s
+          {already}
+          WHERE s.status = 'READY' {where_done}
+        )
+        SELECT CONCAT(symbol, '.NS') AS Ticker, prices_to AS Bar_Date, 'READY' AS Action, {nulls},
+               price AS Signal_Price, target AS Typical_Move_Price, run_timestamp AS Run_Timestamp,
+               {day1} AS Day1, {gauge} AS Gauge_Pct, target AS Plan_Target, exit_below AS Plan_Exit_Below
+        FROM ranked WHERE rn = 1
+        ORDER BY Bar_Date
+        {f'LIMIT {limit}' if limit else ''}
+        """
+        return client.query(sql).to_dataframe()
 
     # Columns are selected against the table's ACTUAL schema, not a fixed list.
     # Spike_Ratio and Max_Drawdown_1Y_Pct were added to swings.py after this
@@ -154,7 +216,6 @@ def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
     # they simply do not exist and naming them is a hard query error. Anything
     # absent is selected as NULL instead, which is also the truthful value: the
     # scanner did not measure it when that signal was issued.
-    existing = {f.name for f in client.get_table(f"{project}.{dataset}.{table}").schema}
     wanted = [
         ("Ticker", "Ticker"), ("Bar_Date", "Bar_Date"), ("Action", "Action"),
         ("Setup_Type", "Setup_Type"), ("Score", "Score"),
@@ -180,6 +241,12 @@ def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
     # ORDER BY below). The entry is measured from it.
     select += (", Run_Timestamp" if "Run_Timestamp" in existing
                else ", CAST(NULL AS TIMESTAMP) AS Run_Timestamp")
+    # Added 2026-10-28; typed NULLs for rows written before the columns existed.
+    for col, typ, alias in (("Day1", "BOOL", "Day1"), ("Market_Breadth_Pct", "FLOAT64", "Gauge_Pct"),
+                            ("Plan_Target", "FLOAT64", "Plan_Target"), ("Plan_Sell_By", "DATE", "Plan_Sell_By"),
+                            ("Now_State", "STRING", "Now_State")):
+        select += f", {col} AS {alias}" if col in existing else f", CAST(NULL AS {typ}) AS {alias}"
+    select += ", CAST(NULL AS FLOAT64) AS Plan_Exit_Below"
     missing = [alias for src, alias in wanted if src not in existing]
     if not target_parts:
         missing.append("Typical_Move_Price/Target")
@@ -206,7 +273,7 @@ def load_pending_signals(client: bigquery.Client, project: str, dataset: str,
 
 
 def load_evaluated_keys(client: bigquery.Client, project: str,
-                        dataset: str) -> set[tuple[str, dt.date, int]]:
+                        dataset: str) -> set[tuple[Optional[str], str, dt.date, int]]:
     """Every (Ticker, Bar_Date, Horizon_Days) already stored.
 
     Needed because a signal stays PENDING until its longest horizon completes,
@@ -221,14 +288,86 @@ def load_evaluated_keys(client: bigquery.Client, project: str,
         client.get_table(ref)
     except NotFound:
         return set()
+    has_source = any(f.name == "Source" for f in client.get_table(ref).schema)
     rows = client.query(
-        f"SELECT Ticker, Bar_Date, Horizon_Days FROM `{ref}`"
+        f"SELECT {'Source' if has_source else 'CAST(NULL AS STRING) AS Source'}, "
+        f"Ticker, Bar_Date, Horizon_Days FROM `{ref}`"
     ).result()
-    return {(r["Ticker"], r["Bar_Date"], int(r["Horizon_Days"])) for r in rows}
+    return {(r["Source"], r["Ticker"], r["Bar_Date"], int(r["Horizon_Days"])) for r in rows}
+
+
+def _b(value: Any) -> Optional[bool]:
+    try:
+        return None if value is None or pd.isna(value) else bool(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def plan_outcome(row: Any, source: Optional[str], dates: list, open_: np.ndarray, high: np.ndarray,
+                 close: np.ndarray, e: int, cost_pct: float) -> dict[str, Any]:
+    """The exit plan the message gave, replayed. All None while it is unfinished or
+    when the row carries no plan (signals from before 2026-10-28)."""
+    none = {"Plan_Entry": None, "Plan_Exit": None, "Plan_Exit_Date": None,
+            "Plan_Exit_Reason": None, "Plan_Return_Pct": None}
+
+    def done(entry: float, exit_: float, k: int, reason: str) -> dict[str, Any]:
+        return {"Plan_Entry": round(float(entry), 2), "Plan_Exit": round(float(exit_), 2),
+                "Plan_Exit_Date": dates[k], "Plan_Exit_Reason": reason,
+                "Plan_Return_Pct": _pct(exit_, entry, cost_pct)}
+
+    def first_on_or_after(day: dt.date) -> Optional[int]:
+        return next((k for k, d in enumerate(dates) if d >= day), None)
+
+    tgt = _f(getattr(row, "Plan_Target", None))
+    sb = getattr(row, "Plan_Sell_By", None)
+    sell_by = pd.Timestamp(sb).date() if sb is not None and pd.notna(sb) else None
+    bar = row.Bar_Date if isinstance(row.Bar_Date, dt.date) else pd.Timestamp(row.Bar_Date).date()
+
+    if source == "form_signals":
+        line = _f(getattr(row, "Plan_Exit_Below", None))
+        if tgt is None or line is None:
+            return none
+        entry = open_[e]
+        if entry >= tgt or entry <= line:              # form's gap rule: skip
+            return {**none, "Plan_Entry": round(float(entry), 2),
+                    "Plan_Exit_Reason": "skipped: opened outside the plan"}
+        k_end = first_on_or_after(np.busday_offset(np.datetime64(bar, "D"), FORM_HOLD_SESSIONS,
+                                                   roll="forward").astype(dt.date))
+        if k_end is None:
+            return none
+        for k in range(e, k_end + 1):
+            if k > e and open_[k] >= tgt:
+                return done(entry, open_[k], k, "target")
+            if high[k] >= tgt:
+                return done(entry, tgt, k, "target")
+            if close[k] < line:
+                return done(entry, open_[k + 1], k + 1, "exit line") if k + 1 < len(dates) else none
+        return done(entry, close[k_end], k_end, "sell-by date")
+
+    if sell_by is None:
+        return none
+    k_end = first_on_or_after(sell_by)
+    if k_end is None or k_end < e:
+        return none
+    if source == "momentum":
+        if getattr(row, "Now_State", None) != "MOVING":
+            return none
+        return done(close[e - 1], close[k_end], k_end, "sell-by date")   # bought after 14:30 on the run day
+    if source == "swings":
+        entry = _f(getattr(row, "Signal_Price", None))                    # bought when the list went out
+        if not entry or tgt is None:
+            return none
+        for k in range(e, k_end + 1):
+            if open_[k] >= tgt:
+                return done(entry, open_[k], k, "target")
+            if high[k] >= tgt:
+                return done(entry, tgt, k, "target")
+        return done(entry, close[k_end], k_end, "sell-by date")
+    return none
 
 
 def evaluate_signal(row: Any, frame: pd.DataFrame,
-                    cost_pct: float) -> list[dict[str, Any]]:
+                    cost_pct: float, source: Optional[str] = None) -> list[dict[str, Any]]:
     """Replay one signal against what the stock actually did.
 
     Returns one dict per horizon that has enough completed sessions. A horizon
@@ -270,6 +409,8 @@ def evaluate_signal(row: Any, frame: pd.DataFrame,
     entry_close = close[e - 1]
     if not np.isfinite(entry_close) or entry_close <= 0:
         return []
+
+    plan = plan_outcome(row, source, dates, open_, high, close, e, cost_pct)
 
     stop = float(row.Stop_Loss) if pd.notna(row.Stop_Loss) else np.nan
     target = float(row.Typical_Move_Price) if pd.notna(row.Typical_Move_Price) else np.nan
@@ -316,6 +457,10 @@ def evaluate_signal(row: Any, frame: pd.DataFrame,
             "Sessions_To_Stop": int(stop_idx[0]) + 1 if len(stop_idx) else None,
             "Target_Hit": bool(len(tgt_idx)),
             "Sessions_To_Target": int(tgt_idx[0]) + 1 if len(tgt_idx) else None,
+            "Source": source,
+            "Day1": _b(getattr(row, "Day1", None)),
+            "Gauge_Pct": _f(getattr(row, "Gauge_Pct", None)),
+            **plan,
         })
     return out
 
@@ -363,12 +508,14 @@ def backfill(project: str, dataset: str, table: str, config: S.ScannerConfig,
         if frame is None:
             missing += 1
             continue
-        produced = evaluate_signal(row, frame, config.round_trip_cost_pct)
+        produced = evaluate_signal(row, frame, config.round_trip_cost_pct, table)
         if not produced:
             not_ready += 1
             continue
-        fresh = [r for r in produced
-                 if (r["Ticker"], r["Bar_Date"], r["Horizon_Days"]) not in done]
+        def is_done(r: dict[str, Any]) -> bool:
+            k = (r["Ticker"], r["Bar_Date"], r["Horizon_Days"])
+            return (table, *k) in done or (table != "form_signals" and (None, *k) in done)
+        fresh = [r for r in produced if not is_done(r)]
         duplicate += len(produced) - len(fresh)
         rows.extend(fresh)
 
@@ -390,6 +537,8 @@ def backfill(project: str, dataset: str, table: str, config: S.ScannerConfig,
     out = pd.DataFrame(rows)
     out["Bar_Date"] = pd.to_datetime(out["Bar_Date"]).dt.date
     out["Entry_Date"] = pd.to_datetime(out["Entry_Date"]).dt.date
+    out["Plan_Exit_Date"] = out["Plan_Exit_Date"].map(lambda v: v if v is None or pd.isna(v) else pd.Timestamp(v).date())
+    out["Day1"] = out["Day1"].astype("boolean")
     out["Run_Timestamp"] = pd.to_datetime(out["Run_Timestamp"], utc=True)
     ref = f"{project}.{dataset}.{OUTCOME_TABLE_ID}"
     try:
@@ -498,7 +647,7 @@ def report(project: str, dataset: str, horizon: int = 15) -> None:
 # since the 2026-09-23 split, and S.DEFAULT_BQ_TABLE_ID is now only the swing
 # one. Grading just that would leave momentum -- the scanner with the evidence
 # behind it -- completely unmeasured.
-GRADED_TABLES = ("swings", "momentum")
+GRADED_TABLES = ("swings", "momentum", "form_signals")   # form added 2026-10-28
 
 
 def main(request: Any = None) -> Optional[tuple[str, int]]:

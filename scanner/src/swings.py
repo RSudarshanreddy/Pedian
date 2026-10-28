@@ -1749,6 +1749,7 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Plan_Hold_Sessions", "INT64"),
     bigquery.SchemaField("Plan_Sell_By", "DATE"),
     bigquery.SchemaField("Market_Breadth_Pct", "FLOAT64"),
+    bigquery.SchemaField("Day1", "BOOL"),        # a new entry today (day1_names)
 ]
 
 def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
@@ -1806,6 +1807,8 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
     output = df.copy()
     output["Bar_Date"] = pd.to_datetime(output["Bar_Date"]).dt.date
     output["Run_Date"] = pd.to_datetime(output["Run_Date"]).dt.date
+    if "Day1" in output.columns:
+        output["Day1"] = output["Day1"].astype("boolean")
     if "Plan_Sell_By" in output.columns:
         output["Plan_Sell_By"] = output["Plan_Sell_By"].map(
             lambda v: dt.date.fromisoformat(v) if isinstance(v, str) and v else None)
@@ -1987,6 +1990,61 @@ def trigger_dataform_run(
 
 
 LIST_SHOWN = 20     # names per Telegram list (the owner: "top 20"); every candidate is still stored
+FIRE_COOLDOWN_SESSIONS = 10   # the tests' no-re-entry window, in run days
+
+
+# day1_names / action_for / new_first are copies of momentum.py's. They are not
+# imported from it because this file must import on its own: the forward-test
+# image ships swings.py without momentum.py.
+def day1_names(table: str, names: list[str], run_date: dt.date, project_id: str,
+               dataset_id: str = "data_options") -> set[str]:
+    """Which of today's names are NEW entries by the tests' own rule: the first
+    day a stock qualifies, and not within FIRE_COOLDOWN_SESSIONS of its last
+    entry, replayed over this table's own run days. Raises if the history
+    cannot be read."""
+    ref = f"{project_id}.{dataset_id}.{table}"
+    rows = list(bigquery.Client(project=project_id).query(f"""
+        WITH cal AS (SELECT DISTINCT Run_Date AS d FROM `{ref}`
+                     WHERE Run_Date < @today ORDER BY d DESC LIMIT 40)
+        SELECT 'cal' AS k, '' AS Ticker, d FROM cal
+        UNION DISTINCT
+        SELECT 'on', Ticker, Run_Date FROM `{ref}` WHERE Run_Date IN (SELECT d FROM cal)""",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("today", "DATE", run_date)])).result())
+    days = sorted(r.d for r in rows if r.k == "cal") + [run_date]
+    seen = {(r.Ticker, r.d) for r in rows if r.k == "on"}
+    new: set[str] = set()
+    for name in names:
+        prev, last = False, -10 ** 6
+        for i, d in enumerate(days):
+            on = d == run_date or (name, d) in seen
+            if on and not prev and i - last > FIRE_COOLDOWN_SESSIONS:
+                last = i
+            prev = on
+        if last == len(days) - 1:
+            new.add(name)
+    return new
+
+
+def _is_new(v: Any) -> bool:
+    return v is True or (isinstance(v, (bool, np.bool_)) and bool(v))
+
+
+def action_for(buy: bool, day1: Any, plan: str) -> str:
+    """A BUY is only a tested BUY on a name's first day; anything else is WATCH."""
+    if not buy:
+        return "WATCH, new today" if _is_new(day1) else "WATCH"
+    if day1 is None or (isinstance(day1, float) and np.isnan(day1)):
+        return "WATCH (day-1 history unavailable)"
+    return plan if _is_new(day1) else "WATCH, not new"
+
+
+def new_first(rows: pd.DataFrame) -> pd.DataFrame:
+    """New names first (by Score), then the rest; a new name is never cut off."""
+    flag = rows["Day1"].map(_is_new) if "Day1" in rows else pd.Series(False, index=rows.index)
+    new = rows[flag].sort_values("Score", ascending=False)
+    rest = rows[~flag].sort_values("Score", ascending=False)
+    return pd.concat([new, rest.head(max(0, LIST_SHOWN - len(new)))])
 TELEGRAM_MAX = 4096     # Bot API limit for one text message
 
 
@@ -2031,20 +2089,20 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # one line per stock -- Stock | Score | Action. On a BUY day the action
     # carries the plan (GTT at the old closing high, sell-by date).
     lines = [f"SWINGS  {now_ist:%d %b %H:%M} IST -- prices {when}{mixed}", market, ""]
-    ranked = candidates.sort_values("Score", ascending=False)
-    shown = ranked.head(LIST_SHOWN)
+    shown = new_first(candidates)
+    n_new = int(shown["Day1"].map(_is_new).sum()) if "Day1" in shown else 0
     lines.append("Stock | Score | Action")
     for _, r in shown.iterrows():
         name = str(r["Ticker"]).replace(".NS", "")
-        action = "WATCH"
-        if buy:
-            action = f"BUY now, GTT {r['Plan_Target']:,.0f}"
-            if pd.notna(r.get("Plan_Sell_By")):
-                action += f", sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
-        lines.append(f"{name} | {r['Score']:.0f} | {action}")
+        plan = f"BUY now, GTT {r['Plan_Target']:,.0f}"
+        if pd.notna(r.get("Plan_Sell_By")):
+            plan += f", sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
+        lines.append(f"{name} | {r['Score']:.0f} | {action_for(buy, r.get('Day1'), plan)}")
     lines.append("")
-    lines.append(f"{len(shown)} of {len(ranked)} shown. Score orders the list; it is not a forecast.")
+    lines.append(f"{len(shown)} of {len(candidates)} shown, {n_new} new today. "
+                 f"Score orders the list; it is not a forecast.")
     if buy:
+        lines.append("Only NEW names are tested buys -- every test bought on a stock's first day.")
         # "now": ICICI 5-minute bars, 2026-10-28 -- swing names bought at 12:00,
         # 14:30 or the close did 0.4-0.5 a trade worse than at the open, on all
         # four halves; 10:00 was -0.2 (mixed). Buy as soon as the list arrives.
@@ -2281,6 +2339,17 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     run_date = now_utc.date().isoformat()
     run_timestamp = now_utc.isoformat()
     candidates, failures, total_quality = scan_tickers(tickers, config, run_date, run_timestamp)
+    # Day 1: which names are new entries by the tests' rule (see day1_names).
+    # Unreadable history leaves Day1 empty, and then no name is marked BUY.
+    if not candidates.empty:
+        candidates["Day1"] = None
+        try:
+            new = day1_names(table_id, candidates["Ticker"].tolist(), dt.date.fromisoformat(run_date),
+                             _resolve_project_id(project_id), dataset_id)
+            candidates["Day1"] = candidates["Ticker"].isin(new)
+            print(f"Day 1: {len(new)} of {len(candidates)} swing names are new entries today")
+        except Exception as exc:
+            print(f"Day-1 history unavailable ({exc}) -- no BUY marks this run")
 
     if failures:
         print(f"\n{len(failures)} tickers failed or had no usable data.")

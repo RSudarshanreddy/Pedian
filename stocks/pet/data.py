@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import pickle
+import time
 import zipfile
 from pathlib import Path
 
@@ -53,12 +54,21 @@ def download(symbols: list[str], period: str = "4y", chunk: int = 100,
     return bars
 
 
-def bhavcopy(day: dt.date, session: requests.Session) -> pd.DataFrame | None:
+def bhavcopy(day: dt.date, session: requests.Session, attempts: int = 3) -> pd.DataFrame | None:
     """NSE's end-of-day file for one session, or None when there is none (a holiday, or not
-    published yet -- NSE puts it out in the evening)."""
-    r = session.get(BHAVCOPY_URL.format(day), timeout=30)
-    if r.status_code == 404:
-        return None
+    published yet -- NSE puts it out in the evening).
+
+    Retried: NSE refuses cloud servers intermittently (403), and one refused file used to fail
+    the whole ~30-file fetch and drop form onto Yahoo, which can be a session behind -- the
+    28 Oct 10:00 run read prices to 26 Oct that way."""
+    for attempt in range(attempts):
+        r = session.get(BHAVCOPY_URL.format(day), timeout=30)
+        if r.status_code == 404:
+            return None
+        if r.ok:
+            break
+        if attempt < attempts - 1:
+            time.sleep(5 * (attempt + 1))
     r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         df = pd.read_csv(z.open(z.namelist()[0]))

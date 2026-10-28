@@ -58,6 +58,13 @@ though it lost money there in absolute terms (−0.67%). Live, 9-28 Oct, every R
 came while the gauge was OFF, and READY lost 3.7% a trade on this exit.
 
 **What changed:**
+- BUY only on a name's FIRST READY day (the test's entry rule: first day READY,
+  no re-entry within 10 sessions), replayed from form_signals; older names read
+  "WATCH, not new". Before this, every READY name said BUY every day.
+- WATCH ONLY when the stored gauge is more than 4 days old, or when the prices
+  are late (they end before the session momentum.py last traded on). On 28 Oct
+  NSE refused the cloud, Yahoo had prices only to 26 Oct, and the 10:00 list was
+  built on two-day-old prices. Each NSE file is now retried before falling back.
 - Runs at 08:45 (was 10:00 and 14:00), and the action reads "BUY at the open".
   ICICI 5-minute bars for the same 250 trades: buying at the opening
   (pre-open) price beat buying at 09:20, 10:00, 12:00, 14:30 or the close by
