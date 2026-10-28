@@ -2160,7 +2160,7 @@ def parse_args() -> argparse.Namespace:
 # =========================================================
 # MAIN
 # =========================================================
-def main(request: Any = None) -> Optional[tuple[str, int]]:
+def main(request: Any = None, collect: Optional[dict] = None) -> Optional[tuple[str, int]]:
     """Run as either a CLI program or an HTTP Cloud Function.
     
     Functions Framework calls the configured entry point with the Flask
@@ -2273,6 +2273,10 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     run_date = now_utc.date().isoformat()
     run_timestamp = now_utc.isoformat()
     candidates, failures, total_quality = scan_tickers(tickers, config, run_date, run_timestamp)
+    # momentum.py's main() passes `collect` to send ONE watchlist for both
+    # scanners; this scan then sends no message of its own.
+    if collect is not None:
+        collect["swings"] = candidates
 
     if failures:
         print(f"\n{len(failures)} tickers failed or had no usable data.")
@@ -2343,7 +2347,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         print(f"WARNING: {total_quality} candidates found but only {len(candidates)} stored "
               f"(top_n={config.top_n}). Raise --top-n or history is being lost.")
 
-    if not no_telegram:
+    if not no_telegram and collect is None:
         try:
             bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
             chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
