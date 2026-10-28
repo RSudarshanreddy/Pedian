@@ -2016,7 +2016,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                if "Market_Breadth_Pct" in candidates else float("nan"))
     avg = f"{config.market_ma_sessions}-day average"
     if not np.isfinite(breadth):
-        market, buy = "Market gauge unavailable this run -- judge the market yourself.", True
+        # Fails CLOSED, like form.py: the gauge is the layer that protects the
+        # owner, so "unknown" must never read as a buy.
+        market, buy = "Market gauge unavailable this run -- WATCH ONLY until it is.", False
     elif breadth >= config.market_breadth_min_pct:
         market, buy = f"Market: {breadth:.0f}% of stocks above their {avg} -- WITH movers.", True
     else:

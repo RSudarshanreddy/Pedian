@@ -35,8 +35,13 @@ of one market.
   directions, net of costs. It does not threshold that into a win rate.
 - Since 2026-10-28 the message carries an exit plan per group (see below). The
   scan itself still does not model one.
-- Ranked by Expected_Move. Score is stored but does not predict (-0.065 vs
-  forward return); nor does Action (BUY +3.54% vs WATCH +4.42% at 30 sessions).
+- Ranked by Score since 2026-10-27 (the owner's decision; it was Expected_Move).
+  Score has NOT been shown to predict: -0.065 against forward return over 991
+  stored signals, and +1.7 points over the rest of the pool as a top-20 ranker.
+  The order is a reading convenience, not a forecast. The tested edge (see
+  MARKET GAUGE AND EXIT PLANS) is for the whole MOVING list bought in equal
+  amounts, not for its top names. Action does not predict either (BUY +3.54%
+  vs WATCH +4.42% at 30 sessions).
 - Every run's candidates are written to BigQuery, keyed on Run_Timestamp.
 
 WHAT THE MESSAGE SHOWS (since 2026-10-27): two groups drawn from EVERY stock that
@@ -2002,7 +2007,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                if "Market_Breadth_Pct" in candidates else float("nan"))
     avg = f"{config.market_ma_sessions}-day average"
     if not np.isfinite(breadth):
-        market, buy = "Market gauge unavailable this run -- judge the market yourself.", True
+        # Fails CLOSED, like form.py: the gauge is the layer that protects the
+        # owner, so "unknown" must never read as a buy.
+        market, buy = "Market gauge unavailable this run -- WATCH ONLY until it is.", False
     elif breadth >= config.market_breadth_min_pct:
         market, buy = f"Market: {breadth:.0f}% of stocks above their {avg} -- WITH movers.", True
     else:
