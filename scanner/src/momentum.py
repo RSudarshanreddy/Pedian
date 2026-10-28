@@ -53,6 +53,9 @@ showed AEGISLOG at 779 (4% of its run done), ANTELOPUS at 791 (17%) and SHILPAME
 Returns over 10 sessions: +1.16% against the top 20's +1.28% (rest of pool +1.09%);
 over 30 sessions the top 20 led, +5.46% against +3.57%.
 
+SINCE 2026-10-28 THE MESSAGE SENDS MOVING ONLY -- momentum picks momentum and
+swings.py picks swings. SWING is still labelled and stored here for comparison.
+
 MARKET GAUGE AND EXIT PLANS (since 2026-10-28). The gates measure how much a stock
 moves, not which way, so in a falling market they hand over the stocks that fall
 hardest: October's picks lost 7.2% in 10 sessions while the Nifty 500 lost 2.0% in
@@ -298,7 +301,7 @@ class ScannerConfig:
     #     top 30  82.8%    r30  +6.22%   54%
     # 20 is where coverage plateaus, and ~20 is also the most that can be read
     # by eye in one pass without becoming a second analysis.
-    display_top_n: int = 20
+    display_top_n: int = 50
 
     # Quality FLOOR for the display only -- min_typical_move_pct (14) still
     # governs what is scanned and stored, so the forward test keeps seeing the
@@ -1955,16 +1958,17 @@ TELEGRAM_MAX = 4096          # Bot API limit for one text message
 
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                            config: ScannerConfig) -> Optional[str]:
-    """The market gauge, then SWING and MOVING names with their exit plans.
+    """The market gauge, then the MOVING names with their exit plan.
 
     Names come from every stock that passed the gates. Returns None only when
     the scan found nothing at all.
 
-    SWING comes first because it is the stronger group (67% of tested trades won,
-    against 51% for MOVING). Within a group the order is Score, highest first (the
-    owner's decision, 2026-10-27) -- NOT Expected_Move, which grows most confident
-    after a stock has already run. See the note at the sort in scan_tickers for
-    what Score does and does not contain.
+    MOVING only, since 2026-10-28: momentum picks momentum, swings.py picks
+    swings (the owner's split). The SWING label is still computed and stored
+    here, so the two can be compared later, but it is not sent. Order is Score,
+    highest first (the owner's decision, 2026-10-27) -- NOT Expected_Move, which
+    grows most confident after a stock has already run. See the note at the sort
+    in scan_tickers for what Score does and does not contain.
 
     Below market_breadth_min_pct the names are still listed, as WATCH ONLY and
     without a plan: the owner sees which stocks hold up while the market is
@@ -1996,39 +2000,13 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                        f"No new buys. Lists are WATCH ONLY."), False
     lines = [f"Momentum {now_ist:%Y-%m-%d %H:%M} IST", f"Prices: {when}{mixed}", market, ""]
 
-    def group(state: str) -> pd.DataFrame:
-        g = candidates[candidates["Now_State"] == state].sort_values("Score", ascending=False).copy()
-        g["name"] = g["Ticker"].astype(str).str.replace(".NS", "", regex=False)
-        return g
-
-    def sell_by(g: pd.DataFrame) -> str:
-        days = pd.to_datetime(g["Plan_Sell_By"].dropna())
-        return days.max().strftime("%d %b") if len(days) else "?"
-
-    swing = group("SWING")
-    if buy and not swing.empty:
-        lines.append(f"SWING -- buy the dip. GTT sell at the price shown, "
-                     f"or sell on {sell_by(swing)}")
-    else:
-        lines.append(f"SWING{'' if buy else ' (watch only)'} -- dip from a high made in the "
-                     f"last {config.swing_high_within} sessions")
-    if swing.empty:
-        lines.append("  none today")
-    else:
-        width = int(swing["name"].str.len().max())
-        for _, r in swing.head(MAX_NAMES_PER_GROUP).iterrows():
-            level = f"sell at {r['Plan_Target']:,.0f}" if buy else f"closing high {r['High20']:,.0f}"
-            lines.append(f"  {r['name']:<{width}}  {r['Pct_Off_High20']:>4.0f}%  {level}")
-        if len(swing) > MAX_NAMES_PER_GROUP:
-            lines.append(f"  ... +{len(swing) - MAX_NAMES_PER_GROUP} more (all stored in BigQuery)")
-
-    moving = group("MOVING")
-    lines.append("")
-    if buy and not moving.empty:
-        lines.append(f"MOVING -- hold, no target. Sell on {sell_by(moving)}")
+    moving = candidates[candidates["Now_State"] == "MOVING"].sort_values("Score", ascending=False)
+    days = pd.to_datetime(moving["Plan_Sell_By"].dropna())
+    if buy and len(days):
+        lines.append(f"MOVING -- buy. Hold, no target. Sell on {days.max():%d %b}")
     else:
         lines.append(f"MOVING{'' if buy else ' (watch only)'} -- at its 20-session high, rising")
-    names = moving["name"].tolist()
+    names = moving["Ticker"].astype(str).str.replace(".NS", "", regex=False).tolist()
     if not names:
         lines.append("  none today")
     for k in range(0, min(len(names), MAX_NAMES_PER_GROUP), 6):
@@ -2095,8 +2073,8 @@ def send_telegram_to_all(text: str, bot_token: str, chat_ids: list[str]) -> list
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Volatility momentum scanner - qualifies stocks that move, then "
-                    "reports which are MOVING (at a fresh high) and which are in a SWING "
-                    "(a dip from a recent high). It does not model an exit."
+                    "sends the ones MOVING (at a fresh high, rising) with a 20-session "
+                    "sell-by date, gated by a market gauge. Swings are swings.py's job."
     )
     p.add_argument("--tickers", nargs="+", default=None)
     p.add_argument("--symbols-source", default=NSE_EQUITY_LIST_URL)
@@ -2137,7 +2115,7 @@ def parse_args() -> argparse.Namespace:
                                     "does not change what is scanned or stored")
     p.add_argument("--display-top-n", default=ScannerConfig.display_top_n, type=int,
                     help="How many rows to print in the CONSOLE table. Telegram shows the "
-                         "MOVING and SWING groups instead; storage is unaffected")
+                         "MOVING group instead; storage is unaffected")
     p.add_argument("--output", default="", help="CSV output path")
     p.add_argument("--no-bq", action="store_true", help="Skip writing results to BigQuery")
     p.add_argument("--no-dataform-trigger", action="store_true",
@@ -2311,7 +2289,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
     print("Age = consecutive days this Setup has held. Action/Setup describe today's price")
     print("structure; they do NOT order the list and BUY has not been shown to beat WATCH.")
     print("MovePx and RR come from Expected_Move -- a historical BEST gain, not a tested trade")
-    print("outcome. Telegram shows the MOVING and SWING groups, not this table.")
+    print("outcome. Telegram shows the MOVING group, not this table.")
     print("-" * 100)
     header = (f"{'Ticker':<13} {'Now':<7} {'Action':<7} {'Setup':<16} {'Age':>4} {'Score':>6} {'Vol%':>6} "
               f"{'Upside%':>9} {'Stabil':>7} {'Move%':>8} {'TailDD':>8} {'RR':>5} "

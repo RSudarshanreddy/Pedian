@@ -42,7 +42,23 @@ for anything that has to work.
 It fires on roughly every other session (75 of 164 dates), by design -- a dip
 that deep is not an everyday event.
 
-- Does NOT model an exit. Exits are a human decision.
+MARKET GAUGE AND EXIT PLAN (2026-10-28). The two scanners were split the owner's
+way: momentum.py sends MOVING names only, this file sends swings. Before choosing
+which swing rule this file keeps, this rule was tested head to head against
+momentum.py's SWING label (8-15% below a 20-session high made within 10
+sessions), rules fixed first: entry the day a stock first qualifies, next open,
+market gauge ON (see momentum.py), Dec-Sep:
+    this rule, GTT at the old closing high else sell after 20 sessions
+        144 trades  +4.72% a trade  63% won  +2.96 per 10 sessions held
+    momentum's SWING label, same plan
+        256 trades  +3.64% a trade  65% won  +2.62 per 10 sessions held
+Both positive on both ticker halves and both time halves; this rule earned more
+per session held, which was the pre-set criterion, so it stays. They share only
+14 of 445 trades. The same test chose the plan: sell at the old high or after 20
+sessions beat holding 10/20/30 and the +10%/+15% targets on return per session,
+and no price stop is used (every stop tested earned less).
+- The message lists every candidate with its sell-at price and sell-by date,
+  or WATCH ONLY when the market gauge is below 50%.
 - Ranked by Bounce_Median. Action/Setup are recorded but do not order the list.
 - Written to BigQuery table `swings`, keyed on Run_Timestamp.
 """
@@ -291,6 +307,16 @@ class ScannerConfig:
     #
     # Raise it with --display-top-n for a session when you want to read wider.
     display_top_n: int = 3
+
+    # --- Market gauge and exit plan (2026-10-28) ---
+    # Same gauge as momentum.py: the share of every stock in the price/liquidity
+    # range above its own 50-day average. Below 50% the message is WATCH ONLY.
+    # See momentum.py's module docstring for the test behind it.
+    market_ma_sessions: int = 50
+    market_breadth_min_pct: float = 50.0
+    # Exit plan: GTT sell at the old 20-session closing high, else sell after
+    # this many sessions. No price stop -- every stop tested earned less.
+    swing_hold_sessions: int = 20
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -502,8 +528,12 @@ def market_session_calendar(yf: Any, tickers: list[str],
     """
     if not tickers:
         return None
-    stride = max(1, len(tickers) // SESSION_SAMPLE_SIZE)
-    sample = tickers[::stride][:SESSION_SAMPLE_SIZE]
+    # Evenly spaced over the whole list. The old integer stride sampled only
+    # the first 150 tickers for lists of 151-299, and skipped the tail of
+    # longer ones -- a bias whenever the NSE list is ordered.
+    idx = np.unique(np.linspace(0, len(tickers) - 1,
+                                min(SESSION_SAMPLE_SIZE, len(tickers))).astype(int))
+    sample = [tickers[i] for i in idx]
     try:
         probe = download_batch(yf, sample, ScannerConfig(period="3mo"))
     except Exception as exc:
@@ -681,8 +711,12 @@ def add_indicators(data: pd.DataFrame, config: ScannerConfig,
     # Liquidity deliberately still uses the inclusive average -- it is a
     # "is this tradeable" measure, not a deviation-from-normal one, and
     # including today is the more current answer.
+    #
+    # The average of each day's Close x Volume. Fixed 2026-10-28 (momentum.py the
+    # day before): this was mean(Close) x mean(Volume), which is not the same
+    # number whenever price and volume move together.
     data["avg_traded_value20_cr"] = (
-        data["Close"].rolling(20).mean() * data["Volume"].rolling(20).mean()
+        (data["Close"] * data["Volume"]).rolling(20).mean()
     ) / 10_000_000
 
     # The swing rule's two price conditions, both trailing.
@@ -1256,6 +1290,28 @@ def calculate_score(
 # =========================================================
 # CANDIDATE BUILDER
 # =========================================================
+def market_gauge_vote(data: pd.DataFrame, config: ScannerConfig) -> Optional[bool]:
+    """This stock's vote in the market gauge: is it above its own 50-day average?
+
+    None when the stock is outside the scanner's price / liquidity range, so it
+    does not count at all. Same definition as momentum.py's.
+    """
+    close = data["Close"]
+    if len(close) < config.market_ma_sessions:
+        return None
+    last = float(close.iloc[-1])
+    traded_cr = float((close * data["Volume"]).tail(20).mean()) / 10_000_000
+    if not (config.min_price < last < config.max_price) or not traded_cr >= config.min_avg_traded_value_cr:
+        return None
+    return last > float(close.tail(config.market_ma_sessions).mean())
+
+
+def sell_by_date(bar_date: dt.date, sessions: int) -> dt.date:
+    """bar_date plus `sessions` weekdays. NSE holidays are not known here, so on a
+    holiday-heavy stretch this lands a session or two EARLY, never late."""
+    return np.busday_offset(np.datetime64(bar_date, "D"), sessions, roll="forward").astype(dt.date)
+
+
 def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_date: str, run_timestamp: str) -> Optional[dict[str, Any]]:
     if len(data) < config.min_days:
         return None
@@ -1380,9 +1436,10 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
     if score < config.min_score:
         return None
 
+    bar_date = pd.Timestamp(data.index[-1]).date()
     return {
         "Ticker": ticker,
-        "Bar_Date": pd.Timestamp(data.index[-1]).date().isoformat(),
+        "Bar_Date": bar_date.isoformat(),
         "Run_Date": run_date,
         "Run_Timestamp": run_timestamp,
         "Action": action,
@@ -1425,6 +1482,11 @@ def build_candidate(ticker: str, data: pd.DataFrame, config: ScannerConfig, run_
         "RR_Ratio": risk["rr_ratio"],
         "ATR": risk["atr"],
         "Move_Horizon_Days": config.move_horizon_days,
+        # The exit plan the message prints: GTT at the old closing high, else
+        # sell on Plan_Sell_By. No stop -- see swing_hold_sessions.
+        "Plan_Target": round(float(latest["high_20_close"]), 2),
+        "Plan_Hold_Sessions": config.swing_hold_sessions,
+        "Plan_Sell_By": sell_by_date(bar_date, config.swing_hold_sessions).isoformat(),
     }
 # =========================================================
 # SCANNER
@@ -1460,6 +1522,8 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
     batches = chunks(tickers, config.chunk_size)
     total = len(batches)
     attempted = 0
+    empty_frames = 0
+    gauge_votes = gauge_up = 0      # the market gauge, over every current ticker
 
     calendar = (
         market_session_calendar(yf, tickers, config) if config.require_current_bar else None
@@ -1498,13 +1562,19 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
             for ticker in batch:
                 attempted += 1
                 try:
+                    raw_frame = get_ticker_frame(batch_data, ticker)
+                    if raw_frame.empty:
+                        empty_frames += 1
                     frame, bar_state = align_to_session(
-                        get_ticker_frame(batch_data, ticker), calendar,
-                        config.contiguous_sessions_required,
+                        raw_frame, calendar, config.contiguous_sessions_required,
                     )
                     bar_state_counts[bar_state] += 1
                     if bar_state != "current":
                         continue
+                    vote = market_gauge_vote(frame, config)
+                    if vote is not None:
+                        gauge_votes += 1
+                        gauge_up += vote
                     candidate = scan_ticker_data(ticker, frame, config, run_date,
                                                  run_timestamp, bar_is_partial)
                     if candidate:
@@ -1581,10 +1651,27 @@ def scan_tickers(tickers: list[str], config: ScannerConfig, run_date: str, run_t
                   f"({config.min_session_coverage:.0%}) before trusting this run.")
         LOGGER.warning("%s", message)
 
+    # A Yahoo outage returns empty frames rather than errors, and used to end
+    # in "No candidates matched" -- an outage dressed up as a quiet market.
+    # Past half the universe it is an outage.
+    no_data = len(batch_failures) + empty_frames
+    if tickers and no_data / len(tickers) > 0.5:
+        raise RuntimeError(
+            f"{no_data}/{len(tickers)} tickers came back with no prices "
+            f"({len(batch_failures)} in failed batches, {empty_frames} empty). "
+            f"That is a data outage, not an empty market -- nothing was scanned."
+        )
+
+    breadth = round(gauge_up / gauge_votes * 100, 1) if gauge_votes else float("nan")
+    print(f"Market gauge: {gauge_up}/{gauge_votes} stocks in range above their "
+          f"{config.market_ma_sessions}-day average = {breadth}% "
+          f"({'WITH' if breadth >= config.market_breadth_min_pct else 'AGAINST'} movers)")
     if not results:
         return pd.DataFrame(), failures, 0
 
     df = pd.DataFrame(results)
+    # The same value on every row of the run: it describes the market, not the stock.
+    df["Market_Breadth_Pct"] = breadth
     # Ranked by Bounce_Median -- this stock's own history of recovering from a
     # dip -- NOT by Expected_Move, Score or Action.
     #
@@ -1653,6 +1740,10 @@ BQ_SCHEMA = [
     bigquery.SchemaField("RR_Ratio", "FLOAT64"),
     bigquery.SchemaField("ATR", "FLOAT64"),
     bigquery.SchemaField("Move_Horizon_Days", "INT64"),
+    bigquery.SchemaField("Plan_Target", "FLOAT64"),
+    bigquery.SchemaField("Plan_Hold_Sessions", "INT64"),
+    bigquery.SchemaField("Plan_Sell_By", "DATE"),
+    bigquery.SchemaField("Market_Breadth_Pct", "FLOAT64"),
 ]
 
 def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
@@ -1710,6 +1801,9 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
     output = df.copy()
     output["Bar_Date"] = pd.to_datetime(output["Bar_Date"]).dt.date
     output["Run_Date"] = pd.to_datetime(output["Run_Date"]).dt.date
+    if "Plan_Sell_By" in output.columns:
+        output["Plan_Sell_By"] = output["Plan_Sell_By"].map(
+            lambda v: dt.date.fromisoformat(v) if isinstance(v, str) and v else None)
     if "Run_Timestamp" in output.columns:
         output["Run_Timestamp"] = pd.to_datetime(output["Run_Timestamp"], utc=True)
     output = output.rename(columns={source: target for source, target in field_map.items() if source != target})
@@ -1887,45 +1981,62 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
+MAX_NAMES = 40          # in the message; the rest are stored, not lost
+TELEGRAM_MAX = 4096     # Bot API limit for one text message
+
+
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
-                           limit: int = 10, horizon_days: int = 30) -> Optional[str]:
-    """Name and Bounce% for the top `limit` rows, in the order the console prints.
+                           config: ScannerConfig) -> Optional[str]:
+    """The market gauge, then every swing candidate with its exit plan.
 
-    Returns None only when the scan found nothing at all.
+    Returns None only when the scan found nothing at all. Every stock that
+    passed is listed (up to MAX_NAMES), in the order scan_tickers sorted them.
 
-    SHOWS Bounce%, NOT Action, to match momentum.py -- one format across both
-    messages so the phone never asks which scanner it is reading.
-
-    Action is useless HERE for a different reason than in momentum.py. There it
-    was misleading, with 91% of top picks reading WATCH while returning +3.71%
-    against BUY's +1.36%. Here it is uninformative: build_candidate overrides
-    Action to BUY on every row, because passing the dip and trend conditions IS
-    the entry. Every line read the same word, so the column carried nothing.
-
-    Bounce_Median is this file's ranker -- the stock's own median recovery from
-    a dip -- so showing it makes the column and the ordering agree, and it
-    separates the names: a 41% recoverer and an 11% one are different
-    propositions even though both cleared the same gate. Measured, ranking the
-    dip cohort by it returned +10.06% against +9.06% for ranking the same
-    cohort by Expected_Move and +8.76% for ranking by deepest dip.
-
-    Action and Setup_Type are still computed and stored in BigQuery.
+    Below market_breadth_min_pct the names are listed as WATCH ONLY, without a
+    plan: the owner sees which dips exist while the market is against movers,
+    but nothing reads as a buy. Same gauge and wording as momentum.py.
 
     Plain text, no parse_mode -- see send_telegram_notification.
     """
     if candidates.empty:
         return None
+    now_ist = dt.datetime.now(dt.timezone.utc) + IST_OFFSET
+    bars = pd.to_datetime(candidates["Bar_Date"]).dt.date
+    bar = bars.max()
+    when = (f"{bar} (session in progress)"
+            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar}")
+    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min()})"
 
-    rows = candidates.head(limit)
-    run_time_ist = (dt.datetime.now(dt.timezone.utc) + IST_OFFSET).strftime("%Y-%m-%d %H:%M IST")
-    width = max((len(str(t).replace(".NS", "")) for t in rows["Ticker"]), default=10)
-    lines = [f"Swing (dip) {run_time_ist}", ""]
-    for n, (_, r) in enumerate(rows.iterrows(), start=1):
-        ticker = str(r["Ticker"]).replace(".NS", "")
-        lines.append(f"{n}. {ticker:<{width}}  {r['Bounce_Median']:.1f}%")
+    breadth = (float(candidates["Market_Breadth_Pct"].iloc[0])
+               if "Market_Breadth_Pct" in candidates else float("nan"))
+    avg = f"{config.market_ma_sessions}-day average"
+    if not np.isfinite(breadth):
+        market, buy = "Market gauge unavailable this run -- judge the market yourself.", True
+    elif breadth >= config.market_breadth_min_pct:
+        market, buy = f"Market: {breadth:.0f}% of stocks above their {avg} -- WITH movers.", True
+    else:
+        market, buy = (f"Market: {breadth:.0f}% of stocks above their {avg} -- AGAINST movers.\n"
+                       f"No new buys. List is WATCH ONLY."), False
+    lines = [f"Swing {now_ist:%Y-%m-%d %H:%M} IST", f"Prices: {when}{mixed}", market, ""]
+
+    days = pd.to_datetime(candidates["Plan_Sell_By"].dropna())
+    if buy and len(days):
+        lines.append(f"SWING -- buy the dip. GTT sell at the price shown, or sell on {days.max():%d %b}")
+    else:
+        lines.append(f"SWING{'' if buy else ' (watch only)'} -- dip from its 20-session closing high")
+    names = candidates["Ticker"].astype(str).str.replace(".NS", "", regex=False)
+    width = int(names.str.len().max())
+    for name, (_, r) in list(zip(names, candidates.iterrows()))[:MAX_NAMES]:
+        level = "sell at" if buy else "closing high"
+        lines.append(f"  {name:<{width}}  {r['Dip_From_High_Pct']:>4.0f}%  {level} {r['Plan_Target']:,.0f}")
+    if len(candidates) > MAX_NAMES:
+        lines.append(f"  ... +{len(candidates) - MAX_NAMES} more (all stored in BigQuery)")
     lines.append("")
-    lines.append(f"Top {len(rows)} of {len(candidates)}. Hold ~{horizon_days} sessions.")
-    return "\n".join(lines)
+    if buy:
+        lines.append("No price stop: every stop tested earned less. The sell-by date is the exit.")
+    lines.append(f"{len(candidates)} swing candidates today.")
+    text = "\n".join(lines)
+    return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 
 
 def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
@@ -2232,8 +2343,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
             if not bot_token or not chat_id_raw:
                 print("\nTelegram notification skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
             else:
-                digest_text = format_telegram_digest(
-                    candidates, run_date, config.display_top_n, config.move_horizon_days)
+                digest_text = format_telegram_digest(candidates, run_date, config)
                 if digest_text is None:
                     # Only reachable when the scan found nothing at all. It used
                     # to say "no fresh Age==1 BUY signals", which stopped being
@@ -2255,6 +2365,7 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
         except Exception as exc:
             print(f"\nTelegram notification skipped/failed: {exc}")
             print("Use --no-telegram to suppress this.")
+    bq_failed = False
     if not no_bq:
         try:
             resolved_project_id = _resolve_project_id(project_id)
@@ -2270,10 +2381,15 @@ def main(request: Any = None) -> Optional[tuple[str, int]]:
                     print("Use --no-dataform-trigger to suppress this, or check the calling "
                           "service account has roles/dataform.editor.")
         except Exception as exc:
+            bq_failed = True
             print(f"\nBigQuery write skipped/failed: {exc}")
             print("Use --no-bq to suppress this, or --project-id / set GCP_PROJECT to fix it.")
 
     if request is not None:
+        # A failed write means the forward test has nothing to grade for this
+        # run. Say so with a 500 so the scheduler records a failure.
+        if bq_failed:
+            return (f"Scanned {len(candidates)} candidates but the BigQuery write FAILED.", 500)
         return (f"Scanner completed: {len(candidates)} candidates processed.", 200)
     return None
 
