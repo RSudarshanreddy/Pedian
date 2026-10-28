@@ -333,7 +333,7 @@ def plan_outcome(row: Any, source: Optional[str], dates: list, open_: np.ndarray
                     "Plan_Exit_Reason": "skipped: opened outside the plan"}
         k_end = first_on_or_after(np.busday_offset(np.datetime64(bar, "D"), FORM_HOLD_SESSIONS,
                                                    roll="forward").astype(dt.date))
-        if k_end is None:
+        if k_end is None or k_end < e:      # unfinished, or a sell-by before the entry (prices far too old)
             return none
         for k in range(e, k_end + 1):
             if k > e and open_[k] >= tgt:
