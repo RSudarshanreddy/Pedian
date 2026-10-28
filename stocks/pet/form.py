@@ -2,16 +2,20 @@
 
 Scans every NSE stock using only its last 25 sessions:
   find the active leg -> judge its form -> keep the persistent movers
-  -> READY: those in a healthy 4-7% pullback; WATCH: those still near their peak.
-The daily list is 10 names: every READY name first (best leg first), then WATCH.
+  -> READY: those in a healthy 4-7% pullback (up to 10 names, best leg first).
 
-It also adds MOMENTUM DIPS: names on the frozen momentum scanner's list (its
-latest stored top 20 by Expected_Move, >= 18) that closed down 2%+ on the last
-complete session. On 23 Aug - 24 Sep 2026 those, bought next open and held 10
-sessions, made +4.7% a trade with 67% up -- against -0.05% for form's own swing
-on the same days. One month, few distinct stocks: a lead, not a law.
-
-Telegram gets the names only; the details (targets, exits, buy zones) go to the log.
+SINCE 2026-10-28 (README, "October 28"): READY only, behind the market gauge, with
+its exit plan in the message -- sell at the leg's peak (GTT), sell on a close
+below halfway, and sell by 10 sessions at the latest. Tested with rules fixed
+first, Dec-Sep, entry the day a stock first turns READY:
+    gauge ON   260 trades  +1.21% a trade  67% won  5.6 sessions held  every split positive
+    gauge OFF   94 trades  -0.73%          47% won
+Live 9-28 Oct, all on gauge-OFF days, READY lost 3.7% a trade on this plan.
+The gauge is the share of every stock in momentum.py's price/liquidity range above
+its 50-day average, read from the latest momentum run; below 50% READY is WATCH ONLY.
+WATCH (now momentum.py's job) and MOMENTUM DIPS (built on the retired Expected_Move
+top 20; 8% of its live picks made money) were removed. It shares no trades with
+swings.py, which buys deeper (12%+) dips.
 
     python form.py        # downloads ~3 months for every NSE stock (a few minutes)
 
@@ -47,7 +51,8 @@ LIST_SIZE = 10
 PROJECT = "sudarshan-442212"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 CLOSE_DONE = dt.time(15, 45)         # after this a bar for today is a complete session
-MOMENTUM_SHOWN, MOMENTUM_FLOOR, RED_DAY = 20, 18.0, -0.02   # the momentum digest's top 20; a 2%+ down close
+GAUGE_MIN = 50.0                     # market gauge: below this READY is WATCH ONLY
+HOLD_SESSIONS = 10                   # the plan's latest exit
 BQ_TABLE = f"{PROJECT}.data_options.form_signals"
 BQ_SCHEMA = (("run_date", "DATE"), ("run_timestamp", "TIMESTAMP"), ("prices_to", "DATE"), ("status", "STRING"),
              ("position", "INTEGER"), ("symbol", "STRING"), ("price", "FLOAT"), ("leg_pct", "FLOAT"),
@@ -135,19 +140,16 @@ def scan(bars: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def shortlist(t: pd.DataFrame, n: int = LIST_SIZE) -> pd.DataFrame:
-    """READY names first, then WATCH: persistent movers still within 4% of their peak,
-    waiting for a 4-7% dip. Best leg (size x persistence) first within each."""
-    ready = t[t.candidate.eq(True)].sort_values("score", ascending=False).assign(status="READY")
-    watch = t[t.form.eq("persistent") & ~t.candidate.eq(True) & (t.pullback.astype(float) > -0.04)]
-    watch = watch.sort_values("score", ascending=False).assign(status="WATCH")
-    return pd.concat([ready, watch]).head(n)
+    """READY names, best leg (size x persistence) first."""
+    if t.empty:
+        return t
+    return t[t.candidate.eq(True)].sort_values("score", ascending=False).assign(status="READY").head(n)
 
 
 def digest(s: pd.DataFrame, prices_to: dt.date) -> str:
     """Plain text: Telegram's Markdown parser chokes on stray underscores in data."""
     lines = [f"form.py -- {dt.datetime.now(IST):%d %b %Y} (prices to {prices_to:%d %b})", ""]
-    for status, title in (("READY", "READY -- in a healthy 4-7% pullback"),
-                          ("WATCH", "WATCH -- in form, wait for a 4-7% dip")):
+    for status, title in (("READY", "READY -- in a healthy 4-7% pullback"),):
         rows = s[s.status == status]
         if not len(rows):
             continue
@@ -217,44 +219,53 @@ def last_session(bars: dict[str, pd.DataFrame]) -> pd.Timestamp:
     return pd.Series([df.index[-1] for df in bars.values()]).mode().iloc[0]
 
 
-def momentum_dips(bars: dict[str, pd.DataFrame]) -> tuple[list[str], list[str]]:
-    """Names on the momentum scanner's latest stored top 20 that closed down 2%+ on the
-    last complete session. Returns (names, detail lines)."""
+def market_gauge() -> tuple[float, dt.date] | None:
+    """The market gauge from the latest momentum run: the share of every stock in its
+    price/liquidity range above its own 50-day average. form's own bars are 30 sessions,
+    too short for a 50-day average, so it reads the value momentum.py stores. At 10:00
+    that is usually the previous day's run; the message says which day."""
     from google.cloud import bigquery
-    rows = bigquery.Client(project=PROJECT).query(f"""
-        SELECT REGEXP_REPLACE(Ticker, r'\\.NS$', '') AS sym, Expected_Move, Run_Date
-        FROM `{PROJECT}.data_options.momentum`
-        WHERE Run_Date = (SELECT MAX(Run_Date) FROM `{PROJECT}.data_options.momentum`)
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker ORDER BY Run_Timestamp DESC) = 1""").result()
-    rows = sorted(rows, key=lambda r: -r.Expected_Move)[:MOMENTUM_SHOWN]
-    latest = last_session(bars)
-    dips = []
-    for rank, r in enumerate(rows, 1):
-        df = bars.get(r.sym)
-        if r.Expected_Move < MOMENTUM_FLOOR or df is None or len(df) < 2 or df.index[-1] != latest:
-            continue
-        change = df.Close.iloc[-1] / df.Close.iloc[-2] - 1
-        if change <= RED_DAY:
-            dips.append({"symbol": r.sym, "rank": rank, "price": float(df.Close.iloc[-1]), "change": float(change),
-                         "list_date": r.Run_Date, "session": latest})
-    return dips
+    rows = list(bigquery.Client(project=PROJECT).query(f"""
+        SELECT Market_Breadth_Pct AS pct, Run_Date AS day FROM `{PROJECT}.data_options.momentum`
+        WHERE Market_Breadth_Pct IS NOT NULL ORDER BY Run_Timestamp DESC LIMIT 1""").result())
+    return (float(rows[0].pct), rows[0].day) if rows else None
 
 
-def names_only(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source: str) -> str:
-    """The Telegram message: just the names. The details stay in digest(), printed to the logs."""
+def sell_by(prices_to: dt.date) -> dt.date:
+    """HOLD_SESSIONS weekdays after the last close used. NSE holidays are not known here,
+    so around a holiday this lands a session early, never late."""
+    return np.busday_offset(np.datetime64(prices_to, "D"), HOLD_SESSIONS, roll="forward").astype(dt.date)
+
+
+def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: dt.date, source: str) -> str:
+    """The Telegram message: the gauge, then each READY name with its plan."""
     lines = [f"form {dt.datetime.now(IST):%d %b}, on {prices_to:%d %b} close" + (" (Yahoo)" if source == "yahoo" else "")]
-    for status in ("READY", "WATCH"):
-        names = list(s.index[s.status == status])
-        if names:
-            lines.append(f"{status}: {', '.join(names)}")
-    if len(lines) == 1:
-        lines.append("No persistent movers today.")
-    lines.append("MOMENTUM DIPS (hold ~10 days): " +
-                 ("unavailable" if dips is None else ", ".join(d["symbol"] for d in dips) if dips else "none today"))
+    if gauge is None:
+        # Conservative: the gauge comes from another service's table, so "unknown" is
+        # a real state here (e.g. before momentum.py's first run that stores it).
+        buy = False
+        lines.append("Market gauge unavailable -- WATCH ONLY until it is.")
+    else:
+        pct, day = gauge
+        buy = pct >= GAUGE_MIN
+        lines.append(f"Market ({day:%d %b}): {pct:.0f}% of stocks above their 50-day average -- "
+                     + ("WITH movers." if buy else "AGAINST movers.\nNo new buys. List is WATCH ONLY."))
+    lines.append("")
+    if not len(s):
+        lines.append("READY: none today.")
+        return "\n".join(lines)
+    if buy:
+        lines.append(f"READY -- buy. GTT sell at the peak; sell on a close below the exit; "
+                     f"sell by {sell_by(prices_to):%d %b} at the latest")
+    else:
+        lines.append("READY (watch only) -- in a healthy 4-7% pullback")
+    width = max(len(sym) for sym in s.index)
+    for sym, r in s.iterrows():
+        lines.append(f"  {sym:<{width}}  {r.pullback * 100:+4.0f}%  peak {r.peak:,.0f}  exit below {r.halfway:,.0f}")
     return "\n".join(lines)
 
 
-def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source: str) -> None:
+def record(s: pd.DataFrame, prices_to: dt.date, source: str) -> None:
     """Keep what was sent, for the end-of-October and December reviews. Re-running in the same
     slot (morning, afternoon, or evening after the close) replaces that slot's rows. A load job, not
     streaming, so the DELETE always works."""
@@ -270,9 +281,6 @@ def record(s: pd.DataFrame, dips: list[dict] | None, prices_to: dt.date, source:
              "leg_pct": float(r["size"]) * 100, "leg_days": int(r.length), "up_days_pct": float(r.persistence) * 100,
              "pullback_pct": float(r.pullback) * 100, "target": float(r.peak), "exit_below": float(r.halfway)}
             for i, (sym, r) in enumerate(s.iterrows(), 1)]
-    rows += [{**base, "status": "MOMENTUM_DIP", "position": i, "symbol": d["symbol"], "price": d["price"],
-              "momentum_rank": d["rank"], "day_change_pct": d["change"] * 100}
-             for i, d in enumerate(dips or [], 1)]
     client.query(f"DELETE FROM `{BQ_TABLE}` WHERE run_date = @d AND slot = @slot", job_config=bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", now.date()),
                           bigquery.ScalarQueryParameter("slot", "STRING", slot)])).result()
@@ -291,15 +299,12 @@ def run() -> dict:
           f"form: {t.form.value_counts().to_dict()}")
     s = shortlist(t)
     try:
-        dips = momentum_dips(bars)
-    except Exception as exc:          # the form list still goes out if BigQuery is unreachable
-        print(f"momentum dips unavailable: {exc}")
-        dips = None
-    dip_lines = [f"{d['symbol']} #{d['rank']} on the momentum list ({d['list_date']:%d %b}) | {d['price']:,.1f}, "
-                 f"{d['change'] * 100:+.1f}% on {d['session']:%d %b}" for d in dips or []]
-    details = digest(s, prices_to) + "\n\nMOMENTUM DIPS -- the momentum list's names that closed down 2%+:\n" + \
-        ("\n".join(dip_lines) if dip_lines else "none")
-    return {"details": details, "names": names_only(s, dips, prices_to, source), "shortlist": s, "dips": dips,
+        gauge = market_gauge()
+    except Exception as exc:          # the list still goes out if BigQuery is unreachable
+        print(f"market gauge unavailable: {exc}")
+        gauge = None
+    print(f"market gauge: {gauge}")
+    return {"details": digest(s, prices_to), "names": names_only(s, gauge, prices_to, source), "shortlist": s,
             "prices_to": prices_to, "source": source}
 
 
@@ -312,7 +317,7 @@ def main(request: Any = None):
         return None
     body = request.get_json(silent=True) or {}
     try:
-        record(out["shortlist"], out["dips"], out["prices_to"], out["source"])
+        record(out["shortlist"], out["prices_to"], out["source"])
     except Exception as exc:          # recording must never stop the message
         print(f"recording failed: {exc}")
     if not body.get("no_telegram"):

@@ -28,6 +28,43 @@
 
 ## Now: `form.py`, movers in form, entered on a healthy pullback (2026-10-08)
 
+### October 28: READY only, behind the market gauge
+
+Three scanners now each own one trade: `momentum.py` buys stocks at their
+20-session high (hold 20 sessions), `swings.py` buys 12%+ dips in an uptrend
+(sell at the old high or after 20), and `form.py` buys the shallow 4-7%
+pullback in a persistent leg described below.
+
+**Test, with the rules fixed first.** The READY rule exactly as below, Dec 2025
+to Sep 2026, Yahoo prices, entry at the next open on the first day a stock turns
+READY, no re-entry for 10 sessions, net of 0.25%. Split by the market gauge
+(the share of every stock in `momentum.py`'s price/liquidity range above its
+own 50-day average; ON at 50% or more):
+
+| | trades | average | median | won | sessions held |
+|---|---|---|---|---|---|
+| gauge ON, form's exit (peak / halfway / 10 sessions) | 260 | **+1.21%** | +3.64% | **67%** | 5.6 |
+| gauge OFF, same exit | 94 | −0.73% | −0.77% | 47% | 5.4 |
+
+Gauge ON was positive on both ticker halves (+1.19 / +1.23) and both time
+halves (+1.43 / +1.00): +2.18 per 10 sessions held, above `momentum.py`'s
+MOVING list (+1.18), which was the bar set before the test for keeping form.
+READY shared no trades with `swings.py`. Live, 9-28 Oct, every READY signal
+came while the gauge was OFF, and READY lost 3.7% a trade on this exit.
+
+**What changed:**
+- READY names go out with the plan: sell at the peak (a GTT), sell on a
+  close below halfway, and sell 10 sessions after the close used at the latest.
+- Below 50% on the gauge, READY is sent as WATCH ONLY. The gauge is read from
+  the latest `momentum.py` run (form's 30 sessions are too short for a 50-day
+  average). If it can't be read, the list is WATCH ONLY.
+- WATCH (persistent movers near their peak) was removed: buying near the high
+  is `momentum.py`'s job.
+- MOMENTUM DIPS was removed. It was built on `momentum.py`'s Expected_Move
+  top 20, the ranking retired on 27 Oct for keeping stale names on top. Its
+  test covered one month, and live only 2 of 24 names (8%) made money on its
+  10-session hold.
+
 The owner's model: **find stocks that are in form now, identify their active
 momentum leg, wait for a healthy pullback, and catch the next swing.** The
 scanner finds the stock, the pullback finds the entry, and the exit manages
