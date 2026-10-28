@@ -1986,20 +1986,23 @@ def trigger_dataform_run(
     return invoke_resp.json()["name"]
 
 
-MAX_NAMES = 40          # in the message; the rest are stored, not lost
+LIST_SHOWN = 20     # names per Telegram list (the owner: "top 20"); every candidate is still stored
 TELEGRAM_MAX = 4096     # Bot API limit for one text message
 
 
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
                            config: ScannerConfig) -> Optional[str]:
-    """The market gauge, then every swing candidate with its exit plan.
+    """The market gauge, then the swing candidates as Stock | Score | Action.
 
-    Returns None only when the scan found nothing at all. Every stock that
-    passed is listed (up to MAX_NAMES), in the order scan_tickers sorted them.
+    Returns None only when the scan found nothing at all. Up to LIST_SHOWN names,
+    by Score -- the format shared with momentum.py and form.py (the owner's,
+    2026-10-28). Score is not shown to predict; the tested edge (+2.13 over
+    random picks) is for the whole list in equal amounts. Storage and the
+    console keep the Bounce_Median order.
 
-    Below market_breadth_min_pct the names are listed as WATCH ONLY, without a
-    plan: the owner sees which dips exist while the market is against movers,
-    but nothing reads as a buy. Same gauge and wording as momentum.py.
+    Below market_breadth_min_pct every action is WATCH, with no plan: the owner
+    sees which dips exist while the market is against movers, but nothing reads
+    as a buy. Same gauge and wording as momentum.py.
 
     Plain text, no parse_mode -- see send_telegram_notification.
     """
@@ -2008,9 +2011,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     now_ist = dt.datetime.now(dt.timezone.utc) + IST_OFFSET
     bars = pd.to_datetime(candidates["Bar_Date"]).dt.date
     bar = bars.max()
-    when = (f"{bar} (session in progress)"
-            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar}")
-    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min()})"
+    when = (f"{bar:%d %b} (session in progress)"
+            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar:%d %b}")
+    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min():%d %b})"
 
     breadth = (float(candidates["Market_Breadth_Pct"].iloc[0])
                if "Market_Breadth_Pct" in candidates else float("nan"))
@@ -2024,24 +2027,25 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     else:
         market, buy = (f"Market: {breadth:.0f}% of stocks above their {avg} -- AGAINST movers.\n"
                        f"No new buys. List is WATCH ONLY."), False
-    lines = [f"Swing {now_ist:%Y-%m-%d %H:%M} IST", f"Prices: {when}{mixed}", market, ""]
-
-    days = pd.to_datetime(candidates["Plan_Sell_By"].dropna())
-    if buy and len(days):
-        lines.append(f"SWING -- buy the dip. GTT sell at the price shown, or sell on {days.max():%d %b}")
-    else:
-        lines.append(f"SWING{'' if buy else ' (watch only)'} -- dip from its 20-session closing high")
-    names = candidates["Ticker"].astype(str).str.replace(".NS", "", regex=False)
-    width = int(names.str.len().max())
-    for name, (_, r) in list(zip(names, candidates.iterrows()))[:MAX_NAMES]:
-        level = "sell at" if buy else "closing high"
-        lines.append(f"  {name:<{width}}  {r['Dip_From_High_Pct']:>4.0f}%  {level} {r['Plan_Target']:,.0f}")
-    if len(candidates) > MAX_NAMES:
-        lines.append(f"  ... +{len(candidates) - MAX_NAMES} more (all stored in BigQuery)")
+    # The owner's format (2026-10-28), shared by momentum, swings and form:
+    # one line per stock -- Stock | Score | Action. On a BUY day the action
+    # carries the plan (GTT at the old closing high, sell-by date).
+    lines = [f"SWINGS  {now_ist:%d %b %H:%M} IST -- prices {when}{mixed}", market, ""]
+    ranked = candidates.sort_values("Score", ascending=False)
+    shown = ranked.head(LIST_SHOWN)
+    lines.append("Stock | Score | Action")
+    for _, r in shown.iterrows():
+        name = str(r["Ticker"]).replace(".NS", "")
+        action = "WATCH"
+        if buy:
+            action = f"BUY, GTT {r['Plan_Target']:,.0f}"
+            if pd.notna(r.get("Plan_Sell_By")):
+                action += f", sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
+        lines.append(f"{name} | {r['Score']:.0f} | {action}")
     lines.append("")
+    lines.append(f"{len(shown)} of {len(ranked)} shown. Score orders the list; it is not a forecast.")
     if buy:
-        lines.append("No price stop: every stop tested earned less. The sell-by date is the exit.")
-    lines.append(f"{len(candidates)} swing candidates today.")
+        lines.append("No price stop: GTT at the old high, else sell on the date. Same amount in each.")
     text = "\n".join(lines)
     return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 

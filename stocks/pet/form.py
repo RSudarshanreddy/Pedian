@@ -238,8 +238,13 @@ def sell_by(prices_to: dt.date) -> dt.date:
 
 
 def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: dt.date, source: str) -> str:
-    """The Telegram message: the gauge, then each READY name with its plan."""
-    lines = [f"form {dt.datetime.now(IST):%d %b}, on {prices_to:%d %b} close" + (" (Yahoo)" if source == "yahoo" else "")]
+    """The Telegram message, in the format shared with momentum.py and swings.py
+    (the owner's, 2026-10-28): the gauge, then Stock | Score | Action. Score is
+    form's own -- leg size x share of up days, x100 -- the order READY is ranked
+    in; it is not on the other two lists' scale. On a BUY day the action carries
+    the plan: GTT at the peak, exit on a close below halfway, sell-by date."""
+    lines = [f"FORM  {dt.datetime.now(IST):%d %b %H:%M} IST -- prices close of {prices_to:%d %b}"
+             + (" (Yahoo)" if source == "yahoo" else "")]
     if gauge is None:
         # Conservative: the gauge comes from another service's table, so "unknown" is
         # a real state here (e.g. before momentum.py's first run that stores it).
@@ -252,16 +257,17 @@ def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: 
                      + ("WITH movers." if buy else "AGAINST movers.\nNo new buys. List is WATCH ONLY."))
     lines.append("")
     if not len(s):
-        lines.append("READY: none today.")
+        lines.append("No names today.")
         return "\n".join(lines)
-    if buy:
-        lines.append(f"READY -- buy. GTT sell at the peak; sell on a close below the exit; "
-                     f"sell by {sell_by(prices_to):%d %b} at the latest")
-    else:
-        lines.append("READY (watch only) -- in a healthy 4-7% pullback")
-    width = max(len(sym) for sym in s.index)
+    lines.append("Stock | Score | Action")
     for sym, r in s.iterrows():
-        lines.append(f"  {sym:<{width}}  {r.pullback * 100:+4.0f}%  peak {r.peak:,.0f}  exit below {r.halfway:,.0f}")
+        action = (f"BUY, GTT {r.peak:,.0f}, exit below {r.halfway:,.0f}, sell by {sell_by(prices_to):%d %b}"
+                  if buy else "WATCH")
+        lines.append(f"{sym} | {float(r.score) * 100:.0f} | {action}")
+    lines.append("")
+    lines.append(f"{len(s)} READY (healthy 4-7% pullback). Score orders the list; it is not a forecast.")
+    if buy:
+        lines.append("Exit on a close below the line, or sell on the date. Same amount in each.")
     return "\n".join(lines)
 
 

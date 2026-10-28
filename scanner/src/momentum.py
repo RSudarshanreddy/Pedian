@@ -1967,7 +1967,7 @@ def select_for_display(candidates: pd.DataFrame, config: ScannerConfig) -> pd.Da
     return kept.head(config.display_top_n)
 
 
-MAX_NAMES_PER_GROUP = 40     # per group in the message; the rest are stored, not lost
+LIST_SHOWN = 20     # names per Telegram list (the owner: "top 20"); every candidate is still stored
 TELEGRAM_MAX = 4096          # Bot API limit for one text message
 
 
@@ -1999,9 +1999,9 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # look fresher than the prices are.
     bars = pd.to_datetime(candidates["Bar_Date"]).dt.date
     bar = bars.max()
-    when = (f"{bar} (session in progress)"
-            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar}")
-    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min()})"
+    when = (f"{bar:%d %b} (session in progress)"
+            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar:%d %b}")
+    mixed = "" if bars.nunique() == 1 else f", some older (from {bars.min():%d %b})"
 
     breadth = (float(candidates["Market_Breadth_Pct"].iloc[0])
                if "Market_Breadth_Pct" in candidates else float("nan"))
@@ -2015,29 +2015,28 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     else:
         market, buy = (f"Market: {breadth:.0f}% of stocks above their {avg} -- AGAINST movers.\n"
                        f"No new buys. Lists are WATCH ONLY."), False
-    lines = [f"Momentum {now_ist:%Y-%m-%d %H:%M} IST", f"Prices: {when}{mixed}", market, ""]
-
+    # The owner's format (2026-10-28), shared by momentum, swings and form:
+    # one line per stock -- Stock | Score | Action. On a BUY day the action
+    # carries the plan; otherwise it is WATCH.
+    lines = [f"MOMENTUM  {now_ist:%d %b %H:%M} IST -- prices {when}{mixed}", market, ""]
     moving = candidates[candidates["Now_State"] == "MOVING"].sort_values("Score", ascending=False)
-    days = pd.to_datetime(moving["Plan_Sell_By"].dropna())
-    if buy and len(days):
-        lines.append(f"MOVING -- buy. Hold, no target. Sell on {days.max():%d %b}")
+    if moving.empty:
+        lines.append("No names today.")
     else:
-        lines.append(f"MOVING{'' if buy else ' (watch only)'} -- at its 20-session high, rising")
-    names = moving["Ticker"].astype(str).str.replace(".NS", "", regex=False).tolist()
-    if not names:
-        lines.append("  none today")
-    for k in range(0, min(len(names), MAX_NAMES_PER_GROUP), 6):
-        lines.append("  " + "  ".join(names[k:k + 6]))
-    if len(names) > MAX_NAMES_PER_GROUP:
-        lines.append(f"  ... +{len(names) - MAX_NAMES_PER_GROUP} more (all stored in BigQuery)")
-
-    lines.append("")
-    if buy:
-        lines.append("No price stop: every stop tested earned less. The sell-by date is the exit.")
-    lines.append(f"From {len(candidates)} stocks that passed the scanner.")
+        shown = moving.head(LIST_SHOWN)
+        lines.append("Stock | Score | Action")
+        for _, r in shown.iterrows():
+            name = str(r["Ticker"]).replace(".NS", "")
+            action = "WATCH"
+            if buy:
+                action = (f"BUY, sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
+                          if pd.notna(r.get("Plan_Sell_By")) else "BUY")
+            lines.append(f"{name} | {r['Score']:.0f} | {action}")
+        lines.append("")
+        lines.append(f"{len(shown)} of {len(moving)} shown. Score orders the list; it is not a forecast.")
+        if buy:
+            lines.append("No price stop: sell on the date. Same amount in each.")
     text = "\n".join(lines)
-    # Telegram rejects a message over 4,096 characters outright; cut rather
-    # than lose the whole alert.
     return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 
 
