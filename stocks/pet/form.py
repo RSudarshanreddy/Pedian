@@ -57,13 +57,13 @@ CLOSE_DONE = dt.time(15, 45)         # after this a bar for today is a complete 
 GAUGE_MIN = 50.0                     # market gauge: below this READY is WATCH ONLY
 HOLD_SESSIONS = 10                   # the plan's latest exit
 GAUGE_MAX_AGE_DAYS = 4               # an older stored gauge counts as unavailable (a weekend is 3)
-FIRE_COOLDOWN_SESSIONS = 10          # the test's no-re-entry window, in run days
 BQ_TABLE = f"{PROJECT}.data_options.form_signals"
 BQ_SCHEMA = (("run_date", "DATE"), ("run_timestamp", "TIMESTAMP"), ("prices_to", "DATE"), ("status", "STRING"),
              ("position", "INTEGER"), ("symbol", "STRING"), ("price", "FLOAT"), ("leg_pct", "FLOAT"),
              ("leg_days", "INTEGER"), ("up_days_pct", "FLOAT"), ("pullback_pct", "FLOAT"), ("target", "FLOAT"),
              ("exit_below", "FLOAT"), ("momentum_rank", "INTEGER"), ("day_change_pct", "FLOAT"),
-             ("slot", "STRING"), ("source", "STRING"), ("day1", "BOOL"), ("gauge_pct", "FLOAT"))
+             ("slot", "STRING"), ("source", "STRING"), ("day1", "BOOL"), ("gauge_pct", "FLOAT"),
+             ("listed_days", "INTEGER"))
 
 
 def analyse(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict:
@@ -144,23 +144,21 @@ def scan(bars: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
-def shortlist(t: pd.DataFrame, new: set[str] | None = None, n: int = LIST_SIZE) -> pd.DataFrame:
-    """READY names: NEW entries first, never cut off, then the rest up to n; best leg
-    (size x persistence) first within each. `new` is None when day-1 is unknown."""
+def shortlist(t: pd.DataFrame, days: dict[str, int] | None = None, n: int = LIST_SIZE) -> pd.DataFrame:
+    """READY names, best leg (size x persistence) first, with how many run days in a
+    row each has been READY (None when the history could not be read)."""
     if t.empty:
         return t
-    ready = t[t.candidate.eq(True)].sort_values("score", ascending=False).assign(status="READY")
-    ready["day1"] = None if new is None else ready.index.isin(list(new))
-    fresh = ready[ready.day1.eq(True)]
-    rest = ready[~ready.day1.eq(True)]
-    return pd.concat([fresh, rest.head(max(0, n - len(fresh)))])
+    ready = t[t.candidate.eq(True)].sort_values("score", ascending=False).assign(status="READY").head(n)
+    ready["listed_days"] = [None if days is None else days.get(sym) for sym in ready.index]
+    return ready
 
 
-def day1_symbols(symbols: list[str], today: dt.date) -> set[str]:
-    """Which READY names are NEW entries by the test's own rule: the first day a
-    stock is READY, and not within FIRE_COOLDOWN_SESSIONS of its last entry,
-    replayed over the run days in form_signals (outside review, 2026-10-28: the
-    message used to say BUY for names on their fifth day, which no test measured).
+def listed_days(symbols: list[str], today: dt.date) -> dict[str, int]:
+    """How many run days in a row each READY name has been READY, today included
+    (1 = new today), over the run days in form_signals. Shown and stored; NOT a BUY
+    gate: tested 2026-10-28 with rules fixed first, buying on a name's first READY day
+    was no better than on later days (+0.02 difference, mixed across halves).
     Raises if the history cannot be read."""
     from google.cloud import bigquery
     rows = list(bigquery.Client(project=PROJECT).query(f"""
@@ -172,19 +170,17 @@ def day1_symbols(symbols: list[str], today: dt.date) -> set[str]:
           WHERE run_date IN (SELECT d FROM cal) AND status = 'READY'""",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("today", "DATE", today)])).result())
-    days = sorted(r.d for r in rows if r.k == "cal") + [today]
+    days = sorted((r.d for r in rows if r.k == "cal"), reverse=True)
     seen = {(r.symbol, r.d) for r in rows if r.k == "on"}
-    new: set[str] = set()
+    out: dict[str, int] = {}
     for sym in symbols:
-        prev, last = False, -10 ** 6
-        for i, d in enumerate(days):
-            on = d == today or (sym, d) in seen
-            if on and not prev and i - last > FIRE_COOLDOWN_SESSIONS:
-                last = i
-            prev = on
-        if last == len(days) - 1:
-            new.add(sym)
-    return new
+        k = 1
+        for d in days:
+            if (sym, d) not in seen:
+                break
+            k += 1
+        out[sym] = k
+    return out
 
 
 def digest(s: pd.DataFrame, prices_to: dt.date) -> str:
@@ -329,23 +325,15 @@ def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: 
         return "\n".join(lines)
     lines.append("Stock | Score | Action")
     for sym, r in s.iterrows():
-        new, unknown = r.get("day1") is True or r.get("day1") == True, r.get("day1") is None  # noqa: E712
-        if not buy:
-            action = "WATCH, new today" if new else "WATCH"
-        elif unknown:
-            action = "WATCH (day-1 history unavailable)"
-        elif new:
-            action = (f"BUY at the open, GTT {r.peak:,.0f}, exit below {r.halfway:,.0f}, "
-                      f"sell by {sell_by(prices_to):%d %b}")
-        else:
-            action = "WATCH, not new"
+        action = (f"BUY at the open, GTT {r.peak:,.0f}, exit below {r.halfway:,.0f}, "
+                  f"sell by {sell_by(prices_to):%d %b}") if buy else "WATCH"
+        k = r.get("listed_days")
+        if k is not None and pd.notna(k):
+            action += " (new today)" if int(k) == 1 else f" (day {int(k)})"
         lines.append(f"{sym} | {float(r.score) * 100:.0f} | {action}")
-    n_new = int(s["day1"].eq(True).sum()) if "day1" in s else 0
     lines.append("")
-    lines.append(f"{len(s)} READY (healthy 4-7% pullback), {n_new} new today. "
-                 f"Score orders the list; it is not a forecast.")
+    lines.append(f"{len(s)} READY (healthy 4-7% pullback). Score orders the list; it is not a forecast.")
     if buy:
-        lines.append("Only NEW names are tested buys -- the test bought on a stock's first READY day.")
         # "at the open": ICICI 5-minute bars, 2026-10-28 -- form names bought at
         # 09:20 or any later time did 0.26-0.40 a trade worse than at the opening
         # (pre-open) price, on all four halves. Hence the 08:45 run.
@@ -375,7 +363,9 @@ def record(s: pd.DataFrame, prices_to: dt.date, source: str, gauge_pct: float | 
     rows = [{**base, "status": r.status, "position": i, "symbol": sym, "price": float(r.price),
              "leg_pct": float(r["size"]) * 100, "leg_days": int(r.length), "up_days_pct": float(r.persistence) * 100,
              "pullback_pct": float(r.pullback) * 100, "target": float(r.peak), "exit_below": float(r.halfway),
-             "day1": (None if r.get("day1") is None else bool(r.get("day1"))), "gauge_pct": gauge_pct}
+             "day1": (None if pd.isna(r.get("listed_days")) else int(r.get("listed_days")) == 1),
+             "listed_days": (None if pd.isna(r.get("listed_days")) else int(r.get("listed_days"))),
+             "gauge_pct": gauge_pct}
             for i, (sym, r) in enumerate(s.iterrows(), 1)]
     client.query(f"DELETE FROM `{BQ_TABLE}` WHERE run_date = @d AND slot = @slot", job_config=bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", now.date()),
@@ -396,12 +386,12 @@ def run() -> dict:
           f"form: {t.form.value_counts().to_dict()}")
     ready = list(t.index[t.candidate.eq(True)]) if not t.empty else []
     try:
-        new = day1_symbols(ready, dt.datetime.now(IST).date())
-        print(f"day 1: {len(new)} of {len(ready)} READY names are new entries today")
-    except Exception as exc:          # unknown day-1 -> no BUY marks, never a guess
-        print(f"day-1 history unavailable: {exc}")
-        new = None
-    s = shortlist(t, new)
+        days = listed_days(ready, dt.datetime.now(IST).date())
+        print(f"listed days: {sum(v == 1 for v in days.values())} of {len(ready)} READY names new today")
+    except Exception as exc:          # the list still goes out, just without day counts
+        print(f"listed-days history unavailable: {exc}")
+        days = None
+    s = shortlist(t, days)
     try:
         gauge = market_gauge()
     except Exception as exc:          # the list still goes out if BigQuery is unreachable

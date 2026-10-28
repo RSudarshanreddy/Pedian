@@ -1711,7 +1711,8 @@ BQ_SCHEMA = [
     bigquery.SchemaField("Plan_Hold_Sessions", "INT64"),
     bigquery.SchemaField("Plan_Sell_By", "DATE"),
     bigquery.SchemaField("Market_Breadth_Pct", "FLOAT64"),
-    bigquery.SchemaField("Day1", "BOOL"),        # MOVING rows: a new entry today (day1_names)
+    bigquery.SchemaField("Day1", "BOOL"),        # MOVING rows: first day on the list
+    bigquery.SchemaField("Listed_Days", "INT64"),  # MOVING rows: run days in a row on the list (listed_days)
 ]
 
 def _schema_for_existing_table(table: bigquery.Table) -> tuple[list[bigquery.SchemaField], dict[str, str]]:
@@ -1771,6 +1772,8 @@ def write_to_bigquery(df: pd.DataFrame, project_id: str, dataset_id: str, table_
     output["Run_Date"] = pd.to_datetime(output["Run_Date"]).dt.date
     if "Day1" in output.columns:
         output["Day1"] = output["Day1"].astype("boolean")
+    if "Listed_Days" in output.columns:
+        output["Listed_Days"] = pd.to_numeric(output["Listed_Days"], errors="coerce").astype("Int64")
     if "Plan_Sell_By" in output.columns:
         output["Plan_Sell_By"] = output["Plan_Sell_By"].map(
             lambda v: dt.date.fromisoformat(v) if isinstance(v, str) and v else None)
@@ -1971,22 +1974,23 @@ def select_for_display(candidates: pd.DataFrame, config: ScannerConfig) -> pd.Da
 
 
 LIST_SHOWN = 20     # names per Telegram list (the owner: "top 20"); every candidate is still stored
-FIRE_COOLDOWN_SESSIONS = 10   # the tests' no-re-entry window, in run days
+TELEGRAM_MAX = 4096          # Bot API limit for one text message
+def listed_days(table: str, names: list[str], run_date: dt.date, project_id: str,
+                dataset_id: str = "data_options", moving_only: bool = False) -> dict[str, int]:
+    """How many run days in a row each of today's names has been on the list,
+    today included (1 = new today), over the table's own run days -- a day the
+    scanner did not run is skipped, not read as "off the list".
 
-
-def day1_names(table: str, names: list[str], run_date: dt.date, project_id: str,
-               dataset_id: str = "data_options", moving_only: bool = False) -> set[str]:
-    """Which of today's names are NEW entries by the tests' own rule.
-
-    Every test bought a stock only on the FIRST day it qualified, and not again
-    within FIRE_COOLDOWN_SESSIONS of its last entry (outside review, 2026-10-28:
-    the message used to say BUY for every name on the list, including ones on
-    their fifth day, which no test measured). This replays that rule over the
-    table's own run days -- so a day the scanner did not run is skipped rather
-    than read as "off the list" -- and returns the names whose entry is today.
+    Shown in the message and stored; it does NOT gate BUY. Tested 2026-10-28
+    with rules fixed first: buying on day 1 was not better than on later days
+    for any list -- MOVING did consistently BETTER later (days 2-3 +0.73 a trade
+    over day 1, days 4+ +1.18 over days 1-3, on all four halves), form showed no
+    difference, and swings' days 4+ looked weaker (+1.9% vs about +5%) but not
+    on every half. An earlier version of this BUY-on-day-1-only gate lasted a
+    few hours.
 
     moving_only: count a momentum row as "on the list" only when labelled MOVING.
-    Raises if the history cannot be read; the caller decides what that means.
+    Raises if the history cannot be read; the caller then shows no day count.
     """
     ref = f"{project_id}.{dataset_id}.{table}"
     cond = "AND Now_State = 'MOVING'" if moving_only else ""
@@ -1999,42 +2003,26 @@ def day1_names(table: str, names: list[str], run_date: dt.date, project_id: str,
           WHERE Run_Date IN (SELECT d FROM cal) {cond}""",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("today", "DATE", run_date)])).result())
-    days = sorted(r.d for r in rows if r.k == "cal") + [run_date]
+    days = sorted((r.d for r in rows if r.k == "cal"), reverse=True)
     seen = {(r.Ticker, r.d) for r in rows if r.k == "on"}
-    new: set[str] = set()
+    out: dict[str, int] = {}
     for name in names:
-        prev, last = False, -10 ** 6
-        for i, d in enumerate(days):
-            on = d == run_date or (name, d) in seen
-            if on and not prev and i - last > FIRE_COOLDOWN_SESSIONS:
-                last = i
-            prev = on
-        if last == len(days) - 1:
-            new.add(name)
-    return new
+        k = 1
+        for d in days:
+            if (name, d) not in seen:
+                break
+            k += 1
+        out[name] = k
+    return out
 
 
-def action_for(buy: bool, day1: Any, plan: str) -> str:
-    """The Action column, shared by momentum.py and swings.py. A BUY is only a
-    tested BUY on a name's first day; anything else is WATCH, with the reason."""
-    new = day1 is True or (isinstance(day1, (bool, np.bool_)) and bool(day1))
-    unknown = day1 is None or (isinstance(day1, float) and np.isnan(day1))
-    if not buy:
-        return "WATCH, new today" if new else "WATCH"
-    if unknown:
-        return "WATCH (day-1 history unavailable)"
-    return plan if new else "WATCH, not new"
-
-
-def new_first(rows: pd.DataFrame) -> pd.DataFrame:
-    """New names first (by Score), then the rest (by Score), and never cut a new
-    name off the message: every tested BUY must be visible."""
-    flag = rows["Day1"].map(lambda v: v is True or (isinstance(v, (bool, np.bool_)) and bool(v))) \
-        if "Day1" in rows else pd.Series(False, index=rows.index)
-    new = rows[flag].sort_values("Score", ascending=False)
-    rest = rows[~flag].sort_values("Score", ascending=False)
-    return pd.concat([new, rest.head(max(0, LIST_SHOWN - len(new)))])
-TELEGRAM_MAX = 4096          # Bot API limit for one text message
+def action_for(buy: bool, days: Any, plan: str) -> str:
+    """The Action column: the plan on a BUY day, else WATCH -- plus how long the
+    name has been listed, when known."""
+    tag = ""
+    if days is not None and not (isinstance(days, float) and np.isnan(days)) and not pd.isna(days):
+        tag = " (new today)" if int(days) == 1 else f" (day {int(days)})"
+    return (plan if buy else "WATCH") + tag
 
 
 def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
@@ -2085,24 +2073,20 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     # one line per stock -- Stock | Score | Action. On a BUY day the action
     # carries the plan; otherwise it is WATCH.
     lines = [f"MOMENTUM  {now_ist:%d %b %H:%M} IST -- prices {when}{mixed}", market, ""]
-    moving = candidates[candidates["Now_State"] == "MOVING"]
+    moving = candidates[candidates["Now_State"] == "MOVING"].sort_values("Score", ascending=False)
     if moving.empty:
         lines.append("No names today.")
     else:
-        shown = new_first(moving)
-        n_new = int(shown["Day1"].map(lambda v: v is True or (isinstance(v, (bool, np.bool_)) and bool(v))).sum()) \
-            if "Day1" in shown else 0
+        shown = moving.head(LIST_SHOWN)
         lines.append("Stock | Score | Action")
         for _, r in shown.iterrows():
             name = str(r["Ticker"]).replace(".NS", "")
             plan = (f"BUY after 14:30, sell by {pd.Timestamp(r['Plan_Sell_By']):%d %b}"
                     if pd.notna(r.get("Plan_Sell_By")) else "BUY after 14:30")
-            lines.append(f"{name} | {r['Score']:.0f} | {action_for(buy, r.get('Day1'), plan)}")
+            lines.append(f"{name} | {r['Score']:.0f} | {action_for(buy, r.get('Listed_Days'), plan)}")
         lines.append("")
-        lines.append(f"{len(shown)} of {len(moving)} shown, {n_new} new today. "
-                     f"Score orders the list; it is not a forecast.")
+        lines.append(f"{len(shown)} of {len(moving)} shown. Score orders the list; it is not a forecast.")
         if buy:
-            lines.append("Only NEW names are tested buys -- every test bought on a stock's first day.")
             # 14:30: ICICI 5-minute bars, 2026-10-28 -- MOVING names bought at 14:30
             # did +0.29 a trade better than at the open, and +0.42 at the close,
             # on all four halves; they tend to dip during the day.
@@ -2334,20 +2318,21 @@ def run_momentum(request: Any = None) -> Optional[tuple[str, int]]:
     run_date = now_utc.date().isoformat()
     run_timestamp = now_utc.isoformat()
     candidates, failures, total_quality = scan_tickers(tickers, config, run_date, run_timestamp)
-    # Day 1: which MOVING names are new entries by the tests' rule. Read from
-    # this table's own history; unreadable history leaves Day1 empty and the
-    # message then marks no BUY (see action_for) rather than guessing.
+    # Days on the list for each MOVING name (see listed_days): shown in the
+    # message and stored, not a BUY gate. Unreadable history just leaves it empty.
     if not candidates.empty:
+        candidates["Listed_Days"] = None
         candidates["Day1"] = None
         is_moving = candidates["Now_State"] == "MOVING"
         try:
-            new = day1_names(table_id, candidates.loc[is_moving, "Ticker"].tolist(),
-                             dt.date.fromisoformat(run_date), _resolve_project_id(project_id),
-                             dataset_id, moving_only=True)
-            candidates.loc[is_moving, "Day1"] = candidates.loc[is_moving, "Ticker"].isin(new)
-            print(f"Day 1: {len(new)} of {int(is_moving.sum())} MOVING names are new entries today")
+            k = listed_days(table_id, candidates.loc[is_moving, "Ticker"].tolist(),
+                            dt.date.fromisoformat(run_date), _resolve_project_id(project_id),
+                            dataset_id, moving_only=True)
+            candidates.loc[is_moving, "Listed_Days"] = candidates.loc[is_moving, "Ticker"].map(k)
+            candidates.loc[is_moving, "Day1"] = candidates.loc[is_moving, "Ticker"].map(k).eq(1)
+            print(f"Listed days: {sum(v == 1 for v in k.values())} of {len(k)} MOVING names new today")
         except Exception as exc:
-            print(f"Day-1 history unavailable ({exc}) -- no BUY marks this run")
+            print(f"Listed-days history unavailable ({exc}) -- no day counts this run")
 
     if failures:
         print(f"\n{len(failures)} tickers failed or had no usable data.")

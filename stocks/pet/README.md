@@ -58,9 +58,11 @@ though it lost money there in absolute terms (−0.67%). Live, 9-28 Oct, every R
 came while the gauge was OFF, and READY lost 3.7% a trade on this exit.
 
 **What changed:**
-- BUY only on a name's FIRST READY day (the test's entry rule: first day READY,
-  no re-entry within 10 sessions), replayed from form_signals; older names read
-  "WATCH, not new". Before this, every READY name said BUY every day.
+- Each READY name shows how many days in a row it has been READY ("new today",
+  "day 2"), stored as listed_days. It does not gate BUY: tested with rules fixed
+  first, buying on a name's first READY day was no better than later (+0.02,
+  mixed across halves). A BUY-on-day-1-only gate was tried for a few hours on
+  28 Oct and removed after that test.
 - WATCH ONLY when the stored gauge is more than 4 days old, or when the prices
   are late (they end before the session momentum.py last traded on). On 28 Oct
   NSE refused the cloud, Yahoo had prices only to 26 Oct, and the 10:00 list was
