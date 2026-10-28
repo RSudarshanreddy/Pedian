@@ -57,6 +57,11 @@ per session held, which was the pre-set criterion, so it stays. They share only
 14 of 445 trades. The same test chose the plan: sell at the old high or after 20
 sessions beat holding 10/20/30 and the +10%/+15% targets on return per session,
 and no price stop is used (every stop tested earned less).
+Against RANDOM picks (rules fixed first): each trade against the mean of every
+liquid, volatile stock bought at the same open and held the same sessions, gauge
+ON: +4.68% against random +2.55%, an edge of +2.13 a trade, beating its control
+57% of the time, positive on all four halves (+0.49 to +3.62). The strongest of
+the three lists (momentum.py MOVING +0.47, form.py +0.80).
 - The message lists every candidate with its sell-at price and sell-by date,
   or WATCH ONLY when the market gauge is below 50%.
 - Ranked by Bounce_Median. Action/Setup are recorded but do not order the list.

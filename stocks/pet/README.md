@@ -49,7 +49,12 @@ own 50-day average; ON at 50% or more):
 Gauge ON was positive on both ticker halves (+1.19 / +1.23) and both time
 halves (+1.43 / +1.00): +2.18 per 10 sessions held, above `momentum.py`'s
 MOVING list (+1.18), which was the bar set before the test for keeping form.
-READY shared no trades with `swings.py`. Live, 9-28 Oct, every READY signal
+READY shared no trades with `swings.py`. Against random picks (each trade against
+the mean of every liquid, volatile stock bought at the same open and held the
+same sessions, gauge ON): +1.26% against +0.46%, an edge of +0.80 a trade,
+beating its control 61% of the time and positive on all four halves (+0.52 to
++1.08). It was the only list still ahead of random on gauge-OFF days (+0.60),
+though it lost money there in absolute terms (−0.67%). Live, 9-28 Oct, every READY signal
 came while the gauge was OFF, and READY lost 3.7% a trade on this exit.
 
 **What changed:**

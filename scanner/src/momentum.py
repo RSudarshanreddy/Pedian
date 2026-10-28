@@ -76,6 +76,16 @@ the month. Two additions, each tested with its rules fixed before running:
     Both positive on both ticker halves and both time halves. No price stop:
     every stop tested (-8% and -10% on close) earned less than the same plan
     without one, so the sell-by date is the exit that is always applied.
+  Against RANDOM picks (an outside review's test, rules fixed first): each trade
+    against the mean of every liquid, volatile stock (Stages 1-2 only) bought at
+    the same open and held the same sessions, gauge ON. MOVING +1.98% against
+    random +1.51%: an edge of +0.47 a trade, positive on all four halves (+0.26 to
+    +0.67) but beating its control only 47% of the time -- the thinnest of the
+    three lists, mostly the reward for owning volatile stocks in a rising market.
+    swings.py +2.13 over random, form.py +0.80. The volatility gates' own measure
+    (Expected_Move) cannot tell an edge from luck -- a random stock moving 4.5% a
+    day clears 14 -- which is why it orders nothing; the exits above were tested
+    on trades you could actually make.
 """
 
 
