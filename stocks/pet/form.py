@@ -273,8 +273,14 @@ def names_only(s: pd.DataFrame, gauge: tuple[float, dt.date] | None, prices_to: 
         # "at the open": ICICI 5-minute bars, 2026-10-28 -- form names bought at
         # 09:20 or any later time did 0.26-0.40 a trade worse than at the opening
         # (pre-open) price, on all four halves. Hence the 08:45 run.
-        lines.append("Buy at the open: place orders 9:00-9:08 (pre-open). "
-                     "Exit on a close below the line, or sell on the date. Same amount in each.")
+        # The gap rule (outside review, 2026-10-28): a stock that opens at or above
+        # its peak has no upside left (the GTT would fire at once), and one that
+        # opens at or below halfway has already broken its setup. Rare -- 3 of 250
+        # gauge-ON trades -- so it changes the average by +0.02, but it stops a
+        # pointless or broken trade at no cost.
+        lines.append("Buy at the open: place orders 9:00-9:08 (pre-open). Skip a stock whose "
+                     "pre-open price is above its GTT or below its exit line.")
+        lines.append("Exit on a close below the line, or sell on the date. Same amount in each.")
     return "\n".join(lines)
 
 
