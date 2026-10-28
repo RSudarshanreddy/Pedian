@@ -2041,166 +2041,6 @@ def format_telegram_digest(candidates: pd.DataFrame, run_date: str,
     return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
 
 
-WATCHLIST_SIZE = 20
-
-
-def first_listed_dates(today: dt.date, picks: list[tuple[str, str]], project_id: str,
-                       dataset_id: str = "data_options") -> dict[tuple[str, str], dt.date]:
-    """(list, ticker) -> the first day of its CURRENT unbroken run on that list.
-
-    'moving' is a momentum row labelled MOVING; 'swing' is any swings row. The
-    calendar is the days momentum ran (every trading day), so a day the stock
-    was missing -- or a day swings did not run -- ends the run. Today counts as
-    listed for everything in `picks`, whether or not today's rows were stored.
-    """
-    ref = f"{project_id}.{dataset_id}"
-    rows = list(bigquery.Client(project=project_id).query(f"""
-        WITH cal AS (SELECT DISTINCT Run_Date AS d FROM `{ref}.momentum`
-                     WHERE Run_Date < @today ORDER BY d DESC LIMIT 60)
-        SELECT 'cal' AS lst, '' AS Ticker, d FROM cal
-        UNION DISTINCT
-        SELECT 'moving', Ticker, Run_Date FROM `{ref}.momentum`
-          WHERE Run_Date IN (SELECT d FROM cal) AND Now_State = 'MOVING'
-        UNION DISTINCT
-        SELECT 'swing', Ticker, Run_Date FROM `{ref}.swings`
-          WHERE Run_Date IN (SELECT d FROM cal)""",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("today", "DATE", today)])).result())
-    cal = sorted((r.d for r in rows if r.lst == "cal"), reverse=True)
-    seen = {(r.lst, r.Ticker, r.d) for r in rows if r.lst != "cal"}
-    out: dict[tuple[str, str], dt.date] = {}
-    for lst, ticker in picks:
-        first = today
-        for d in cal:
-            if (lst, ticker, d) not in seen:
-                break
-            first = d
-        out[(lst, ticker)] = first
-    return out
-
-
-def watchlist_picks(momentum_c: pd.DataFrame, swings_c: pd.DataFrame) -> list[dict[str, Any]]:
-    """Every name for the watchlist, in order: swings first (the larger tested edge
-    over random picks, +2.13 a trade), in swings.py's order; then MOVING (+0.47),
-    by Score. A stock on both lists appears once, as a swing, tagged with both."""
-    picks: list[dict[str, Any]] = []
-    for _, r in (swings_c.iterrows() if not swings_c.empty else []):
-        picks.append({"ticker": r["Ticker"], "list": "swing", "tag": "swing",
-                      "target": r.get("Plan_Target"), "sell_by": r.get("Plan_Sell_By"),
-                      "bar": r.get("Bar_Date"), "gauge": r.get("Market_Breadth_Pct")})
-    if not momentum_c.empty and "Now_State" in momentum_c:
-        moving = momentum_c[momentum_c["Now_State"] == "MOVING"].sort_values("Score", ascending=False)
-        held = {p["ticker"]: p for p in picks}
-        for _, r in moving.iterrows():
-            if r["Ticker"] in held:
-                held[r["Ticker"]]["tag"] = "swing+moving"
-                continue
-            picks.append({"ticker": r["Ticker"], "list": "moving", "tag": "moving",
-                          "target": float("nan"), "sell_by": r.get("Plan_Sell_By"),
-                          "bar": r.get("Bar_Date"), "gauge": r.get("Market_Breadth_Pct")})
-    return picks
-
-
-def format_watchlist(picks: list[dict[str, Any]], first_seen: dict[tuple[str, str], dt.date],
-                     gauge: float, config: ScannerConfig) -> str:
-    """The owner's watchlist (2026-10-28): ONE message for momentum and swings,
-    top WATCHLIST_SIZE, one line per stock -- name, the day it first joined the
-    list (its current run), the action.
-
-    The action is BUY when the market gauge is WITH movers and WATCH otherwise;
-    an unreadable gauge is WATCH (fails closed). BUY lines carry the plan: a swing
-    name shows its GTT at the old closing high, and the footer gives the sell-by
-    date, so the exit is decided at the moment of buying. form.py sends its own
-    list at 10:15.
-    """
-    now_ist = dt.datetime.now(dt.timezone.utc) + IST_OFFSET
-    bars = [pd.Timestamp(p["bar"]).date() for p in picks if p.get("bar") is not None]
-    bar = max(bars) if bars else now_ist.date()
-    when = (f"{bar:%d %b} (session in progress)"
-            if bar == now_ist.date() and now_ist.time() < dt.time(15, 45) else f"close of {bar:%d %b}")
-    avg = f"{config.market_ma_sessions}-day average"
-    if not np.isfinite(gauge):
-        market, buy = "Market gauge unavailable -- WATCH ONLY until it is.", False
-    elif gauge >= config.market_breadth_min_pct:
-        market, buy = f"Market: {gauge:.0f}% of stocks above their {avg} -- WITH movers.", True
-    else:
-        market, buy = f"Market: {gauge:.0f}% of stocks above their {avg} -- AGAINST movers. No new buys.", False
-    lines = [f"Watchlist {now_ist:%d %b %H:%M} IST -- prices {when}", market, ""]
-    if not picks:
-        lines.append("No names today.")
-        return "\n".join(lines)
-
-    shown = picks[:WATCHLIST_SIZE]
-    names = [str(p["ticker"]).replace(".NS", "") for p in shown]
-    width = max(len(n) for n in names)
-    action = "BUY" if buy else "WATCH"
-    for name, p in zip(names, shown):
-        first = first_seen.get((p["list"], p["ticker"]))
-        line = f"  {name:<{width}}  {first:%d %b}" if first else f"  {name:<{width}}  --    "
-        line += f"  {action:<5}  {p['tag']}"
-        if buy and p["list"] == "swing" and p["target"] is not None and np.isfinite(float(p["target"])):
-            line += f"  GTT {float(p['target']):,.0f}"
-        lines.append(line)
-
-    lines.append("")
-    if buy:
-        sell_by = max((pd.Timestamp(p["sell_by"]) for p in shown if p.get("sell_by")), default=None)
-        if sell_by is not None:
-            lines.append(f"Sell by {sell_by:%d %b} at the latest. No price stop.")
-        lines.append("Same amount in each; the order is not a forecast.")
-    n_swing = sum(p["list"] == "swing" for p in picks)
-    lines.append(f"Top {len(shown)} of {len(picks)} ({n_swing} swing, {len(picks) - n_swing} moving). "
-                 f"Date = first day on the list, this run.")
-    text = "\n".join(lines)
-    return text if len(text) <= TELEGRAM_MAX else text[:TELEGRAM_MAX - 40] + "\n... (cut to fit Telegram)"
-
-
-def send_watchlist(collect: dict, body: dict) -> str:
-    """Build and send the combined watchlist. Never raises: if the combined
-    message cannot be built, each scanner's own message goes out instead, so a
-    bug here never leaves the owner with nothing at 10:00. With
-    {"no_telegram": true} it is still built and printed, just not sent -- so a
-    test run exercises everything but the send."""
-    config = ScannerConfig()
-    momentum_c = collect.get("momentum", pd.DataFrame())
-    swings_c = collect.get("swings", pd.DataFrame())
-    try:
-        picks = watchlist_picks(momentum_c, swings_c)
-        gauges = [float(p["gauge"]) for p in picks if p.get("gauge") is not None and pd.notna(p["gauge"])]
-        if not gauges:
-            for c in (momentum_c, swings_c):
-                if not c.empty and "Market_Breadth_Pct" in c:
-                    gauges.append(float(c["Market_Breadth_Pct"].iloc[0]))
-        gauge = gauges[0] if gauges else float("nan")
-        today = (dt.datetime.now(dt.timezone.utc)).date()
-        try:
-            first_seen = first_listed_dates(today, [(p["list"], p["ticker"]) for p in picks],
-                                            _resolve_project_id(body.get("project_id")),
-                                            body.get("dataset_id", "data_options"))
-        except Exception as exc:
-            LOGGER.warning("First-listed dates unavailable (%s) -- shown as --", exc)
-            first_seen = {}
-        text = format_watchlist(picks, first_seen, gauge, config)
-    except Exception as exc:
-        LOGGER.exception("watchlist failed; sending each scanner's own message")
-        import swings
-        parts = [t for t in (format_telegram_digest(momentum_c, "", config) if not momentum_c.empty else None,
-                             swings.format_telegram_digest(swings_c, "", swings.ScannerConfig())
-                             if not swings_c.empty else None) if t]
-        text = "\n\n".join(parts) if parts else None
-        if text is None:
-            return f"watchlist failed ({exc}) and nothing to send"
-    print("\n" + text)
-    if body.get("no_telegram"):
-        return f"watchlist built ({text.count(chr(10)) + 1} lines), not sent (no_telegram)"
-    bot_token, chat_id_raw = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id_raw:
-        return "watchlist built; Telegram not configured"
-    chat_ids = [c.strip() for c in chat_id_raw.split(",") if c.strip()]
-    failed = send_telegram_to_all(text, bot_token, chat_ids)
-    return f"watchlist sent to {len(chat_ids) - len(failed)}/{len(chat_ids)}"
-
-
 def send_telegram_notification(text: str, bot_token: str, chat_id: str) -> None:
     """
     Sends `text` to a single Telegram chat via the Bot API. Raises on
@@ -2315,7 +2155,7 @@ def parse_args() -> argparse.Namespace:
 # =========================================================
 # MAIN
 # =========================================================
-def run_momentum(request: Any = None, collect: Optional[dict] = None) -> Optional[tuple[str, int]]:
+def run_momentum(request: Any = None) -> Optional[tuple[str, int]]:
     """Run as either a CLI program or an HTTP Cloud Function.
     
     Functions Framework calls the configured entry point with the Flask
@@ -2423,10 +2263,6 @@ def run_momentum(request: Any = None, collect: Optional[dict] = None) -> Optiona
     run_date = now_utc.date().isoformat()
     run_timestamp = now_utc.isoformat()
     candidates, failures, total_quality = scan_tickers(tickers, config, run_date, run_timestamp)
-    # main() passes `collect` to build ONE watchlist for both scanners; this
-    # scan then sends no message of its own (see the Telegram block below).
-    if collect is not None:
-        collect["momentum"] = candidates
 
     if failures:
         print(f"\n{len(failures)} tickers failed or had no usable data.")
@@ -2497,7 +2333,7 @@ def run_momentum(request: Any = None, collect: Optional[dict] = None) -> Optiona
         print(f"WARNING: {total_quality} candidates found but only {len(candidates)} stored "
               f"(top_n={config.top_n}). Raise --top-n or history is being lost.")
 
-    if not no_telegram and collect is None:
+    if not no_telegram:
         try:
             bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
             chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
@@ -2556,39 +2392,35 @@ def run_momentum(request: Any = None, collect: Optional[dict] = None) -> Optiona
     return None
 
 def main(request: Any = None) -> Optional[tuple[str, int]]:
-    """Entry point: the momentum scan, then -- over HTTP only -- the swing scan,
-    then ONE watchlist message for both.
+    """Entry point: the momentum scan, then -- over HTTP only -- the swing scan.
 
     swings.py rides on this service's 10:00 call because the owner keeps three
-    scheduler jobs (2026-10-28). The two stay separate scanners -- their own
-    rules and BigQuery tables -- but send a single watchlist (the owner's format:
-    stock, date first listed, action; top 20), built by send_watchlist. Both
-    read the same request body, so {"no_telegram": true, "no_bq": true} quiets
-    both, and {"no_swings": true} runs momentum alone. A failure in either
-    still lets the other run, and the response is a 500 if either failed.
+    scheduler jobs (2026-10-28). The two stay separate scanners: their own rules,
+    message and BigQuery table; only the trigger is shared. Both read the same
+    request body, so {"no_telegram": true, "no_bq": true} quiets both, and
+    {"no_swings": true} runs momentum alone. A failure in either still lets the
+    other run, and the response is a 500 if either failed.
     """
     if request is None:
         return run_momentum(None)
     try:
-        body = request.get_json(silent=True) or {}
-    except Exception:
-        body = {}
-    collect: dict = {}
-    try:
-        momentum_msg, momentum_code = run_momentum(request, collect)
+        momentum_msg, momentum_code = run_momentum(request)
     except Exception as exc:
         LOGGER.exception("momentum scan failed")
         momentum_msg, momentum_code = f"Momentum FAILED: {exc}", 500
-    swings_msg, swings_code = "skipped", 200
-    if not body.get("no_swings"):
-        try:
-            import swings
-            swings_msg, swings_code = swings.main(request, collect)
-        except Exception as exc:
-            LOGGER.exception("swing scan failed")
-            swings_msg, swings_code = f"FAILED: {exc}", 500
-    sent = send_watchlist(collect, body)
-    return f"{momentum_msg} | Swings: {swings_msg} | {sent}", max(momentum_code, swings_code)
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    if body.get("no_swings"):
+        return momentum_msg, momentum_code
+    try:
+        import swings
+        swings_msg, swings_code = swings.main(request)
+    except Exception as exc:
+        LOGGER.exception("swing scan failed")
+        swings_msg, swings_code = f"FAILED: {exc}", 500
+    return f"{momentum_msg} | Swings: {swings_msg}", max(momentum_code, swings_code)
 
 
 if __name__ == "__main__":
