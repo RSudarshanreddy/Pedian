@@ -47,7 +47,10 @@ import data
 
 WINDOW = 25
 SESSIONS = WINDOW + 5                 # fetched from NSE, so a stock missing a few days still fills the window
-MIN_PRICE = 100.0
+# 100 -> 300 on 2026-10-29 (owner's decision, after a test with rules fixed first;
+# research/README.md, sector_wide.py): gauge-ON, Dec-Sep, READY names priced
+# 100-300 made -0.19% a trade against +1.37% above 300, worse on all four halves.
+MIN_PRICE = 300.0
 MIN_TRADED_CR = 10.0
 MAX_SHOWN = 30
 LIST_SIZE = 10

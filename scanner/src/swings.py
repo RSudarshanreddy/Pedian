@@ -152,7 +152,12 @@ class ScannerConfig:
     #   2200 +10.26% (12.20/8.45)          none  +9.42% (7.85/10.70)
     # All inside noise, and 1400 had the best balance -- so this is a
     # preference call, not a performance one, and it is recorded as such.
-    max_price: float = 1600.0
+    # Cap REMOVED on 2026-10-29 (owner's decision, after a test with rules fixed
+    # first; research/README.md, sector_wide.py). Gauge-ON, Dec-Sep, each list's
+    # own plan: swings above 1600 +5.00% a trade, 71% won, all four halves
+    # positive (161 picks, 30 stocks; +4.66 without the top 3), against +4.73
+    # for 250-1600. The gauge keeps 250-1600 (market_max_price below).
+    max_price: float = float("inf")
     # NOT raised. Measured the wrong way round: tightening to 20/30/50/100 Cr
     # moved returns +2.14 -> 1.62 -> 1.22 -> 1.34 -> 0.89, and corr(traded
     # value, forward return) is -0.042. This exists to guarantee you can get in
@@ -319,6 +324,9 @@ class ScannerConfig:
     # See momentum.py's module docstring for the test behind it.
     market_ma_sessions: int = 50
     market_breadth_min_pct: float = 50.0
+    # The gauge's own price ceiling: momentum.py's 250-1600, so all three lists
+    # read the same market after swings' candidate cap was removed (2026-10-29).
+    market_max_price: float = 1600.0
     # Exit plan: GTT sell at the old 20-session closing high, else sell after
     # this many sessions. No price stop -- every stop tested earned less.
     swing_hold_sessions: int = 20
@@ -1306,7 +1314,7 @@ def market_gauge_vote(data: pd.DataFrame, config: ScannerConfig) -> Optional[boo
         return None
     last = float(close.iloc[-1])
     traded_cr = float((close * data["Volume"]).tail(20).mean()) / 10_000_000
-    if not (config.min_price < last < config.max_price) or not traded_cr >= config.min_avg_traded_value_cr:
+    if not (config.min_price < last < config.market_max_price) or not traded_cr >= config.min_avg_traded_value_cr:
         return None
     return last > float(close.tail(config.market_ma_sessions).mean())
 

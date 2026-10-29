@@ -93,7 +93,7 @@ the trade.
 Fixed on 2026-10-08, **before testing**. Every measure uses only the **last 25
 sessions**.
 
-**Universe:** NSE stocks priced at ₹100 or more, trading at least ₹10 crore a
+**Universe:** NSE stocks priced at ₹300 or more (₹100 until 29 Oct 2026), trading at least ₹10 crore a
 day on average over 20 sessions.
 
 **The leg:** from the lowest close in the 25-session window to the highest
